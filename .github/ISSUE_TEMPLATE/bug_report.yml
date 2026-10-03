@@ -82,7 +82,14 @@ body:
         - Kubernetes
         - Helm
         - AWS (Terraform)
+        - Azure (Terraform)
         - Digital Ocean (Terraform)
+        - GCP (Terraform)
+        - Hetzner (Terraform)
+        - Linode (Terraform)
+        - Vultr (Terraform)
+        - Install script (deploy/scripts)
+        - Generic cloud-init
         - Other
     validations:
       required: true

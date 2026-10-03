@@ -23,6 +23,17 @@ fullnameOverride: ""
 # Mail domain
 domain: "mail.example.com"
 
+# Public base URL of the web interface (e.g. "https://mail.example.com"),
+# used in "password change required" replies to mail clients. Empty: not set.
+publicUrl: ""
+
+# Proxies whose X-Real-IP / X-Forwarded-For headers are trusted for the
+# client IP (lockout, allowed_ips) -> KISS_MAIL_TRUSTED_PROXIES. Behind an
+# Ingress, set this to the ingress controller pod CIDR (e.g. your cluster pod
+# CIDR, "10.244.0.0/16"); otherwise every web/API client appears to come from
+# the ingress controller's pod IP and shares one lockout bucket.
+trustedProxies: "127.0.0.1/32,::1/128"
+
 # ----------------------------------------------------------------------------
 # Service ports
 # ----------------------------------------------------------------------------
@@ -122,6 +133,10 @@ externalService:
 # ----------------------------------------------------------------------------
 # Ingress configuration (for web admin and API)
 # ----------------------------------------------------------------------------
+# Every host also gets /account (Prefix, self-service password page),
+# /static (Prefix, the web UI's CSS/JS) and /callback (Exact, SSO) paths to
+# the web port, unless you list those paths yourself. A path of
+# exactly /api goes to the API port (which includes POST /api/account/password).
 ingress:
   enabled: false
   className: nginx
@@ -142,48 +157,104 @@ ingress:
 # API configuration
 # ----------------------------------------------------------------------------
 api:
-  enabled: true
-  # API key for remote administration (set via secrets)
-  # apiKey: ""
+  # Disabled by default. When true, the container/Service expose the API port
+  # and KISS_MAIL_API_ENABLED=true is set. Always configure an API key
+  # (secrets.apiKey -> KISS_MAIL_API_KEY) when enabling it. Note that the
+  # binary also starts the API whenever KISS_MAIL_API_KEY is non-empty, so do
+  # not put an API key in the Secret if you want the API fully off. Restrict
+  # who can reach it with networkPolicy below.
+  enabled: false
+
+# ----------------------------------------------------------------------------
+# NetworkPolicy (example; requires a CNI that enforces NetworkPolicy)
+# ----------------------------------------------------------------------------
+# When enabled, ingress to the pod is limited to the mail and web ports from
+# anywhere, plus the REST API port (only if api.enabled) from the peers in
+# apiFrom. With an empty apiFrom, nothing can reach the API port.
+networkPolicy:
+  enabled: false
+  apiFrom: []
+  #  - namespaceSelector:
+  #      matchLabels:
+  #        kubernetes.io/metadata.name: ops
+  #    podSelector:
+  #      matchLabels:
+  #        app: kiss-mail-admin
 
 # ----------------------------------------------------------------------------
 # Web admin configuration
 # ----------------------------------------------------------------------------
 webAdmin:
   enabled: true
+  # KISS_MAIL_WEB_SECURE_COOKIE. Empty: "true" when the Ingress is enabled
+  # with a non-empty ingress.tls (HTTPS), otherwise "false" so logins work over plain HTTP (port-forward,
+  # an Ingress without TLS). Set "true" when TLS is terminated elsewhere.
+  secureCookie: ""
 
 # ----------------------------------------------------------------------------
 # LDAP configuration
 # ----------------------------------------------------------------------------
 ldap:
+  # Only when enabled is LDAP_URL emitted (setting LDAP_URL turns LDAP on).
   enabled: false
   url: ""
   bindDn: ""
   baseDn: ""
-  userFilter: "(uid={0})"
+  # {username} is replaced with the login name
+  userFilter: "(uid={username})"
+  # Optional direct-bind template, e.g. "uid={username},ou=people,dc=example,dc=com"
+  userDnTemplate: ""
   useTls: false
   useStartTls: false
-  # Password stored in secret
+  # Fall back to local accounts when LDAP auth fails
+  fallbackLocal: true
+  # Bind password: secrets.ldapPassword -> LDAP_BIND_PASSWORD
 
 # ----------------------------------------------------------------------------
 # SSO configuration
 # ----------------------------------------------------------------------------
 sso:
   enabled: false
-  # Supported: onepassword, google, microsoft, okta, auth0
+  # Supported: google, microsoft, okta, auth0, onepassword, or "" / "oidc"
+  # for generic OIDC. The provider decides the env var names, e.g.
+  # google -> GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET, generic -> SSO_*.
   provider: ""
   clientId: ""
   redirectUri: ""
-  # Client secret stored in secret
+  # microsoft only, REQUIRED: your Entra tenant ID (GUID or domain). The
+  # multi-tenant "common", "organizations" and "consumers" are refused; a
+  # token's tid claim must match this tenant.
+  tenantId: ""
+  # okta / auth0 only, e.g. "dev-123.okta.com"
+  domain: ""
+  # generic OIDC: all three are required. onepassword: userinfoUrl is
+  # required (-> ONEPASSWORD_USERINFO_URL; 1Password has no well-known one).
+  authUrl: ""
+  tokenUrl: ""
+  userinfoUrl: ""
+  # Email domains accepted from the provider (comma-separated); defaults to
+  # domain. Matching is exact: "example.com" does not accept
+  # "mail.example.com" or the reverse. The provider must report
+  # email_verified=true (Microsoft: the tid claim must match tenantId).
+  allowedDomain: ""
+  # SSO_ALLOW_SUBDOMAINS: also accept subdomains of allowedDomain
+  allowSubdomains: false
+  # SSO_AUTO_BIND_ADMINS: let an unlinked admin account be bound to its first
+  # SSO identity. Off by default: link admins explicitly with
+  #   kiss-mail sso-link <user> <provider> <sub>
+  autoBindAdmins: false
+  # Client secret: secrets.ssoClientSecret -> <PROVIDER>_CLIENT_SECRET
 
 # ----------------------------------------------------------------------------
 # ClamAV configuration
 # ----------------------------------------------------------------------------
 clamav:
+  # When false (and no sidecar), CLAMAV_ENABLED=false is set explicitly
+  # because the binary scans by default.
   enabled: false
   # Use external ClamAV service
   address: "clamav:3310"
-  # Deploy ClamAV as a sidecar
+  # Deploy ClamAV as a sidecar (implies scanning via 127.0.0.1:3310)
   sidecar:
     enabled: false
     image:
@@ -202,7 +273,9 @@ clamav:
 # Logging
 # ----------------------------------------------------------------------------
 logging:
-  level: info
+  # RUST_LOG filter. "kiss_mail=info" logs only the server; plain "info" also
+  # enables the (verbose) logs of every dependency.
+  level: kiss_mail=info
 
 # ----------------------------------------------------------------------------
 # Node scheduling
@@ -219,6 +292,9 @@ affinity: {}
 secrets:
   # Create secrets from values (not recommended for production)
   create: false
+  # Use an existing Secret instead (keys: KISS_MAIL_API_KEY,
+  # LDAP_BIND_PASSWORD, <PROVIDER>_CLIENT_SECRET)
+  existingSecret: ""
   apiKey: ""
   ldapPassword: ""
   ssoClientSecret: ""

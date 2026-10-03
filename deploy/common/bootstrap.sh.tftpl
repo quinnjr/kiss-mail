@@ -1,138 +1,41 @@
 #!/bin/bash
 # ============================================================================
-# KISS Mail - One-Click Install Script
+# KISS Mail - cloud VM bootstrap (shared by every Terraform provider)
 # ============================================================================
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/quinnjr/kiss-mail/main/deploy/scripts/install.sh | sudo bash
+# Rendered by Terraform templatefile() with:
+#   provider_name  - label used in logs
+#   domain         - mail domain (validated by the Terraform variable)
+#   public_ip_cmd  - shell command printing the VM's public IPv4 address
 #
-# Or with options:
-#   curl -fsSL ... | sudo bash -s -- --domain mail.example.com
+# Everything below the three assignments is plain bash. Use $VAR (never the
+# brace form) for shell variables: Terraform interpolates dollar-brace.
 #
-# The admin password is generated here and saved (root-only) in
-# /opt/kiss-mail/credentials.txt; it is passed to the server on stdin.
+# The admin password is generated on the VM and stored only in the root-only
+# /opt/kiss-mail/credentials.txt; it never passes through Terraform state or
+# instance metadata.
 # ============================================================================
 set -euo pipefail
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+PROVIDER="${provider_name}"
+DOMAIN="${domain}"
+public_ip() {
+    ${public_ip_cmd}
+}
 
-# Defaults
-DOMAIN="${KISS_MAIL_DOMAIN:-$(hostname -f)}"
-ADMIN_PASSWORD=""
-API_KEY=""
-DATA_DIR="/opt/kiss-mail/data"
-CONFIG_DIR="/opt/kiss-mail"
 IMAGE="ghcr.io/quinnjr/kiss-mail:latest"
-INSTALL_NGINX=true
-INSTALL_CERTBOT=true
+CONFIG_DIR="/opt/kiss-mail"
+DATA_DIR="/opt/kiss-mail/data"
+API_KEY=""
+ADMIN_PASSWORD=""
 # Nginx serves the web admin over plain HTTP until certbot is run, so the
-# session cookie is not marked Secure by default. Pass --secure-cookie when
-# HTTPS is already terminated in front of the web admin.
-SECURE_COOKIE=false
-# Base URL of the web interface, used in "password change required" replies.
-# Empty: http://<public IP> (https://<domain> with --secure-cookie).
+# session cookie must not be Secure yet (see credentials.txt to flip it).
+SECURE_COOKIE="false"
+# Derived from the public IP (http://IP); see credentials.txt for https.
 PUBLIC_URL=""
 
-usage() {
-    echo "KISS Mail Installer"
-    echo ""
-    echo "Usage: $0 [options]"
-    echo ""
-    echo "Options:"
-    echo "  -d, --domain DOMAIN    Mail domain (default: hostname)"
-    echo "  -p, --password PASS    Admin password (default: auto-generated; a password"
-    echo "                         given here is visible in the process list)"
-    echo "  --data-dir DIR         Data directory (default: /opt/kiss-mail/data)"
-    echo "  --no-nginx             Skip Nginx installation"
-    echo "  --no-certbot           Skip Certbot installation"
-    echo "  --secure-cookie        Mark the web session cookie Secure (HTTPS already in place)"
-    echo "  --public-url URL       Public base URL of the web interface (KISS_MAIL_PUBLIC_URL)"
-    echo "  -h, --help             Show this help"
-}
-
-# Parse arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -d|--domain)
-            DOMAIN="$2"
-            shift 2
-            ;;
-        -p|--password)
-            ADMIN_PASSWORD="$2"
-            shift 2
-            ;;
-        --data-dir)
-            DATA_DIR="$2"
-            shift 2
-            ;;
-        --no-nginx)
-            INSTALL_NGINX=false
-            shift
-            ;;
-        --no-certbot)
-            INSTALL_CERTBOT=false
-            shift
-            ;;
-        --secure-cookie)
-            SECURE_COOKIE=true
-            shift
-            ;;
-        --public-url)
-            [[ $# -ge 2 ]] || { echo "--public-url requires a value"; exit 1; }
-            PUBLIC_URL="$2"
-            shift 2
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            echo "Unknown option: $1"
-            usage
-            exit 1
-            ;;
-    esac
-done
-
-# ----------------------------------------------------------------------------
-# Functions
-# ----------------------------------------------------------------------------
-log() {
-    echo -e "${GREEN}[KISS Mail]${NC} $1"
-}
-
-warn() {
-    echo -e "${YELLOW}[WARNING]${NC} $1" >&2
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
-    exit 1
-}
-
-public_ip() {
-    curl -s --max-time 10 ifconfig.me || curl -s --max-time 10 icanhazip.com
-}
-
-banner() {
-    echo -e "${BLUE}"
-    echo "  ╦╔═╦╔══╗  ╔╦╗╔═╗╦╦  "
-    echo "  ╠╩╗║╚═╗╚═╗║║║╠═╣║║  "
-    echo "  ╩ ╩╩╚═╝╚═╝╩ ╩╩ ╩╩╩═╝"
-    echo -e "${NC}"
-    echo "  Simple Email Server Installer"
-    echo ""
-}
-
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        error "This script must be run as root (use sudo)"
-    fi
-}
+log() { echo "[KISS Mail] $1"; }
+warn() { echo "[WARNING] $1" >&2; }
+error() { echo "[ERROR] $1" >&2; exit 1; }
 
 # >>> kiss-mail common >>>
 # Shared provisioning functions. This block is kept byte-identical in
@@ -608,84 +511,116 @@ finish_admin_password() {
 }
 # <<< kiss-mail common <<<
 
-install_kiss_mail() {
-    log "Installing KISS Mail..."
-    prepare_dirs
-    pull_or_build_image
-    detect_public_ip
-    generate_secrets
-    # Save the secrets before anything else can fail
-    write_credentials "Admin password: PENDING - the installer has not finished. The server's bootstrap password is in $DATA_DIR/initial-admin-password"
-    run_container
-    finish_admin_password
-    log "KISS Mail installed"
+# ----------------------------------------------------------------------------
+# Admin password retry
+# ----------------------------------------------------------------------------
+RETRY_SCRIPT="$CONFIG_DIR/bootstrap-retry.sh"
+RETRY_UNIT="/etc/systemd/system/kiss-mail-admin-password.service"
+
+# Mark the VM provisioned once the admin password is set (rc 0 or 3).
+# Otherwise leave .admin-password-pending and a oneshot systemd unit that
+# re-runs this script, which then only retries the admin password, on every
+# boot until it succeeds.
+record_admin_password_result() {
+    if [[ "$ADMIN_PASSWORD_RC" -eq 0 || "$ADMIN_PASSWORD_RC" -eq 3 ]]; then
+        touch "$CONFIG_DIR/.provisioned"
+        rm -f "$CONFIG_DIR/.admin-password-pending"
+        if [[ -f "$RETRY_UNIT" ]]; then
+            systemctl disable kiss-mail-admin-password.service >/dev/null 2>&1 || true
+            rm -f "$RETRY_UNIT" "$RETRY_SCRIPT"
+            systemctl daemon-reload || true
+        fi
+        return 0
+    fi
+    touch "$CONFIG_DIR/.admin-password-pending"
+    if [[ "$0" != "$RETRY_SCRIPT" ]]; then
+        if [[ -f "$0" ]] && cp -- "$0" "$RETRY_SCRIPT"; then
+            chmod 700 "$RETRY_SCRIPT"
+        else
+            warn "Could not keep a copy of this script; set the admin password by hand (see $CONFIG_DIR/credentials.txt)"
+            return 0
+        fi
+    fi
+    cat > "$RETRY_UNIT" << 'UNIT'
+[Unit]
+Description=KISS Mail: retry setting the admin password
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/kiss-mail/.admin-password-pending
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/kiss-mail/bootstrap-retry.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload || true
+    systemctl enable kiss-mail-admin-password.service >/dev/null 2>&1 || warn "Could not enable the admin password retry unit"
+    warn "The admin password is not set yet; it is retried on the next boot (or run: bash $RETRY_SCRIPT)"
 }
 
-print_summary() {
-    echo ""
-    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  KISS Mail Installation Complete!${NC}"
-    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo "  Web Admin:    http://$PUBLIC_IP/admin"
-    echo "  SMTP:         $PUBLIC_IP:25"
-    echo "  IMAP:         $PUBLIC_IP:143"
-    echo "  POP3:         $PUBLIC_IP:110"
-    echo "  REST API:     127.0.0.1:8025 only (remote: ssh -L 8025:127.0.0.1:8025 <user>@$PUBLIC_IP)"
-    echo ""
-    echo "  Credentials:  $CONFIG_DIR/credentials.txt (root only)"
-    echo ""
-    echo -e "  ${YELLOW}DNS Records to configure:${NC}"
-    echo ""
-    echo "    A     $DOMAIN              $PUBLIC_IP"
-    echo "    MX    $DOMAIN    10        $DOMAIN"
-    echo "    TXT   $DOMAIN              \"v=spf1 ip4:$PUBLIC_IP -all\""
-    echo ""
-    echo -e "  ${YELLOW}To enable HTTPS for the web admin:${NC}"
-    echo "    certbot --nginx -d $DOMAIN"
-    if [[ "$SECURE_COOKIE" != "true" ]]; then
-        echo "  then recreate the container with a Secure session cookie and an https URL:"
-        echo "    curl -fsSL $KM_REPO_URL/raw/main/deploy/scripts/upgrade.sh | sudo bash -s -- --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true --env KISS_MAIL_PUBLIC_URL=https://$DOMAIN"
-        echo "  (a certbot --deploy-hook that does this is suggested in $CONFIG_DIR/credentials.txt)"
+retry_admin_password() {
+    log "Retrying the admin password step at $(date)"
+    API_KEY=$(sed -n 's/^API Key: //p' "$CONFIG_DIR/credentials.txt" 2>/dev/null | head -n 1)
+    if [[ -z "$API_KEY" ]]; then
+        error "No API key found in $CONFIG_DIR/credentials.txt; cannot retry"
     fi
-    echo ""
-    echo -e "  ${YELLOW}Changing the admin password later:${NC} use the web admin, or offline:"
-    echo "    docker stop kiss-mail"
-    echo "    docker run --rm -i -v $DATA_DIR:/data $IMAGE passwd admin --stdin"
-    echo "    docker start kiss-mail"
-    echo ""
-    echo -e "  ${YELLOW}Note:${NC} SMTP/IMAP/POP3 are plaintext (no STARTTLS)."
-    echo "  Put a TLS-terminating proxy in front of them before using real passwords."
-    echo ""
-    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    if ! docker ps -a --format '{{.Names}}' | grep -qx kiss-mail; then
+        error "The kiss-mail container does not exist; re-provision the VM"
+    fi
+    docker start kiss-mail >/dev/null 2>&1 || true
+    detect_public_ip
+    generate_secrets
+    finish_admin_password
+    record_admin_password_result
 }
 
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
-main() {
-    banner
-    check_root
-    validate_domain
-    detect_os
+exec > >(tee -a /var/log/kiss-mail-setup.log) 2>&1
 
-    log "Domain: $DOMAIN"
-    log "Data directory: $DATA_DIR"
-    echo ""
+# Serialise concurrent runs (a provider startup script and the retry unit).
+mkdir -p "$CONFIG_DIR"
+exec 9> "$CONFIG_DIR/.bootstrap.lock"
+flock 9
 
-    install_base_packages
-    install_docker
-    if [[ "$INSTALL_NGINX" == "true" ]]; then
-        install_nginx
-        configure_nginx
-    fi
-    if [[ "$INSTALL_CERTBOT" == "true" ]]; then
-        install_certbot
-    fi
-    configure_firewall
-    install_kiss_mail
+# Some providers (GCP, Vultr) run the startup script on every boot; only
+# provision once. The container itself is restarted by Docker.
+if [[ -f "$CONFIG_DIR/.provisioned" ]]; then
+    log "KISS Mail already provisioned; nothing to do"
+    exit 0
+fi
+if [[ -f "$CONFIG_DIR/.admin-password-pending" ]]; then
+    retry_admin_password
+    exit 0
+fi
 
-    print_summary
-}
+log "Starting KISS Mail setup on $PROVIDER at $(date)"
+validate_domain
+detect_os
+install_base_packages
+if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+    pkg_install ufw
+fi
+install_docker
+install_nginx
+install_certbot
+prepare_dirs
+pull_or_build_image
+detect_public_ip
+generate_secrets
+write_credentials "Admin password: PENDING - setup has not finished (see /var/log/kiss-mail-setup.log). The server's bootstrap password is in $DATA_DIR/initial-admin-password"
+run_container
+configure_nginx
+configure_firewall
+finish_admin_password
+record_admin_password_result
 
-main "$@"
+# Remove any setup copies that might hold configuration
+rm -f /opt/kiss-mail-setup.sh /etc/kiss-mail.conf
+
+log "KISS Mail setup complete at $(date)"
+log "Web Admin: http://$PUBLIC_IP/admin"
+log "Credentials saved to $CONFIG_DIR/credentials.txt (root only)"

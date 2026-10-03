@@ -19,3 +19,6 @@ admin_username = "azureuser"
 
 # OS disk size (GB)
 disk_size = 30
+
+# The KISS Mail admin password is generated on the server and saved in the
+# root-only /opt/kiss-mail/credentials.txt (it is not a Terraform variable).

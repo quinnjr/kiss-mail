@@ -24,8 +24,8 @@ commonLabels:
 
 # Image customization
 images:
-  - name: kiss-mail
-    newName: kiss-mail
+  - name: ghcr.io/quinnjr/kiss-mail
+    newName: ghcr.io/quinnjr/kiss-mail
     newTag: latest
 
 # ConfigMap generator (alternative to static configmap.yaml)

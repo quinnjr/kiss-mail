@@ -38,7 +38,7 @@ Before proposing a new feature, ask yourself:
 
 ### Prerequisites
 
-- **Rust**: 1.85.0 or later (Rust 2024 edition)
+- **Rust**: 1.94.0 or later (Rust 2024 edition)
 - **Git**: For version control
 - **Docker** (optional): For testing containerized builds
 
@@ -354,6 +354,25 @@ For significant changes, update CHANGELOG.md:
 ### Fixed
 - Fixed connection timeout issue (#456)
 ```
+
+## CI Action Pins
+
+Every GitHub Action is pinned to a full commit SHA, with the version in a
+trailing comment. Dependabot updates tagged actions, but
+`dtolnay/rust-toolchain` has no release tags, so Dependabot can't track it.
+All workflows use one pin of its `master` branch and pick the toolchain with
+`with: toolchain: stable` (or `1.94.0` for the MSRV job). Re-pin it by hand
+now and then, replacing the SHA everywhere at once:
+
+```bash
+git ls-remote https://github.com/dtolnay/rust-toolchain.git refs/heads/master
+grep -rl 'dtolnay/rust-toolchain@' .github/workflows \
+  | xargs sed -i 's|dtolnay/rust-toolchain@[0-9a-f]*|dtolnay/rust-toolchain@<new-sha>|'
+```
+
+When you bump the MSRV, update `toolchain: 1.94.0` in `ci.yml`, the Rust
+builder images in `Dockerfile` and `Dockerfile.alpine`, along with
+`rust-version` in `Cargo.toml`.
 
 ## Questions?
 

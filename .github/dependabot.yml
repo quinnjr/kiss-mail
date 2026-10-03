@@ -26,10 +26,6 @@ updates:
         update-types:
           - "minor"
           - "patch"
-    ignore:
-      # Ignore pre-release versions
-      - dependency-name: "*"
-        update-types: ["version-update:semver-prerelease"]
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
@@ -67,20 +63,16 @@ updates:
       - "dependencies"
       - "docker"
 
-  # Terraform (AWS)
+  # Terraform (all cloud deployments)
   - package-ecosystem: "terraform"
-    directory: "/deploy/aws"
-    schedule:
-      interval: "monthly"
-    commit-message:
-      prefix: "terraform"
-    labels:
-      - "dependencies"
-      - "terraform"
-
-  # Terraform (Digital Ocean)
-  - package-ecosystem: "terraform"
-    directory: "/deploy/digitalocean"
+    directories:
+      - "/deploy/aws"
+      - "/deploy/azure"
+      - "/deploy/digitalocean"
+      - "/deploy/gcp"
+      - "/deploy/hetzner"
+      - "/deploy/linode"
+      - "/deploy/vultr"
     schedule:
       interval: "monthly"
     commit-message:

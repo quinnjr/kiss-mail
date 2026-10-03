@@ -65,9 +65,13 @@ spec:
                 name: kiss-mail-secrets
                 optional: true
           
+          # readOnlyRootFilesystem is enabled below: all state lives in the
+          # data volume at /data (KISS_MAIL_DATA_DIR=/data in the ConfigMap).
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
           
           resources:
             requests:
@@ -104,6 +108,8 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: kiss-mail-data
+        - name: tmp
+          emptyDir: {}
       
       # Optional: Node selector
       # nodeSelector:

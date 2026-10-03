@@ -16,5 +16,8 @@ plan = "vc2-1c-1gb"
 # Mail domain
 domain = "mail.example.com"
 
+# The KISS Mail admin password is generated on the server and saved in the
+# root-only /opt/kiss-mail/credentials.txt (it is not a Terraform variable).
+
 # SSH key IDs (optional)
 # ssh_keys = ["key-id-1", "key-id-2"]

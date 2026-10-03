@@ -7,8 +7,15 @@ metadata:
 data:
   # Domain configuration
   KISS_MAIL_DOMAIN: {{ .Values.domain | quote }}
+  {{- with .Values.publicUrl }}
+  KISS_MAIL_PUBLIC_URL: {{ . | quote }}
+  {{- end }}
+
+  # Proxies trusted for X-Real-IP / X-Forwarded-For (set trustedProxies to
+  # the ingress controller pod CIDR when using an Ingress)
+  KISS_MAIL_TRUSTED_PROXIES: {{ .Values.trustedProxies | quote }}
   
-  # Port configuration
+  # Port configuration (SMTP_PORT/IMAP_PORT/POP3_PORT are deprecated aliases)
   KISS_MAIL_SMTP_PORT: {{ .Values.ports.smtp | quote }}
   KISS_MAIL_IMAP_PORT: {{ .Values.ports.imap | quote }}
   KISS_MAIL_POP3_PORT: {{ .Values.ports.pop3 | quote }}
@@ -19,33 +26,83 @@ data:
   KISS_MAIL_WEB_BIND: "0.0.0.0"
   KISS_MAIL_API_BIND: "0.0.0.0"
   KISS_MAIL_WEB_ENABLED: {{ .Values.webAdmin.enabled | quote }}
-  KISS_MAIL_API_ENABLED: {{ .Values.api.enabled | quote }}
+  # Secure session cookie: defaults to "true" only when ingress.tls is set
+  KISS_MAIL_WEB_SECURE_COOKIE: {{ include "kiss-mail.secureCookie" . | quote }}
+  {{- if .Values.api.enabled }}
+  KISS_MAIL_API_ENABLED: "true"
+  {{- end }}
   
-  # Data directory
+  # Data directory (deprecated alias: KISS_MAIL_DATA). Must match the writable data
+  # volume mount - the root filesystem is read-only.
   KISS_MAIL_DATA_DIR: "/data"
   
   # Logging
   RUST_LOG: {{ .Values.logging.level | quote }}
   
   {{- if .Values.ldap.enabled }}
-  # LDAP configuration
-  KISS_MAIL_LDAP_URL: {{ .Values.ldap.url | quote }}
-  KISS_MAIL_LDAP_BIND_DN: {{ .Values.ldap.bindDn | quote }}
-  KISS_MAIL_LDAP_BASE_DN: {{ .Values.ldap.baseDn | quote }}
-  KISS_MAIL_LDAP_USER_FILTER: {{ .Values.ldap.userFilter | quote }}
-  KISS_MAIL_LDAP_USE_TLS: {{ .Values.ldap.useTls | quote }}
-  KISS_MAIL_LDAP_USE_STARTTLS: {{ .Values.ldap.useStartTls | quote }}
+  {{- if not .Values.ldap.url }}
+  {{- fail "ldap.enabled=true requires ldap.url" }}
   {{- end }}
-  
+  # LDAP configuration (LDAP_URL enables LDAP auth, so it is only emitted
+  # when ldap.enabled is true)
+  LDAP_URL: {{ .Values.ldap.url | quote }}
+  {{- with .Values.ldap.bindDn }}
+  LDAP_BIND_DN: {{ . | quote }}
+  {{- end }}
+  LDAP_BASE_DN: {{ .Values.ldap.baseDn | quote }}
+  LDAP_USER_FILTER: {{ .Values.ldap.userFilter | quote }}
+  {{- with .Values.ldap.userDnTemplate }}
+  LDAP_USER_DN_TEMPLATE: {{ . | quote }}
+  {{- end }}
+  LDAP_USE_TLS: {{ .Values.ldap.useTls | quote }}
+  LDAP_USE_STARTTLS: {{ .Values.ldap.useStartTls | quote }}
+  LDAP_FALLBACK_LOCAL: {{ .Values.ldap.fallbackLocal | quote }}
+  {{- end }}
+
   {{- if .Values.sso.enabled }}
-  # SSO configuration
-  KISS_MAIL_SSO_PROVIDER: {{ .Values.sso.provider | quote }}
-  KISS_MAIL_SSO_CLIENT_ID: {{ .Values.sso.clientId | quote }}
-  KISS_MAIL_SSO_REDIRECT_URI: {{ .Values.sso.redirectUri | quote }}
+  {{- $prefix := include "kiss-mail.ssoPrefix" . }}
+  # SSO configuration (provider: {{ default "generic OIDC" .Values.sso.provider }})
+  {{ $prefix }}_CLIENT_ID: {{ required "sso.clientId is required when sso.enabled=true" .Values.sso.clientId | quote }}
+  {{- if eq $prefix "MICROSOFT" }}
+  {{- $tenant := required "sso.tenantId is required for microsoft (common/organizations/consumers are refused)" .Values.sso.tenantId }}
+  {{- if has (lower $tenant) (list "common" "organizations" "consumers") }}
+  {{- fail "sso.tenantId must be your own tenant; common/organizations/consumers are refused by the server" }}
   {{- end }}
-  
-  {{- if .Values.clamav.enabled }}
-  # ClamAV configuration
-  KISS_MAIL_CLAMAV_ENABLED: "true"
-  KISS_MAIL_CLAMAV_ADDRESS: {{ .Values.clamav.address | quote }}
+  MICROSOFT_TENANT_ID: {{ $tenant | quote }}
+  {{- end }}
+  {{- if eq $prefix "ONEPASSWORD" }}
+  ONEPASSWORD_USERINFO_URL: {{ required "sso.userinfoUrl is required for onepassword" .Values.sso.userinfoUrl | quote }}
+  {{- end }}
+  {{- if or (eq $prefix "OKTA") (eq $prefix "AUTH0") }}
+  {{ $prefix }}_DOMAIN: {{ required "sso.domain is required for okta/auth0" .Values.sso.domain | quote }}
+  {{- end }}
+  {{- if eq $prefix "SSO" }}
+  SSO_AUTH_URL: {{ required "sso.authUrl is required for generic OIDC" .Values.sso.authUrl | quote }}
+  SSO_TOKEN_URL: {{ required "sso.tokenUrl is required for generic OIDC" .Values.sso.tokenUrl | quote }}
+  SSO_USERINFO_URL: {{ required "sso.userinfoUrl is required for generic OIDC" .Values.sso.userinfoUrl | quote }}
+  {{- end }}
+  {{- with .Values.sso.allowedDomain }}
+  SSO_ALLOWED_DOMAIN: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.sso.redirectUri }}
+  SSO_REDIRECT_URI: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.sso.allowSubdomains }}
+  SSO_ALLOW_SUBDOMAINS: "true"
+  {{- end }}
+  {{- if .Values.sso.autoBindAdmins }}
+  SSO_AUTO_BIND_ADMINS: "true"
+  {{- end }}
+  {{- end }}
+
+  # ClamAV configuration (scanning is on by default in the binary, so it is
+  # always set explicitly here)
+  {{- if .Values.clamav.sidecar.enabled }}
+  CLAMAV_ENABLED: "true"
+  CLAMAV_ADDRESS: "127.0.0.1:3310"
+  {{- else if .Values.clamav.enabled }}
+  CLAMAV_ENABLED: "true"
+  CLAMAV_ADDRESS: {{ .Values.clamav.address | quote }}
+  {{- else }}
+  CLAMAV_ENABLED: "false"
   {{- end }}

@@ -10,15 +10,103 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+
+/// Save learned data after this many `learn_*` calls...
+const SAVE_EVERY_N_LEARNS: u32 = 20;
+/// ...or when dirty and at least this long since the last save.
+const SAVE_MAX_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Messages larger than this are never learned from.
+pub const MAX_LEARN_MESSAGE_BYTES: usize = 256 * 1024;
+/// At most this many distinct tokens are learned from one message.
+pub const MAX_TOKENS_PER_LEARN: usize = 1000;
+/// Vocabulary cap: when exceeded, the lowest-count tokens are evicted.
+pub const MAX_VOCABULARY: usize = 200_000;
+/// Fraction of the vocabulary cap freed per prune (amortises eviction cost).
+const PRUNE_FRACTION: usize = 10; // 1/10 = 10%
+
+/// Whether a message is eligible for learning (size cap). Callers decide
+/// separately whether the sender is trusted enough to learn from.
+pub fn should_learn_from(email: &str) -> bool {
+    email.len() <= MAX_LEARN_MESSAGE_BYTES
+}
+
+/// Known URL-shortener hosts (matched exactly against the parsed URL host,
+/// optionally with a `www.` prefix).
+pub(crate) const URL_SHORTENER_HOSTS: &[&str] = &[
+    "bit.ly",
+    "tinyurl.com",
+    "t.co",
+    "goo.gl",
+    "ow.ly",
+    "is.gd",
+    "buff.ly",
+];
+
+/// Extract lowercase hosts of all `http://` / `https://` URLs in `text`.
+///
+/// The authority ends at the first character outside
+/// `[A-Za-z0-9.\-:\[\]@]`; trailing punctuation is trimmed. Userinfo
+/// (`user@`) and port are stripped. Matching of the scheme is ASCII
+/// case-insensitive.
+pub(crate) fn url_hosts(text: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut hosts = Vec::new();
+    let mut rest = lower.as_str();
+    while let Some(pos) = rest.find("http") {
+        let after = &rest[pos + 4..];
+        let after = if let Some(a) = after.strip_prefix("s://") {
+            a
+        } else if let Some(a) = after.strip_prefix("://") {
+            a
+        } else {
+            rest = after;
+            continue;
+        };
+        let end = after
+            .find(|c: char| {
+                !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']' | '@'))
+            })
+            .unwrap_or(after.len());
+        let authority = after[..end].trim_end_matches(['.', '-', ':', '@']);
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let host = match host.rfind(':') {
+            Some(i) if host[i + 1..].chars().all(|c| c.is_ascii_digit()) => &host[..i],
+            _ => host,
+        };
+        let host = host.trim_end_matches(['.', '-', ':']);
+        if !host.is_empty() {
+            hosts.push(host.to_string());
+        }
+        rest = &after[end..];
+    }
+    hosts
+}
+
+/// Whether `host` is a known URL shortener (exact host match).
+pub(crate) fn is_url_shortener(host: &str) -> bool {
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    URL_SHORTENER_HOSTS.contains(&host)
+}
+
+/// Whether the ordered word list contains `phrase` (space-separated words)
+/// as consecutive words.
+fn contains_phrase(words: &[&str], phrase: &str) -> bool {
+    let parts: Vec<&str> = phrase.split(' ').collect();
+    if parts.len() == 1 {
+        return words.contains(&parts[0]);
+    }
+    words.windows(parts.len()).any(|w| w == parts.as_slice())
+}
 
 /// Spam classification result
 #[derive(Debug, Clone)]
 pub struct SpamClassification {
     /// Probability that the email is spam (0.0 - 1.0)
     pub spam_probability: f64,
-    /// Whether classified as spam (probability > threshold)
-    pub is_spam: bool,
     /// Top words contributing to spam score
     pub spam_indicators: Vec<(String, f64)>,
     /// Top words contributing to ham score  
@@ -45,14 +133,20 @@ pub struct SpamClassifier {
     total_spam: Arc<RwLock<u64>>,
     /// Total ham emails seen
     total_ham: Arc<RwLock<u64>>,
-    /// Spam classification threshold (default: 0.7)
-    pub threshold: f64,
     /// Minimum token occurrences to be considered (default: 3)
     pub min_occurrences: u64,
     /// Data directory for persistence
     data_dir: PathBuf,
     /// Whether the model has been modified since last save
     dirty: Arc<RwLock<bool>>,
+    /// `learn_*` calls since the last successful save
+    learns_since_save: AtomicU32,
+    /// Time of the last successful save (or creation)
+    last_save: std::sync::Mutex<Instant>,
+    /// Serializes saves so snapshots land on disk in order
+    save_lock: tokio::sync::Mutex<()>,
+    /// Vocabulary cap (defaults to [`MAX_VOCABULARY`])
+    max_vocabulary: usize,
 }
 
 impl SpamClassifier {
@@ -62,25 +156,24 @@ impl SpamClassifier {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             total_spam: Arc::new(RwLock::new(0)),
             total_ham: Arc::new(RwLock::new(0)),
-            threshold: 0.7,
             min_occurrences: 3,
             data_dir,
             dirty: Arc::new(RwLock::new(false)),
+            learns_since_save: AtomicU32::new(0),
+            last_save: std::sync::Mutex::new(Instant::now()),
+            save_lock: tokio::sync::Mutex::new(()),
+            max_vocabulary: MAX_VOCABULARY,
         }
     }
 
     /// Load learned data from disk
     pub async fn load(&self) -> Result<(), std::io::Error> {
         let path = self.data_dir.join("spam_classifier.json");
-        if !path.exists() {
+        let Some(saved) = crate::storage::read_json::<SavedClassifier>(&path).await? else {
             // Initialize with seed data
             self.seed_initial_data().await;
             return Ok(());
-        }
-
-        let data = tokio::fs::read_to_string(&path).await?;
-        let saved: SavedClassifier = serde_json::from_str(&data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        };
 
         *self.tokens.write().await = saved.tokens;
         *self.total_spam.write().await = saved.total_spam;
@@ -96,8 +189,9 @@ impl SpamClassifier {
         Ok(())
     }
 
-    /// Save learned data to disk
+    /// Save learned data to disk (if modified). Atomic, 0600, fsync'd.
     pub async fn save(&self) -> Result<(), std::io::Error> {
+        let _guard = self.save_lock.lock().await;
         if !*self.dirty.read().await {
             return Ok(());
         }
@@ -105,19 +199,63 @@ impl SpamClassifier {
         tokio::fs::create_dir_all(&self.data_dir).await?;
         let path = self.data_dir.join("spam_classifier.json");
 
-        let saved = SavedClassifier {
-            tokens: self.tokens.read().await.clone(),
-            total_spam: *self.total_spam.read().await,
-            total_ham: *self.total_ham.read().await,
+        // Snapshot under the tokens lock (learners hold it while updating)
+        // and clear `dirty` at the same point, so learns that happen during
+        // the write re-mark it.
+        let saved = {
+            let tokens = self.tokens.read().await;
+            let saved = SavedClassifier {
+                tokens: tokens.clone(),
+                total_spam: *self.total_spam.read().await,
+                total_ham: *self.total_ham.read().await,
+            };
+            *self.dirty.write().await = false;
+            saved
         };
+        let learns = self.learns_since_save.swap(0, Ordering::SeqCst);
 
-        let data = serde_json::to_string(&saved)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let result = async {
+            let data = serde_json::to_vec(&saved)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            crate::storage::write_atomic(&path, data).await
+        }
+        .await;
 
-        tokio::fs::write(&path, data).await?;
-        *self.dirty.write().await = false;
+        match result {
+            Ok(()) => {
+                if let Ok(mut t) = self.last_save.lock() {
+                    *t = Instant::now();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                *self.dirty.write().await = true;
+                self.learns_since_save.fetch_add(learns, Ordering::SeqCst);
+                Err(e)
+            }
+        }
+    }
 
-        Ok(())
+    /// Save if enough learning has happened since the last save: every
+    /// [`SAVE_EVERY_N_LEARNS`] learns, or when dirty and more than
+    /// [`SAVE_MAX_INTERVAL`] has passed. Returns whether a save was attempted.
+    pub async fn maybe_save(&self) -> bool {
+        if !*self.dirty.read().await {
+            return false;
+        }
+        let learns = self.learns_since_save.load(Ordering::SeqCst);
+        let elapsed = self
+            .last_save
+            .lock()
+            .map(|t| t.elapsed())
+            .unwrap_or(SAVE_MAX_INTERVAL);
+        if learns < SAVE_EVERY_N_LEARNS && elapsed < SAVE_MAX_INTERVAL {
+            return false;
+        }
+        if let Err(e) = self.save().await {
+            tracing::warn!("Failed to save spam classifier: {}", e);
+        }
+        true
     }
 
     /// Classify an email as spam or ham
@@ -130,7 +268,6 @@ impl SpamClassifier {
         if total_spam < 10 || total_ham < 10 {
             return SpamClassification {
                 spam_probability: 0.5,
-                is_spam: false,
                 spam_indicators: vec![],
                 ham_indicators: vec![],
                 confidence: 0.0,
@@ -193,39 +330,72 @@ impl SpamClassifier {
 
         SpamClassification {
             spam_probability,
-            is_spam: spam_probability >= self.threshold,
             spam_indicators,
             ham_indicators,
             confidence,
         }
     }
 
-    /// Train the classifier with a spam email
-    pub async fn learn_spam(&self, email: &str) {
-        let tokens = self.tokenize(email);
-        let mut token_data = self.tokens.write().await;
-
-        for token in tokens {
-            let stats = token_data.entry(token).or_default();
-            stats.spam_count += 1;
-        }
-
-        *self.total_spam.write().await += 1;
-        *self.dirty.write().await = true;
+    /// Train the classifier with a spam email. Returns `false` (and learns
+    /// nothing) if the message exceeds [`MAX_LEARN_MESSAGE_BYTES`].
+    pub async fn learn_spam(&self, email: &str) -> bool {
+        self.learn(email, true).await
     }
 
-    /// Train the classifier with a ham (non-spam) email
-    pub async fn learn_ham(&self, email: &str) {
-        let tokens = self.tokenize(email);
+    /// Train the classifier with a ham (non-spam) email. Returns `false`
+    /// (and learns nothing) if the message exceeds [`MAX_LEARN_MESSAGE_BYTES`].
+    pub async fn learn_ham(&self, email: &str) -> bool {
+        self.learn(email, false).await
+    }
+
+    async fn learn(&self, email: &str, spam: bool) -> bool {
+        if !should_learn_from(email) {
+            tracing::debug!(
+                "Not learning from {}-byte message (limit {})",
+                email.len(),
+                MAX_LEARN_MESSAGE_BYTES
+            );
+            return false;
+        }
+        let tokens = Self::cap_learn_tokens(self.tokenize(email));
         let mut token_data = self.tokens.write().await;
 
         for token in tokens {
             let stats = token_data.entry(token).or_default();
-            stats.ham_count += 1;
+            if spam {
+                stats.spam_count = stats.spam_count.saturating_add(1);
+            } else {
+                stats.ham_count = stats.ham_count.saturating_add(1);
+            }
+        }
+        if token_data.len() > self.max_vocabulary {
+            prune_vocabulary(&mut token_data, self.max_vocabulary);
         }
 
-        *self.total_ham.write().await += 1;
+        if spam {
+            *self.total_spam.write().await += 1;
+        } else {
+            *self.total_ham.write().await += 1;
+        }
         *self.dirty.write().await = true;
+        drop(token_data);
+        self.learns_since_save.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Keep at most [`MAX_TOKENS_PER_LEARN`] distinct tokens, always keeping
+    /// the (bounded) feature tokens and dropping excess words.
+    fn cap_learn_tokens(tokens: Vec<String>) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let (features, words): (Vec<String>, Vec<String>) = tokens
+            .into_iter()
+            .filter(|t| seen.insert(t.clone()))
+            .partition(|t| t.starts_with("__"));
+        let room = MAX_TOKENS_PER_LEARN.saturating_sub(features.len());
+        let mut out = features;
+        out.truncate(MAX_TOKENS_PER_LEARN);
+        out.extend(words.into_iter().take(room));
+        out
     }
 
     /// Tokenize email into words/features
@@ -246,35 +416,48 @@ impl SpamClassifier {
             }
         }
 
-        // Extract special features
-        self.extract_features(&email_lower, &mut tokens, &mut seen);
+        // Extract special features (needs original case for CAPS ratio)
+        self.extract_features(email, &email_lower, &mut tokens, &mut seen);
 
         tokens
     }
 
-    /// Extract special features from email
+    /// Extract special features from email.
+    ///
+    /// `original` is the message as received (used for case-sensitive
+    /// features); `email` is its lowercased form.
     fn extract_features(
         &self,
+        original: &str,
         email: &str,
         tokens: &mut Vec<String>,
         seen: &mut std::collections::HashSet<String>,
     ) {
+        // Ordered word sequence (for bigrams / phrase matching on word boundaries)
+        let words: Vec<&str> = email
+            .split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .map(|w| w.trim_matches('\''))
+            .filter(|w| !w.is_empty())
+            .collect();
+
         // URL features
-        let url_count = email.matches("http://").count() + email.matches("https://").count();
-        if url_count > 0 {
-            tokens.push(format!("__URL_COUNT_{}", url_count.min(10)));
+        let hosts = url_hosts(email);
+        if !hosts.is_empty() {
+            tokens.push(format!("__URL_COUNT_{}", hosts.len().min(10)));
         }
 
-        // Suspicious URL patterns
-        if (email.contains("bit.ly") || email.contains("tinyurl") || email.contains("t.co"))
-            && seen.insert("__SHORT_URL".to_string())
-        {
+        // URL shorteners (exact host match, so "t.co" doesn't hit "microsoft.com")
+        if hosts.iter().any(|h| is_url_shortener(h)) && seen.insert("__SHORT_URL".to_string()) {
             tokens.push("__SHORT_URL".to_string());
         }
 
-        // CAPS features
-        let caps_ratio = email.chars().filter(|c| c.is_uppercase()).count() as f64
-            / email.chars().filter(|c| c.is_alphabetic()).count().max(1) as f64;
+        // CAPS features (computed on the original-case text)
+        let caps_ratio = original.chars().filter(|c| c.is_uppercase()).count() as f64
+            / original
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .count()
+                .max(1) as f64;
         if caps_ratio > 0.3 {
             tokens.push("__HIGH_CAPS".to_string());
         }
@@ -300,7 +483,7 @@ impl SpamClassifier {
             "deadline",
         ];
         for word in &urgency_words {
-            if email.contains(word) && seen.insert(format!("__URGENT_{}", word)) {
+            if contains_phrase(&words, word) && seen.insert(format!("__URGENT_{}", word)) {
                 tokens.push(format!("__URGENT_{}", word));
             }
         }
@@ -345,25 +528,30 @@ impl SpamClassifier {
         }
 
         // Missing headers (suspicious)
-        if !email.to_lowercase().contains("message-id:") {
+        if !email.contains("message-id:") {
             tokens.push("__NO_MESSAGE_ID".to_string());
         }
-        if !email.to_lowercase().contains("date:") {
+        if !email.contains("date:") {
             tokens.push("__NO_DATE".to_string());
         }
 
         // Sender patterns
         if email.contains("@") {
             // Extract domain from From header
-            if let Some(from_start) = email.find("from:") {
-                let from_section = &email[from_start..];
-                if let Some(at_pos) = from_section.find('@') {
-                    let domain_start = at_pos + 1;
-                    let domain_end = from_section[domain_start..]
-                        .find(|c: char| !c.is_alphanumeric() && c != '.' && c != '-')
-                        .map(|p| domain_start + p)
-                        .unwrap_or(from_section.len().min(domain_start + 50));
-                    let domain = &from_section[domain_start..domain_end];
+            let from_start = if email.starts_with("from:") {
+                Some(0)
+            } else {
+                email.find("\nfrom:").map(|p| p + 1)
+            };
+            if let Some(from_start) = from_start {
+                let from_line = email[from_start..].lines().next().unwrap_or("");
+                if let Some(at_pos) = from_line.find('@') {
+                    // Char-based (never splits a multibyte character)
+                    let domain: String = from_line[at_pos + 1..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '.' || *c == '-')
+                        .take(253)
+                        .collect();
 
                     // Suspicious TLDs
                     let suspicious_tlds = [
@@ -393,12 +581,13 @@ impl SpamClassifier {
             ("wire", "transfer"),
         ];
 
-        for (w1, w2) in &spam_bigrams {
-            if email.contains(w1)
-                && email.contains(w2)
-                && seen.insert(format!("__BIGRAM_{}_{}", w1, w2))
-            {
-                tokens.push(format!("__BIGRAM_{}_{}", w1, w2));
+        // Real adjacent-word bigrams
+        for pair in words.windows(2) {
+            if spam_bigrams.contains(&(pair[0], pair[1])) {
+                let tok = format!("__BIGRAM_{}_{}", pair[0], pair[1]);
+                if seen.insert(tok.clone()) {
+                    tokens.push(tok);
+                }
             }
         }
     }
@@ -535,55 +724,53 @@ impl SpamClassifier {
         *self.dirty.write().await = true;
 
         drop(tokens);
-        let _ = self.save().await;
+        if let Err(e) = self.save().await {
+            tracing::warn!("Failed to save seeded spam classifier: {}", e);
+        }
 
         tracing::info!("Spam classifier seeded with initial data");
     }
 
     /// Get classifier statistics
     pub async fn stats(&self) -> ClassifierStats {
-        let tokens = self.tokens.read().await;
-        let total_spam = *self.total_spam.read().await;
-        let total_ham = *self.total_ham.read().await;
-
-        // Find most spammy and hammy words
-        let mut spam_words: Vec<_> = tokens
-            .iter()
-            .filter(|(_, s)| s.spam_count + s.ham_count >= self.min_occurrences)
-            .map(|(word, stats)| {
-                let ratio = stats.spam_count as f64 / (stats.spam_count + stats.ham_count) as f64;
-                (word.clone(), ratio, stats.spam_count + stats.ham_count)
-            })
-            .collect();
-
-        spam_words.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let top_spam_words: Vec<_> = spam_words
-            .iter()
-            .take(20)
-            .map(|(w, r, _)| (w.clone(), *r))
-            .collect();
-
-        spam_words.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        let top_ham_words: Vec<_> = spam_words
-            .iter()
-            .take(20)
-            .map(|(w, r, _)| (w.clone(), 1.0 - *r))
-            .collect();
-
         ClassifierStats {
-            total_tokens: tokens.len(),
-            total_spam_emails: total_spam,
-            total_ham_emails: total_ham,
-            top_spam_words,
-            top_ham_words,
-            threshold: self.threshold,
+            total_tokens: self.tokens.read().await.len(),
         }
     }
+}
 
-    /// Set the spam threshold
-    pub fn set_threshold(&mut self, threshold: f64) {
-        self.threshold = threshold.clamp(0.0, 1.0);
+/// Evict the lowest-count tokens so the vocabulary drops to 90% of `cap`
+/// (freeing 10% at once so pruning is amortised over many learns).
+fn prune_vocabulary(tokens: &mut HashMap<String, TokenStats>, cap: usize) {
+    let target = cap - cap / PRUNE_FRACTION;
+    if tokens.len() <= target {
+        return;
     }
+    let remove = tokens.len() - target;
+    let mut counts: Vec<u64> = tokens
+        .values()
+        .map(|s| s.spam_count.saturating_add(s.ham_count))
+        .collect();
+    // Count threshold: the `remove`-th smallest total.
+    let (_, &mut threshold, _) = counts.select_nth_unstable(remove - 1);
+    let below = counts.iter().filter(|&&c| c < threshold).count();
+    let mut at_threshold_to_remove = remove.saturating_sub(below);
+    tokens.retain(|_, s| {
+        let c = s.spam_count.saturating_add(s.ham_count);
+        if c < threshold {
+            false
+        } else if c == threshold && at_threshold_to_remove > 0 {
+            at_threshold_to_remove -= 1;
+            false
+        } else {
+            true
+        }
+    });
+    tracing::debug!(
+        "Pruned spam classifier vocabulary to {} tokens (cap {})",
+        tokens.len(),
+        cap
+    );
 }
 
 /// Saved classifier data for persistence
@@ -598,11 +785,6 @@ struct SavedClassifier {
 #[derive(Debug, Clone)]
 pub struct ClassifierStats {
     pub total_tokens: usize,
-    pub total_spam_emails: u64,
-    pub total_ham_emails: u64,
-    pub top_spam_words: Vec<(String, f64)>,
-    pub top_ham_words: Vec<(String, f64)>,
-    pub threshold: f64,
 }
 
 #[cfg(test)]
@@ -676,9 +858,136 @@ mod tests {
             let classifier = SpamClassifier::new(dir.path().to_path_buf());
             classifier.load().await.unwrap();
 
-            let stats = classifier.stats().await;
-            assert!(stats.total_spam_emails > 100); // Seeded + trained
-            assert!(stats.total_ham_emails > 100);
+            assert!(*classifier.total_spam.read().await > 100); // Seeded + trained
+            assert!(*classifier.total_ham.read().await > 100);
         }
+    }
+
+    fn features(text: &str) -> Vec<String> {
+        let c = SpamClassifier::new(PathBuf::from("unused"));
+        c.tokenize(text)
+    }
+
+    #[test]
+    fn test_caps_feature_uses_original_case() {
+        assert!(features("BUY NOW THIS IS AMAZING").contains(&"__HIGH_CAPS".to_string()));
+        assert!(!features("buy now this is amazing").contains(&"__HIGH_CAPS".to_string()));
+    }
+
+    #[test]
+    fn test_bigrams_require_adjacency() {
+        let t = features("Click here to win");
+        assert!(t.contains(&"__BIGRAM_click_here".to_string()));
+        let t = features("Click the button over there");
+        assert!(!t.iter().any(|x| x.starts_with("__BIGRAM_click")));
+        // "now" inside "acknowledge" / "act" inside "contact" must not count
+        let t = features("contact us to acknowledge");
+        assert!(!t.iter().any(|x| x.starts_with("__BIGRAM_act")));
+    }
+
+    #[test]
+    fn test_urgency_word_boundaries() {
+        assert!(features("this is urgent").contains(&"__URGENT_urgent".to_string()));
+        assert!(!features("this is non-urgentish").contains(&"__URGENT_urgent".to_string()));
+        assert!(features("act now please").contains(&"__URGENT_act now".to_string()));
+        assert!(!features("contact nowhere").contains(&"__URGENT_act now".to_string()));
+    }
+
+    #[test]
+    fn test_url_hosts_and_shorteners() {
+        let hosts = url_hosts(
+            "a HTTPS://User@Bit.LY:443/x b http://www.microsoft.com/t.co c https://t.co/z",
+        );
+        assert_eq!(hosts, vec!["bit.ly", "www.microsoft.com", "t.co"]);
+        assert!(is_url_shortener("t.co"));
+        assert!(is_url_shortener("www.bit.ly"));
+        assert!(!is_url_shortener("microsoft.com"));
+        assert!(!is_url_shortener("reddit.co"));
+        let t = features("visit https://www.microsoft.com/ today");
+        assert!(!t.contains(&"__SHORT_URL".to_string()));
+        let t = features("visit https://t.co/abc today");
+        assert!(t.contains(&"__SHORT_URL".to_string()));
+    }
+
+    #[test]
+    fn test_url_hosts_end_at_non_host_chars() {
+        assert_eq!(url_hosts("go to http://evil.ru, now"), vec!["evil.ru"]);
+        assert_eq!(url_hosts("(see https://example.com)."), vec!["example.com"]);
+        assert_eq!(url_hosts("x http://a.example.com;y"), vec!["a.example.com"]);
+        assert_eq!(
+            url_hosts("http://host.example.com!!"),
+            vec!["host.example.com"]
+        );
+        assert_eq!(url_hosts("http://u:p@10.0.0.1:8080/x"), vec!["10.0.0.1"]);
+        assert_eq!(url_hosts("http://[::1]:80/"), vec!["[::1]"]);
+        assert_eq!(url_hosts("http://example.com.-"), vec!["example.com"]);
+    }
+
+    #[tokio::test]
+    async fn learn_ignores_oversized_messages() {
+        let c = SpamClassifier::new(PathBuf::from("unused"));
+        let big = "word ".repeat(MAX_LEARN_MESSAGE_BYTES / 5 + 1);
+        assert!(!should_learn_from(&big));
+        assert!(!c.learn_spam(&big).await);
+        assert_eq!(*c.total_spam.read().await, 0);
+        assert!(c.tokens.read().await.is_empty());
+        assert!(c.learn_ham("small message here").await);
+        assert_eq!(*c.total_ham.read().await, 1);
+    }
+
+    #[tokio::test]
+    async fn learn_caps_tokens_per_message() {
+        let c = SpamClassifier::new(PathBuf::from("unused"));
+        let text: String = (0..5000).map(|i| format!("tok{} ", i)).collect();
+        assert!(text.len() <= MAX_LEARN_MESSAGE_BYTES);
+        c.learn_spam(&text).await;
+        let tokens = c.tokens.read().await;
+        assert!(tokens.len() <= MAX_TOKENS_PER_LEARN, "{}", tokens.len());
+        // Feature tokens survive the cap.
+        assert!(tokens.contains_key("__NO_DATE"));
+    }
+
+    #[tokio::test]
+    async fn vocabulary_cap_evicts_lowest_count_tokens() {
+        let mut c = SpamClassifier::new(PathBuf::from("unused"));
+        c.max_vocabulary = 100;
+        // A frequent token that must survive.
+        for _ in 0..5 {
+            c.learn_ham("keepme").await;
+        }
+        for batch in 0..10 {
+            let text: String = (0..30).map(|i| format!("w{}x{} ", batch, i)).collect();
+            c.learn_spam(&text).await;
+            assert!(c.tokens.read().await.len() <= 100);
+        }
+        let tokens = c.tokens.read().await;
+        assert!(tokens.contains_key("keepme"));
+    }
+
+    #[test]
+    fn prune_vocabulary_hits_target() {
+        let mut m: HashMap<String, TokenStats> = HashMap::new();
+        for i in 0..1100u64 {
+            m.insert(
+                format!("t{}", i),
+                TokenStats {
+                    spam_count: i % 7,
+                    ham_count: 0,
+                },
+            );
+        }
+        prune_vocabulary(&mut m, 1000);
+        assert_eq!(m.len(), 900);
+        // Lowest counts go first: no zero-count token survives.
+        assert_eq!(m.values().filter(|s| s.spam_count == 0).count(), 0);
+    }
+
+    #[test]
+    fn test_from_domain_multibyte_no_panic() {
+        let long = "ü".repeat(60);
+        let raw = format!("From: x@{}\nSubject: hi\n\nbody", long);
+        let _ = features(&raw);
+        let t = features("From: spammer@evil.xyz\nSubject: hi\n\nbody");
+        assert!(t.contains(&"__SUSPICIOUS_TLD_.xyz".to_string()));
     }
 }
