@@ -195,9 +195,8 @@ Docker is the **preferred deployment method** for KISS Mail.
 
 ### Security
 
-Published images are built on [Docker Hardened Images](https://www.docker.com/products/hardened-images/) (Alpine-based).
-If the hardened build fails in CI, the image is built from `Dockerfile.alpine`
-(standard Alpine) instead and the workflow emits a warning.
+Published images are built from the repository's `Dockerfile` on the official
+`rust:alpine` and `alpine` base images.
 - **Continuously scanned** - Trivy scan on every push; the workflow fails on fixable critical CVEs
 - **Minimal attack surface** - Alpine Linux base, pure-Rust TLS (no OpenSSL)
 - **SBOM and provenance attestations** - Attached to each pushed image by BuildKit
@@ -213,7 +212,7 @@ cosign verify ghcr.io/quinnjr/kiss-mail:latest \
 ### Pull from Registry
 
 ```bash
-# Pull the official hardened image
+# Pull the official image
 docker pull ghcr.io/quinnjr/kiss-mail:latest
 
 # Run container
@@ -247,12 +246,7 @@ docker logs -f kiss-mail
 ### Build Locally (Optional)
 
 ```bash
-# Using Docker Hardened Images (requires Docker Hub login for dhi.io)
-docker login dhi.io
 docker build -t kiss-mail .
-
-# Or using standard Alpine (no login required)
-docker build -f Dockerfile.alpine -t kiss-mail .
 ```
 
 ### Docker Compose

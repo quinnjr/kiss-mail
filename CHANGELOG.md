@@ -66,6 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--public-url`.
 
 ### Changed
+- Docker images are built only from the standard Alpine `Dockerfile` (`rust:1.94-alpine` builder, `alpine:3.23` runtime). The Docker Hardened Images (`dhi.io`) variant and `Dockerfile.alpine` were removed: dhi.io is enterprise-only, and the CI workflow no longer needs Docker Hub credentials.
 - Improved startup banner with security status
 - **REST API status codes** now follow the error kind: 400 invalid input
   (including an unknown `role` or `status` value, which used to be ignored),
