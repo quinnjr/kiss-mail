@@ -5,170 +5,595 @@
 # Works on any cloud provider that supports cloud-init:
 # - AWS, GCP, Azure, Digital Ocean, Linode, Vultr, Hetzner, OVH, Scaleway, etc.
 # - Also works on bare metal with cloud-init installed
+# Tested target: Ubuntu 24.04 LTS (also handles Debian and the RHEL family).
 #
 # Usage:
-#   1. Copy this file and customize the variables below
-#   2. Use as user-data when creating your VM/instance
+#   1. Copy this file and set DOMAIN (and optionally the API key) below
+#   2. Use it as user-data when creating your VM/instance
+#
+# The admin password is generated on the VM and written only to the root-only
+# /opt/kiss-mail/credentials.txt. Both setup copies (/etc/kiss-mail.conf and
+# /opt/kiss-mail-setup.sh) are deleted when setup finishes. Note that the
+# cloud provider and cloud-init keep a copy of this user-data, so prefer
+# leaving KISS_MAIL_API_KEY empty (it is then generated on the VM).
 # ============================================================================
-
-# Customize these variables
-# write_files at the top will create a config file that the setup script reads
 
 write_files:
   - path: /etc/kiss-mail.conf
     permissions: '0600'
     content: |
-      # KISS Mail Configuration
-      KISS_MAIL_DOMAIN=mail.example.com
-      KISS_MAIL_ADMIN_PASSWORD=
-      # Leave empty to auto-generate API key
+      # KISS Mail setup configuration. Parsed as KEY=VALUE lines by
+      # /opt/kiss-mail-setup.sh (never sourced). These are not environment
+      # variables of the kiss-mail binary.
+      DOMAIN=mail.example.com
+      # Leave empty to auto-generate the REST API key on the VM
       KISS_MAIL_API_KEY=
+      # Public base URL of the web interface (default: http://<public IP>)
+      KISS_MAIL_PUBLIC_URL=
 
-  - path: /opt/kiss-mail/setup.sh
-    permissions: '0755'
+  - path: /opt/kiss-mail-setup.sh
+    permissions: '0700'
     content: |
       #!/bin/bash
-      # KISS Mail Setup Script
+      # KISS Mail Setup Script (deleted, together with /etc/kiss-mail.conf, when
+      # setup finishes)
       set -euo pipefail
-      
-      # Load config
-      source /etc/kiss-mail.conf
-      
-      # Logging
-      exec > >(tee /var/log/kiss-mail-setup.log) 2>&1
-      echo "Starting KISS Mail setup at $(date)"
-      
-      # Detect OS
-      if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-      else
-        echo "Cannot detect OS"
-        exit 1
-      fi
-      
-      echo "Detected OS: $OS"
-      
-      # Install Docker
-      if ! command -v docker &> /dev/null; then
-        echo "Installing Docker..."
-        curl -fsSL https://get.docker.com | sh
-        systemctl enable docker
-        systemctl start docker
-      fi
-      
-      # Install packages
-      case $OS in
-        ubuntu|debian)
-          apt-get update
-          apt-get install -y nginx certbot python3-certbot-nginx curl
-          ;;
-        centos|rhel|rocky|almalinux|fedora)
-          dnf install -y nginx certbot python3-certbot-nginx curl
-          ;;
-        *)
-          echo "Installing packages for $OS may require manual steps"
-          ;;
-      esac
-      
-      # Create directories
-      mkdir -p /opt/kiss-mail/data
-      chown -R 1000:1000 /opt/kiss-mail
-      
-      # Generate API key if not set
-      if [ -z "$KISS_MAIL_API_KEY" ]; then
-        KISS_MAIL_API_KEY=$(openssl rand -hex 32)
-      fi
-      
-      # Pull and run container
-      echo "Starting KISS Mail container..."
-      docker pull ghcr.io/quinnjr/kiss-mail:latest || true
-      
-      docker run -d \
-        --name kiss-mail \
-        --restart unless-stopped \
-        -p 25:2525 \
-        -p 587:2525 \
-        -p 143:1143 \
-        -p 110:1100 \
-        -p 8080:8080 \
-        -p 8025:8025 \
-        -v /opt/kiss-mail/data:/data \
-        -e KISS_MAIL_DOMAIN="$KISS_MAIL_DOMAIN" \
-        -e KISS_MAIL_API_KEY="$KISS_MAIL_API_KEY" \
-        -e KISS_MAIL_WEB_BIND=0.0.0.0 \
-        -e KISS_MAIL_API_BIND=0.0.0.0 \
-        -e RUST_LOG=info \
-        ghcr.io/quinnjr/kiss-mail:latest || docker start kiss-mail
-      
-      # Wait for startup
-      sleep 10
-      
-      # Create admin user if password provided
-      if [ -n "$KISS_MAIL_ADMIN_PASSWORD" ]; then
-        docker exec kiss-mail kiss-mail add admin "$KISS_MAIL_ADMIN_PASSWORD" --role superadmin || true
-      fi
-      
-      # Configure Nginx
-      cat > /etc/nginx/conf.d/kiss-mail.conf << 'NGINX'
+
+      IMAGE="ghcr.io/quinnjr/kiss-mail:latest"
+      CONFIG_DIR="/opt/kiss-mail"
+      DATA_DIR="/opt/kiss-mail/data"
+      DOMAIN="mail.example.com"
+      API_KEY=""
+      # The admin password is always generated on this machine and kept only in
+      # the root-only /opt/kiss-mail/credentials.txt.
+      ADMIN_PASSWORD=""
+      # Nginx serves the web admin over plain HTTP until certbot is run, so the
+      # session cookie must not be Secure yet (see credentials.txt to flip it).
+      SECURE_COOKIE="false"
+      # Empty: derived from the public IP (http://IP); see credentials.txt.
+      PUBLIC_URL=""
+
+      log() { echo "[KISS Mail] $1"; }
+      warn() { echo "[WARNING] $1" >&2; }
+      error() { echo "[ERROR] $1" >&2; exit 1; }
+
+      public_ip() {
+          curl -s --max-time 10 ifconfig.me || curl -s --max-time 10 icanhazip.com
+      }
+
+      # Parse /etc/kiss-mail.conf as KEY=VALUE lines. It is never sourced, so
+      # nothing in it is executed.
+      read_config() {
+          local conf="/etc/kiss-mail.conf" line key value
+          [[ -f "$conf" ]] || return 0
+          while IFS= read -r line || [[ -n "$line" ]]; do
+              line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+              case "$line" in
+                  ""|"#"*) continue ;;
+                  *=*) ;;
+                  *) warn "Ignoring malformed line in $conf: $line"; continue ;;
+              esac
+              key="$(echo "$line" | cut -d= -f1 | sed -e 's/[[:space:]]*$//')"
+              value="$(echo "$line" | cut -d= -f2- | sed -e 's/^[[:space:]]*//')"
+              # Strip one pair of surrounding quotes
+              if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+                  value="$(echo "$value" | sed -e 's/^.//' -e 's/.$//')"
+              fi
+              case "$key" in
+                  DOMAIN) DOMAIN="$value" ;;
+                  KISS_MAIL_API_KEY) API_KEY="$value" ;;
+                  KISS_MAIL_PUBLIC_URL) PUBLIC_URL="$value" ;;
+                  *) warn "Ignoring unknown key in $conf: $key" ;;
+              esac
+          done < "$conf"
+      }
+
+      # >>> kiss-mail common >>>
+      # Shared provisioning functions. This block is kept byte-identical in
+      # deploy/common/bootstrap.sh.tftpl, deploy/scripts/install.sh and
+      # deploy/generic/cloud-init.yml (verified by deploy/common/check-sync.sh).
+      # It must not contain dollar-brace or percent-brace sequences, because the
+      # Terraform template would interpolate them.
+      #
+      # The caller defines log, warn, error and public_ip, and sets DOMAIN, IMAGE,
+      # CONFIG_DIR, DATA_DIR, API_KEY, ADMIN_PASSWORD, SECURE_COOKIE and PUBLIC_URL
+      # (empty: derived from the public IP, or https://DOMAIN with a Secure cookie).
+      # After finish_admin_password, ADMIN_PASSWORD_RC holds the set_admin_password
+      # result (0 and 3 mean the password was set).
+
+      KM_REPO_URL="https://github.com/quinnjr/kiss-mail"
+      KM_TMPDIR=""
+
+      apt_get() {
+          DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 "$@"
+      }
+
+      # /etc/os-release is sourced in subshells, only to read ID/VERSION_*.
+      # shellcheck disable=SC1091
+      detect_os() {
+          if [[ ! -f /etc/os-release ]]; then
+              error "Cannot detect OS (no /etc/os-release)"
+          fi
+          OS=$(set +u; . /etc/os-release; echo "$ID")
+          OS_VERSION=$(set +u; . /etc/os-release; echo "$VERSION_ID")
+          OS_CODENAME=$(set +u; . /etc/os-release; echo "$VERSION_CODENAME")
+          log "Detected OS: $OS $OS_VERSION"
+      }
+
+      pkg_install() {
+          case "$OS" in
+              ubuntu|debian) apt_get install -y "$@" ;;
+              centos|rhel|rocky|almalinux|fedora|amzn) dnf install -y "$@" ;;
+              *) error "Unsupported OS: $OS" ;;
+          esac
+      }
+
+      validate_domain() {
+          if [[ ! "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]]; then
+              error "Invalid domain '$DOMAIN' (allowed: letters, digits, '.' and '-')"
+          fi
+      }
+
+      install_base_packages() {
+          log "Installing base packages..."
+          case "$OS" in
+              ubuntu|debian)
+                  apt_get update
+                  pkg_install ca-certificates curl gnupg openssl
+                  ;;
+              *)
+                  pkg_install ca-certificates openssl
+                  # Amazon Linux ships curl-minimal, which conflicts with curl
+                  command -v curl >/dev/null 2>&1 || pkg_install curl
+                  ;;
+          esac
+      }
+
+      install_docker() {
+          if command -v docker >/dev/null 2>&1; then
+              log "Docker already installed"
+          else
+              log "Installing Docker..."
+              case "$OS" in
+                  ubuntu|debian)
+                      install -m 0755 -d /etc/apt/keyrings
+                      curl -fsSL "https://download.docker.com/linux/$OS/gpg" | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+                      chmod a+r /etc/apt/keyrings/docker.gpg
+                      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS $OS_CODENAME stable" > /etc/apt/sources.list.d/docker.list
+                      apt_get update
+                      pkg_install docker-ce docker-ce-cli containerd.io
+                      ;;
+                  centos|rhel|rocky|almalinux|fedora)
+                      local repo_url="https://download.docker.com/linux/centos/docker-ce.repo"
+                      if [[ "$OS" == "fedora" ]]; then
+                          repo_url="https://download.docker.com/linux/fedora/docker-ce.repo"
+                      fi
+                      pkg_install dnf-plugins-core
+                      # dnf4 uses --add-repo; dnf5 (Fedora 41+) uses "addrepo --from-repofile="
+                      dnf config-manager --add-repo "$repo_url" 2>/dev/null \
+                          || dnf config-manager addrepo --from-repofile="$repo_url"
+                      pkg_install docker-ce docker-ce-cli containerd.io
+                      ;;
+                  amzn)
+                      pkg_install docker
+                      ;;
+                  *)
+                      error "Unsupported OS: $OS"
+                      ;;
+              esac
+          fi
+          systemctl enable --now docker
+      }
+
+      install_nginx() {
+          if command -v nginx >/dev/null 2>&1; then
+              log "Nginx already installed"
+          else
+              log "Installing Nginx..."
+              pkg_install nginx
+          fi
+      }
+
+      # The web admin (8080) and REST API (8025) are published on 127.0.0.1 only.
+      # Nginx proxies the web admin, the self-service password page (/account/),
+      # the web UI assets (/static/) and the SSO callback on port 80. The REST API is
+      # NOT exposed through Nginx (loopback clients only); for remote CLI use, open
+      # an SSH tunnel: ssh -L 8025:127.0.0.1:8025 <server>, then use
+      # kiss-mail --server http://127.0.0.1:8025 --api-key <key> <command>.
+      # X-Real-IP and X-Forwarded-For are overwritten with the TCP peer (never
+      # appended to), so a client cannot inject an address; kiss-mail trusts them
+      # because Nginx reaches it from a KISS_MAIL_TRUSTED_PROXIES range.
+      configure_nginx() {
+          log "Configuring Nginx..."
+          cat > /etc/nginx/conf.d/kiss-mail.conf << 'NGINX'
       server {
           listen 80;
           server_name _;
-      
+
+          # Web Admin
           location /admin {
               proxy_pass http://127.0.0.1:8080;
               proxy_http_version 1.1;
               proxy_set_header Host $host;
               proxy_set_header X-Real-IP $remote_addr;
-              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-For $remote_addr;
               proxy_set_header X-Forwarded-Proto $scheme;
           }
-      
+
+          # Self-service password change (any mail user), served by the web admin
+          location /account/ {
+              proxy_pass http://127.0.0.1:8080;
+              proxy_http_version 1.1;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $remote_addr;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          # Stylesheet and script of the web UI
+          location /static/ {
+              proxy_pass http://127.0.0.1:8080;
+              proxy_http_version 1.1;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $remote_addr;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          # SSO (OIDC) callback, served by the web admin
+          location = /callback {
+              proxy_pass http://127.0.0.1:8080;
+              proxy_http_version 1.1;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $remote_addr;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          # REST API: loopback only. Remote CLI: ssh -L 8025:127.0.0.1:8025 <server>
           location /api {
+              allow 127.0.0.1;
+              allow ::1;
+              deny all;
               proxy_pass http://127.0.0.1:8025;
               proxy_http_version 1.1;
               proxy_set_header Host $host;
               proxy_set_header X-Real-IP $remote_addr;
-              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-For $remote_addr;
               proxy_set_header X-Forwarded-Proto $scheme;
           }
-      
+
+          # Root redirect
           location / {
               return 301 /admin;
           }
       }
       NGINX
-      
-      # Remove default site on Debian/Ubuntu
-      rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-      
-      # Test and reload Nginx
-      nginx -t && systemctl enable nginx && systemctl restart nginx
-      
-      # Get public IP
-      PUBLIC_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || echo "YOUR_IP")
-      
-      # Save credentials
-      cat > /opt/kiss-mail/credentials.txt << EOF
+          # Debian/Ubuntu: the default site also listens on port 80
+          rm -f /etc/nginx/sites-enabled/default
+          # RHEL family: SELinux blocks Nginx from connecting to the upstream ports
+          if command -v setsebool >/dev/null 2>&1; then
+              setsebool -P httpd_can_network_connect 1 || warn "setsebool httpd_can_network_connect failed"
+          fi
+          nginx -t
+          systemctl enable nginx
+          systemctl restart nginx
+      }
+
+      install_certbot() {
+          if command -v certbot >/dev/null 2>&1; then
+              log "Certbot already installed"
+              return 0
+          fi
+          log "Installing Certbot..."
+          local ok=true
+          case "$OS" in
+              ubuntu|debian)
+                  apt_get install -y certbot python3-certbot-nginx || ok=false
+                  ;;
+              fedora)
+                  dnf install -y certbot python3-certbot-nginx || ok=false
+                  ;;
+              centos|rhel|rocky|almalinux)
+                  # certbot lives in EPEL on Enterprise Linux
+                  { dnf install -y epel-release && dnf install -y certbot python3-certbot-nginx; } || ok=false
+                  ;;
+              amzn)
+                  # Amazon Linux 2023 has no certbot package; install it with pip
+                  { dnf install -y python3-pip && pip3 install certbot certbot-nginx; } || ok=false
+                  ;;
+              *)
+                  ok=false
+                  ;;
+          esac
+          if [[ "$ok" != "true" ]]; then
+              warn "Certbot could not be installed automatically; install it manually to enable HTTPS"
+          fi
+          return 0
+      }
+
+      configure_firewall() {
+          log "Configuring firewall..."
+          local port
+          if command -v ufw >/dev/null 2>&1; then
+              ufw default deny incoming
+              ufw default allow outgoing
+              for port in 22 25 587 143 110 80 443; do
+                  ufw allow "$port/tcp"
+              done
+              ufw --force enable || warn "Could not enable ufw"
+          elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+              firewall-cmd --permanent --add-service=ssh
+              firewall-cmd --permanent --add-service=smtp
+              firewall-cmd --permanent --add-service=http
+              firewall-cmd --permanent --add-service=https
+              for port in 587 143 110; do
+                  firewall-cmd --permanent --add-port="$port/tcp"
+              done
+              firewall-cmd --reload || warn "Could not reload firewalld"
+          else
+              warn "No host firewall (ufw/firewalld) found; restrict inbound traffic to ports 22, 25, 587, 143, 110, 80 and 443 yourself"
+          fi
+      }
+
+      prepare_dirs() {
+          # Only the data dir belongs to the container user (uid 1000); the config
+          # dir holding credentials.txt stays root-only.
+          mkdir -p "$CONFIG_DIR" "$DATA_DIR"
+          chmod 700 "$CONFIG_DIR"
+          chown -R 1000:1000 "$DATA_DIR"
+      }
+
+      cleanup_tmpdir() {
+          if [[ -n "$KM_TMPDIR" ]]; then
+              rm -rf "$KM_TMPDIR"
+              KM_TMPDIR=""
+          fi
+      }
+
+      pull_or_build_image() {
+          log "Pulling $IMAGE..."
+          if docker pull "$IMAGE"; then
+              return 0
+          fi
+          warn "Registry image not available, building from source..."
+          KM_TMPDIR=$(mktemp -d)
+          trap cleanup_tmpdir EXIT
+          command -v git >/dev/null 2>&1 || pkg_install git
+          git clone --depth 1 "$KM_REPO_URL.git" "$KM_TMPDIR/src"
+          docker build -t "$IMAGE" "$KM_TMPDIR/src"
+          cleanup_tmpdir
+          trap - EXIT
+      }
+
+      generate_secrets() {
+          if [[ -z "$API_KEY" ]]; then
+              API_KEY=$(openssl rand -hex 32)
+          fi
+          if [[ -z "$ADMIN_PASSWORD" ]]; then
+              ADMIN_PASSWORD=$(openssl rand -base64 48 | tr -d '/+=\n' | cut -c1-32)
+          fi
+      }
+
+      detect_public_ip() {
+          PUBLIC_IP=$(public_ip 2>/dev/null || true)
+          if [[ -z "$PUBLIC_IP" ]]; then
+              PUBLIC_IP="YOUR_IP"
+          fi
+          # Base URL of the web interface, used in "password change required"
+          # replies to mail clients. Switch it to https:// once certbot has run.
+          if [[ -z "$PUBLIC_URL" ]]; then
+              if [[ "$SECURE_COOKIE" == "true" ]]; then
+                  PUBLIC_URL="https://$DOMAIN"
+              elif [[ "$PUBLIC_IP" != "YOUR_IP" ]]; then
+                  PUBLIC_URL="http://$PUBLIC_IP"
+              fi
+          fi
+      }
+
+      # Requests proxied by Nginx reach the container from the Docker bridge
+      # gateway, so that range must be a trusted proxy for kiss-mail to take the
+      # client IP (lockout, allowed_ips) from X-Real-IP. Prints the bridge subnet,
+      # or the whole default Docker range when it cannot be determined.
+      docker_bridge_cidr() {
+          local subnet
+          for subnet in $(docker network inspect bridge --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null); do
+              if [[ "$subnet" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+                  echo "$subnet"
+                  return 0
+              fi
+          done
+          echo "172.16.0.0/12"
+      }
+
+      # credentials.txt is written (root-only) as soon as the secrets exist, so they
+      # are never lost if a later step fails, and rewritten once the admin password
+      # has been set.
+      write_credentials() {
+          local admin_line="$1"
+          (
+              umask 077
+              cat > "$CONFIG_DIR/credentials.txt.new" << CREDS
       KISS Mail Server Credentials
       =============================
-      Domain: $KISS_MAIL_DOMAIN
-      API Key: $KISS_MAIL_API_KEY
+      Domain: $DOMAIN
+      Admin user: admin
+      $admin_line
+      API Key: $API_KEY
       Web Admin: http://$PUBLIC_IP/admin
-      
+      REST API: loopback only; from your machine: ssh -L 8025:127.0.0.1:8025 <user>@$PUBLIC_IP
+                then: kiss-mail --server http://127.0.0.1:8025 --api-key <API Key> status
+
+      Change the admin password later in the web admin, or offline:
+        docker stop kiss-mail
+        docker run --rm -i -v $DATA_DIR:/data $IMAGE passwd admin --stdin
+        docker start kiss-mail
+      (never run "passwd" against the running container: the server would
+      overwrite the change with its in-memory copy)
+
+      HTTPS: certbot --nginx -d $DOMAIN
+      The session cookie is currently sent with KISS_MAIL_WEB_SECURE_COOKIE=$SECURE_COOKIE
+      and KISS_MAIL_PUBLIC_URL is "$PUBLIC_URL".
+      Once HTTPS works, recreate the container with a Secure cookie and an https URL:
+        curl -fsSL $KM_REPO_URL/raw/main/deploy/scripts/upgrade.sh | sudo bash -s -- --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true --env KISS_MAIL_PUBLIC_URL=https://$DOMAIN
+      Or let certbot do it once the certificate is issued (the hook is a no-op
+      after the first run):
+        certbot --nginx -d $DOMAIN --deploy-hook 'docker inspect kiss-mail --format "{{.Config.Env}}" | grep -q KISS_MAIL_WEB_SECURE_COOKIE=true || curl -fsSL $KM_REPO_URL/raw/main/deploy/scripts/upgrade.sh | bash -s -- --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true --env KISS_MAIL_PUBLIC_URL=https://$DOMAIN'
+
+      Note: SMTP/IMAP/POP3 are plaintext (no STARTTLS). Use a TLS-terminating
+      proxy in front of them before sending real passwords over the internet.
+
       Generated: $(date)
-      EOF
-      
-      chmod 600 /opt/kiss-mail/credentials.txt
-      
-      echo ""
-      echo "============================================"
-      echo "KISS Mail setup complete!"
-      echo "============================================"
-      echo ""
-      echo "Web Admin: http://$PUBLIC_IP/admin"
-      echo "Credentials: /opt/kiss-mail/credentials.txt"
-      echo ""
+      CREDS
+              mv -f "$CONFIG_DIR/credentials.txt.new" "$CONFIG_DIR/credentials.txt"
+          )
+      }
+
+      run_container() {
+          log "Starting KISS Mail container..."
+          docker rm -f kiss-mail >/dev/null 2>&1 || true
+          local trusted_proxies
+          trusted_proxies="127.0.0.1/32,::1/128,$(docker_bridge_cidr)"
+          log "Trusted proxies: $trusted_proxies"
+          # The web UI binds 0.0.0.0 inside the container, which would make the
+          # session cookie Secure by default; it stays non-Secure (SECURE_COOKIE)
+          # until HTTPS is enabled in front of it. An empty KISS_MAIL_PUBLIC_URL is
+          # treated as unset by the server.
+          docker run -d \
+              --name kiss-mail \
+              --restart unless-stopped \
+              -p 25:2525 \
+              -p 587:2525 \
+              -p 143:1143 \
+              -p 110:1100 \
+              -p 127.0.0.1:8080:8080 \
+              -p 127.0.0.1:8025:8025 \
+              -v "$DATA_DIR":/data \
+              -e KISS_MAIL_DATA_DIR=/data \
+              -e KISS_MAIL_DOMAIN="$DOMAIN" \
+              -e KISS_MAIL_API_KEY="$API_KEY" \
+              -e KISS_MAIL_WEB_BIND=0.0.0.0 \
+              -e KISS_MAIL_API_BIND=0.0.0.0 \
+              -e KISS_MAIL_WEB_SECURE_COOKIE="$SECURE_COOKIE" \
+              -e KISS_MAIL_TRUSTED_PROXIES="$trusted_proxies" \
+              -e KISS_MAIL_PUBLIC_URL="$PUBLIC_URL" \
+              -e CLAMAV_ENABLED=false \
+              -e RUST_LOG=kiss_mail=info \
+              "$IMAGE" >/dev/null
+      }
+
+      # Wait until the server accepts SMTP connections. It only listens after it
+      # has finished initialising (users.json, keys.json, the admin account), so
+      # the offline passwd below never races its first writes.
+      wait_for_server() {
+          for _ in $(seq 1 90); do
+              if docker exec kiss-mail nc -z localhost 2525 >/dev/null 2>&1; then
+                  return 0
+              fi
+              sleep 1
+          done
+          return 1
+      }
+
+      # The running server keeps accounts in memory and would overwrite a change
+      # made by `kiss-mail passwd` inside the container, so the password is set
+      # offline: stop, run passwd in a one-off container on the same data, start.
+      # Returns 0 on success, 1 if the server never came up, 2 if stopping it or
+      # `passwd` failed (the container is started again) and 3 if the password was
+      # changed but the container could not be started again.
+      set_admin_password() {
+          if ! wait_for_server; then
+              return 1
+          fi
+          if ! docker stop kiss-mail >/dev/null; then
+              return 2
+          fi
+          local rc=0
+          # Read from stdin so the password never appears in a process listing.
+          if printf '%s' "$ADMIN_PASSWORD" | docker run --rm -i \
+              -v "$DATA_DIR":/data \
+              -e KISS_MAIL_DATA_DIR=/data \
+              -e KISS_MAIL_DOMAIN="$DOMAIN" \
+              "$IMAGE" passwd admin --stdin; then
+              # The server's bootstrap password is no longer valid; remove its file.
+              rm -f "$DATA_DIR/initial-admin-password" || warn "Could not remove $DATA_DIR/initial-admin-password"
+          else
+              rc=2
+          fi
+          if ! docker start kiss-mail >/dev/null; then
+              if [[ "$rc" -eq 0 ]]; then
+                  return 3
+              fi
+              warn "Could not start the kiss-mail container again; run: docker start kiss-mail"
+              return "$rc"
+          fi
+          wait_for_server || warn "KISS Mail is slow to come back after the restart; check: docker logs kiss-mail"
+          return "$rc"
+      }
+
+      ADMIN_PASSWORD_RC=0
+      finish_admin_password() {
+          local rc=0
+          local bootstrap="$DATA_DIR/initial-admin-password"
+          log "Waiting for KISS Mail to start and setting the admin password..."
+          set_admin_password || rc=$?
+          # shellcheck disable=SC2034  # read by callers that need the result
+          ADMIN_PASSWORD_RC="$rc"
+          case "$rc" in
+              0)
+                  write_credentials "Admin password: $ADMIN_PASSWORD"
+                  log "Admin password set"
+                  ;;
+              1)
+                  warn "KISS Mail did not accept connections on port 2525 within 90s; check: docker logs kiss-mail"
+                  write_credentials "Admin password: NOT SET (server did not start). Once it runs, its bootstrap password is in $bootstrap (must be changed at first login)"
+                  ;;
+              2)
+                  warn "Setting the admin password failed (docker run ... passwd admin --stdin)."
+                  warn "The server's bootstrap password is in $bootstrap"
+                  write_credentials "Admin password: NOT SET (passwd failed). Use the bootstrap password in $bootstrap (must be changed at first login)"
+                  ;;
+              3)
+                  warn "The admin password was changed but starting the container failed; run: docker start kiss-mail"
+                  write_credentials "Admin password: $ADMIN_PASSWORD (start the server with: docker start kiss-mail)"
+                  ;;
+          esac
+          return 0
+      }
+      # <<< kiss-mail common <<<
+
+      # ----------------------------------------------------------------------------
+      # Main
+      # ----------------------------------------------------------------------------
+      exec > >(tee -a /var/log/kiss-mail-setup.log) 2>&1
+      log "Starting KISS Mail setup at $(date)"
+
+      read_config
+      validate_domain
+      detect_os
+      install_base_packages
+      if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+          pkg_install ufw
+      fi
+      install_docker
+      install_nginx
+      install_certbot
+      prepare_dirs
+      pull_or_build_image
+      detect_public_ip
+      generate_secrets
+      write_credentials "Admin password: PENDING - setup has not finished (see /var/log/kiss-mail-setup.log). The server's bootstrap password is in $DATA_DIR/initial-admin-password"
+      run_container
+      configure_nginx
+      configure_firewall
+      finish_admin_password
+
+      # Remove the setup copies (the config may hold an API key)
+      rm -f /opt/kiss-mail-setup.sh /etc/kiss-mail.conf
+
+      log "KISS Mail setup complete at $(date)"
+      log "Web Admin: http://$PUBLIC_IP/admin"
+      log "Credentials saved to $CONFIG_DIR/credentials.txt (root only)"
 
 package_update: true
 package_upgrade: true
@@ -178,6 +603,6 @@ packages:
   - ca-certificates
 
 runcmd:
-  - /opt/kiss-mail/setup.sh
+  - [bash, /opt/kiss-mail-setup.sh]
 
 final_message: "KISS Mail cloud-init complete after $UPTIME seconds"

@@ -6,13 +6,17 @@
 hcloud_token = "your-hetzner-api-token"
 
 # Location
-# nbg1 = Nuremberg, fsn1 = Falkenstein, hel1 = Helsinki, ash = Ashburn
+# nbg1 = Nuremberg, fsn1 = Falkenstein, hel1 = Helsinki, ash = Ashburn,
+# hil = Hillsboro, sin = Singapore
 location = "nbg1"
 
 # Server type
-# cx11 = €3.29/month (1 vCPU, 2GB RAM)
-# cx21 = €5.49/month (2 vCPU, 4GB RAM)
-server_type = "cx11"
+# cx22 = 2 vCPU, 4GB RAM (default)
+# cx32 = 4 vCPU, 8GB RAM
+server_type = "cx22"
+
+# The KISS Mail admin password is generated on the server and saved in the
+# root-only /opt/kiss-mail/credentials.txt (it is not a Terraform variable).
 
 # Mail domain
 domain = "mail.example.com"

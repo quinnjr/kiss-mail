@@ -53,7 +53,6 @@ do_token       = "your-digitalocean-api-token"
 region         = "nyc1"
 droplet_size   = "s-1vcpu-1gb"
 domain         = "mail.yourdomain.com"
-admin_password = "your-secure-password"
 ```
 
 ### Available Regions
@@ -81,6 +80,19 @@ doctl compute size list
 | s-1vcpu-2gb | 1 | 2GB | $12/mo |
 | s-2vcpu-2gb | 2 | 2GB | $18/mo |
 | s-2vcpu-4gb | 2 | 4GB | $24/mo |
+
+The admin password is not a Terraform variable: it is generated on the
+server (so it never reaches Terraform state or instance metadata) and written
+to the root-only `/opt/kiss-mail/credentials.txt` (`terraform output
+credentials_command`). The server is provisioned by the shared bootstrap
+script `deploy/common/bootstrap.sh.tftpl` on Ubuntu 24.04 LTS. The web admin
+is reached through Nginx on port 80; the REST API is published on
+`127.0.0.1` only (use `ssh -L 8025:127.0.0.1:8025 ...` for the remote CLI).
+After `certbot --nginx`, switch the session cookie to Secure with
+`upgrade.sh --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true` (see the main
+README).
+The droplet uses the plain `ubuntu-24-04-x64` image; Docker is installed by the
+bootstrap script.
 
 ## Access
 

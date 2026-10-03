@@ -21,8 +21,6 @@ maintainers:
   - name: Joseph R. Quinn
     url: https://github.com/quinnjr
 
-icon: https://raw.githubusercontent.com/quinnjr/kiss-mail/main/icon.png
-
 annotations:
   artifacthub.io/license: MIT
   artifacthub.io/links: |

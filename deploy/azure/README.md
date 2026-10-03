@@ -31,7 +31,7 @@ terraform apply
 | Virtual Network | Custom VNet | Free |
 | Network Security Group | Firewall rules | Free |
 | Public IP | Static IP address | ~$3/month |
-| Virtual Machine | Standard_B1s (Ubuntu 22.04) | ~$8/month |
+| Virtual Machine | Standard_B1s (Ubuntu 24.04 LTS) | ~$8/month |
 
 **Estimated Cost: ~$10-15/month**
 
@@ -43,17 +43,34 @@ terraform apply
 | Standard_B1ms | 1 | 2GB | ~$15/month |
 | Standard_B2s | 2 | 4GB | ~$30/month |
 
+## Admin Password
+
+The admin password is not a Terraform variable: it is generated on the
+server (so it never reaches Terraform state or instance metadata) and written
+to the root-only `/opt/kiss-mail/credentials.txt` (`terraform output
+credentials_command`). The server is provisioned by the shared bootstrap
+script `deploy/common/bootstrap.sh.tftpl` on Ubuntu 24.04 LTS. The web admin
+is reached through Nginx on port 80; the REST API is published on
+`127.0.0.1` only (use `ssh -L 8025:127.0.0.1:8025 ...` for the remote CLI).
+After `certbot --nginx`, switch the session cookie to Secure with
+`upgrade.sh --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true` (see the main
+README).
+
+azurerm 4.x requires a subscription: set `subscription_id` in
+`terraform.tfvars` or export `ARM_SUBSCRIPTION_ID`.
+
 ## Access
 
 ```bash
 # SSH
 ssh azureuser@<public_ip>
 
-# View credentials
-cat /opt/kiss-mail/credentials.txt
+# View credentials (admin password, API key)
+sudo cat /opt/kiss-mail/credentials.txt
 
-# View container logs
-docker logs kiss-mail
+# View setup log / container logs
+sudo cat /var/log/kiss-mail-setup.log
+sudo docker logs kiss-mail
 ```
 
 ## Cleanup

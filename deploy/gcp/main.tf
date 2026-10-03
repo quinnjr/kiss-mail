@@ -9,7 +9,7 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = "~> 5.0"
+      version = "~> 7.0"
     }
   }
 }
@@ -37,20 +37,18 @@ variable "zone" {
 variable "machine_type" {
   description = "Compute Engine machine type"
   type        = string
-  default     = "e2-micro"  # Free tier eligible
+  default     = "e2-micro" # Free tier eligible
 }
 
 variable "domain" {
   description = "Mail domain"
   type        = string
   default     = "mail.example.com"
-}
 
-variable "admin_password" {
-  description = "Initial admin password"
-  type        = string
-  default     = ""
-  sensitive   = true
+  validation {
+    condition     = can(regex("^[A-Za-z0-9.-]+$", var.domain))
+    error_message = "The domain may only contain letters, digits, '.' and '-'."
+  }
 }
 
 variable "disk_size" {
@@ -112,6 +110,14 @@ resource "google_compute_address" "kiss_mail" {
 }
 
 # ----------------------------------------------------------------------------
+# Service account (no IAM roles: the VM needs no Google Cloud API access)
+# ----------------------------------------------------------------------------
+resource "google_service_account" "kiss_mail" {
+  account_id   = "kiss-mail-vm"
+  display_name = "KISS Mail VM (no roles)"
+}
+
+# ----------------------------------------------------------------------------
 # Compute Instance
 # ----------------------------------------------------------------------------
 resource "google_compute_instance" "kiss_mail" {
@@ -122,7 +128,10 @@ resource "google_compute_instance" "kiss_mail" {
 
   boot_disk {
     initialize_params {
-      image = "cos-cloud/cos-stable"  # Container-Optimized OS
+      # Ubuntu + Docker (installed by the startup script). The container
+      # publishes 25/587/143/110 -> 2525/1143/1100 and Nginx proxies the web
+      # admin/API on port 80, matching the firewall rule above.
+      image = "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
       size  = var.disk_size
       type  = "pd-standard"
     }
@@ -135,41 +144,21 @@ resource "google_compute_instance" "kiss_mail" {
     }
   }
 
-  metadata = {
-    gce-container-declaration = yamlencode({
-      spec = {
-        containers = [{
-          name  = "kiss-mail"
-          image = "ghcr.io/quinnjr/kiss-mail:latest"
-          env = [
-            { name = "KISS_MAIL_DOMAIN", value = var.domain },
-            { name = "KISS_MAIL_WEB_BIND", value = "0.0.0.0" },
-            { name = "KISS_MAIL_API_BIND", value = "0.0.0.0" },
-          ]
-          volumeMounts = [{
-            name      = "data"
-            mountPath = "/data"
-          }]
-        }]
-        volumes = [{
-          name = "data"
-          hostPath = {
-            path = "/var/kiss-mail"
-          }
-        }]
-        restartPolicy = "Always"
-      }
-    })
-  }
+  # Runs on every boot; the script provisions only once (data lives in
+  # /opt/kiss-mail/data on the boot disk).
+  # The admin password is generated on the VM and kept only in the root-only
+  # /opt/kiss-mail/credentials.txt.
+  metadata_startup_script = templatefile("${path.module}/../common/bootstrap.sh.tftpl", {
+    provider_name = "gcp"
+    domain        = var.domain
+    public_ip_cmd = "curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip"
+  })
 
-  metadata_startup_script = <<-EOF
-    #!/bin/bash
-    mkdir -p /var/kiss-mail
-    chmod 777 /var/kiss-mail
-  EOF
-
+  # Dedicated service account without roles, and only the logging scope
+  # (not the default compute account with cloud-platform).
   service_account {
-    scopes = ["cloud-platform"]
+    email  = google_service_account.kiss_mail.email
+    scopes = ["https://www.googleapis.com/auth/logging.write"]
   }
 
   labels = {
@@ -194,6 +183,26 @@ output "public_ip" {
 output "web_admin_url" {
   description = "Web admin URL"
   value       = "http://${google_compute_address.kiss_mail.address}/admin"
+}
+
+output "smtp_server" {
+  description = "SMTP server address"
+  value       = "${google_compute_address.kiss_mail.address}:25"
+}
+
+output "imap_server" {
+  description = "IMAP server address"
+  value       = "${google_compute_address.kiss_mail.address}:143"
+}
+
+output "pop3_server" {
+  description = "POP3 server address"
+  value       = "${google_compute_address.kiss_mail.address}:110"
+}
+
+output "credentials_command" {
+  description = "Show the generated credentials (admin password, API key)"
+  value       = "gcloud compute ssh kiss-mail --zone ${var.zone} --command 'sudo cat /opt/kiss-mail/credentials.txt'"
 }
 
 output "ssh_command" {

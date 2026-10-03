@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main, develop]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -19,30 +22,48 @@ jobs:
     name: Formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (no release tags; see CONTRIBUTING.md)
         with:
+          toolchain: stable
           components: rustfmt
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  deploy-scripts:
+    name: Deploy Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Shared provisioning block is in sync
+        run: bash deploy/common/check-sync.sh
+
+      - name: ShellCheck
+        run: |
+          shellcheck deploy/scripts/*.sh deploy/common/check-sync.sh
+          # Render the Terraform template with dummy values and check it too
+          # shellcheck disable=SC2016 # literal Terraform placeholders
+          sed -e 's/\${provider_name}/ci/' -e 's/\${domain}/mail.example.com/' \
+              -e 's/\${public_ip_cmd}/curl -s ifconfig.me/' \
+              deploy/common/bootstrap.sh.tftpl > "$RUNNER_TEMP/bootstrap.sh"
+          shellcheck "$RUNNER_TEMP/bootstrap.sh"
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (no release tags; see CONTRIBUTING.md)
         with:
+          toolchain: stable
           components: clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -56,35 +77,25 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
 
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (no release tags; see CONTRIBUTING.md)
         with:
-          targets: ${{ matrix.target }}
-
+          toolchain: stable
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.os }}
 
-      - name: Build
-        run: cargo build --verbose
-
+      # `cargo test` builds everything it needs; no separate debug build.
       - name: Run tests
         run: cargo test --verbose
 
       - name: Build release
-        run: cargo build --release --verbose
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --release --locked --verbose
 
   # ==========================================================================
   # Documentation
@@ -93,14 +104,13 @@ jobs:
     name: Documentation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (no release tags; see CONTRIBUTING.md)
+        with:
+          toolchain: stable
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build docs
         run: cargo doc --no-deps --all-features
         env:
@@ -113,44 +123,43 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (no release tags; see CONTRIBUTING.md)
         with:
+          toolchain: stable
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-llvm-cov
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Generate coverage
         run: cargo llvm-cov --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
           files: lcov.info
           fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   # ==========================================================================
   # Minimum Supported Rust Version
   # ==========================================================================
   msrv:
-    name: MSRV (1.85.0)
+    name: MSRV (1.94.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust 1.85.0
-        uses: dtolnay/rust-toolchain@1.85.0
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.94.0
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (no release tags; see CONTRIBUTING.md)
+        with:
+          toolchain: 1.94.0
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check MSRV
         run: cargo check --all-features

@@ -46,7 +46,27 @@ Domain: {{ .Values.domain }}
 {{- end }}
 {{- end }}
 
-5. Quick CLI commands:
+5. Admin account:
+
+   An "admin" superadmin account is created on first start. Its generated
+   password is written to /data/initial-admin-password (it is not logged):
+   kubectl exec deploy/{{ include "kiss-mail.fullname" . }} -n {{ .Release.Namespace }} -- cat /data/initial-admin-password
+
+   It must be changed at first login. Easiest: log in to the web admin with
+   it (port-forward above) and set a new one when prompted.
+{{- if eq (include "kiss-mail.secureCookie" .) "true" }}
+   (KISS_MAIL_WEB_SECURE_COOKIE=true: log in over https, not the port-forward.)
+{{- end }}
+
+   Or from the command line (the password is read from stdin, so it stays
+   out of the process list). The running server keeps accounts in memory, so
+   restart it right away so it reloads users.json:
+   read -rs P   # type the new password
+   printf '%s' "$P" | kubectl exec -i deploy/{{ include "kiss-mail.fullname" . }} -n {{ .Release.Namespace }} -- kiss-mail passwd admin --stdin
+   kubectl exec deploy/{{ include "kiss-mail.fullname" . }} -n {{ .Release.Namespace }} -- rm -f /data/initial-admin-password
+   kubectl rollout restart deploy/{{ include "kiss-mail.fullname" . }} -n {{ .Release.Namespace }}
+
+6. Quick CLI commands (restart the deployment after changes, see above):
 
    # List users
    kubectl exec -it deploy/{{ include "kiss-mail.fullname" . }} -n {{ .Release.Namespace }} -- kiss-mail list

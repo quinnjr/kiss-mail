@@ -1,37 +1,34 @@
-//! Zero-Knowledge Email Encryption (ProtonMail-style)
+//! Encryption at rest for stored mail, with password-wrapped keys.
 //!
-//! This module provides automatic email encryption at rest:
-//! - Each user has a unique X25519 key pair
-//! - Private keys are encrypted with the user's password (via Argon2)
-//! - Emails are encrypted using ChaCha20-Poly1305
-//! - Emails between local users use end-to-end encryption
-//! - External emails are encrypted at rest after reception
+//! What this module actually does:
+//! - Each user has an X25519 key pair (generated when the account is created,
+//!   or lazily on the first successful password login for older accounts).
+//! - The private key is wrapped (encrypted) with ChaCha20-Poly1305 under a key
+//!   derived from the user's password with Argon2id; only the public key and the
+//!   wrapped private key are written to `keys.json`.
+//! - Each delivered message is encrypted to the recipient's public key using an
+//!   ECIES-style construction: a fresh ephemeral X25519 key pair per message,
+//!   ECDH with the recipient's public key, SHA-256 over a fixed label and the
+//!   shared secret as the KDF, and ChaCha20-Poly1305 for the message bytes.
+//! - When a user logs in (IMAP/POP3) with their password the server unwraps the
+//!   private key and keeps it in memory for the session; it is dropped again on
+//!   logout/disconnect.
 //!
-//! # Security Model
+//! Limitations (this is *not* end-to-end encryption):
+//! - The server receives mail in plaintext over SMTP and encrypts it itself.
+//! - The server sees the user's password at login and holds the unwrapped
+//!   private key in memory while a session is open.
+//! - Parsed headers (From, To, Subject, ...) are stored in plaintext alongside
+//!   the encrypted message so that listings work without the private key.
+//! - Resetting a password without the old one (admin reset) requires a new key
+//!   pair, which makes previously stored encrypted mail unreadable.
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                     User Registration                           │
-//! │  Password → Argon2 → Key Encryption Key (KEK)                  │
-//! │  Generate X25519 keypair                                        │
-//! │  Private key encrypted with KEK → stored                        │
-//! │  Public key → stored (unencrypted)                              │
-//! └─────────────────────────────────────────────────────────────────┘
-//!
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                     Email Encryption                            │
-//! │  1. Generate random symmetric key (per email)                   │
-//! │  2. Encrypt email body with ChaCha20-Poly1305                   │
-//! │  3. Encrypt symmetric key with recipient's public key           │
-//! │  4. Store: encrypted_key + nonce + ciphertext                   │
-//! └─────────────────────────────────────────────────────────────────┘
-//!
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                     Email Decryption                            │
-//! │  1. User logs in → password decrypts private key                │
-//! │  2. Private key decrypts email's symmetric key                  │
-//! │  3. Symmetric key decrypts email body                           │
-//! └─────────────────────────────────────────────────────────────────┘
+//! Registration:  password --Argon2id--> KEK;  X25519 keypair;  wrap(private, KEK)
+//! Delivery:      ephemeral X25519 + ECDH(recipient pub) --SHA-256--> key;
+//!                ChaCha20-Poly1305(key, message)
+//! Login:         password --Argon2id--> KEK; unwrap private key (session only)
+//! Read:          ECDH(private, ephemeral pub) --SHA-256--> key; decrypt
 //! ```
 
 use argon2::Argon2;
@@ -45,6 +42,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -81,10 +79,18 @@ pub struct UserKeyPair {
 pub struct SessionKeys {
     /// Decrypted private key
     pub private_key: StaticSecret,
-    /// Public key
-    pub public_key: PublicKey,
-    /// Username
-    pub username: String,
+}
+
+/// An unlocked key session for one user, shared by all of that user's open
+/// logins (reference counted).
+struct Session {
+    keys: SessionKeys,
+    /// Open logins holding this session.
+    refs: usize,
+    /// Identifies this session: returned by `unlock_keys` and required by
+    /// `lock_keys`, so a login opened before a key regeneration or deletion
+    /// cannot release a reference held by a newer session.
+    generation: u64,
 }
 
 /// An encrypted email
@@ -125,116 +131,234 @@ pub struct EncryptionMetadata {
 pub struct CryptoManager {
     /// User keys (username -> key pair)
     keys: Arc<RwLock<HashMap<String, UserKeyPair>>>,
-    /// Active session keys (username -> decrypted keys)
-    sessions: Arc<RwLock<HashMap<String, SessionKeys>>>,
+    /// Active key sessions (username -> session)
+    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    /// Source of session generations (never reused within a process).
+    next_generation: AtomicU64,
     /// Data directory for key storage
     data_dir: PathBuf,
     /// Whether encryption is enabled
     enabled: bool,
+    /// Set when `keys.json` existed but could not be read/parsed. While set,
+    /// every key change is refused so the unreadable file is never replaced by
+    /// an (incomplete) in-memory map.
+    load_error: Option<String>,
+    /// Serialises key changes (and with them writes of `keys.json`).
+    save_lock: tokio::sync::Mutex<()>,
 }
 
 impl CryptoManager {
-    /// Create a new crypto manager
+    /// Create a new crypto manager; encryption of new mail is enabled unless
+    /// `KISS_MAIL_ENCRYPTION` is `false`/`0`/`no`/`off`.
+    ///
+    /// Safe to call from inside a tokio runtime (keys are loaded with plain
+    /// `std::fs` before the lock is constructed).
     pub fn new(data_dir: PathBuf) -> Self {
-        let enabled = std::env::var("KISS_MAIL_ENCRYPTION")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-
-        let manager = Self {
-            keys: Arc::new(RwLock::new(HashMap::new())),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            data_dir,
-            enabled,
-        };
-
-        // Load keys synchronously during construction
-        let keys_path = manager.data_dir.join("keys.json");
-        if keys_path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&keys_path) {
-                if let Ok(keys) = serde_json::from_str(&data) {
-                    *manager.keys.blocking_write() = keys;
-                }
-            }
-        }
-
-        manager
+        let enabled = crate::config::env_bool("KISS_MAIL_ENCRYPTION", true);
+        Self::with_enabled(data_dir, enabled)
     }
 
-    /// Check if encryption is enabled
+    /// Create a crypto manager with an explicit enabled flag. `enabled` only
+    /// controls whether NEW mail is encrypted; key management, unlocking and
+    /// decryption work either way.
+    pub fn with_enabled(data_dir: PathBuf, enabled: bool) -> Self {
+        let keys_path = data_dir.join("keys.json");
+        let (keys, load_error) = Self::load_keys_file(&keys_path);
+
+        Self {
+            keys: Arc::new(RwLock::new(keys)),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            next_generation: AtomicU64::new(1),
+            data_dir,
+            enabled,
+            load_error,
+            save_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Read `keys.json`. A missing file yields an empty map; an unreadable or
+    /// unparsable file yields an empty map plus an error (which blocks saving).
+    fn load_keys_file(path: &std::path::Path) -> (HashMap<String, UserKeyPair>, Option<String>) {
+        if !path.exists() {
+            return (HashMap::new(), None);
+        }
+        let result = std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|data| {
+                serde_json::from_str::<HashMap<String, UserKeyPair>>(&data)
+                    .map_err(|e| e.to_string())
+            });
+        match result {
+            Ok(keys) => (keys, None),
+            Err(e) => {
+                let msg = format!("failed to load {}: {}", path.display(), e);
+                tracing::error!(
+                    "Encryption keys could not be loaded ({}); refusing to overwrite the key file until this is fixed",
+                    msg
+                );
+                (HashMap::new(), Some(msg))
+            }
+        }
+    }
+
+    /// Check if encryption of new mail is enabled
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
-    /// Save keys to disk
-    async fn save_keys(&self) -> Result<(), CryptoError> {
-        let keys = self.keys.read().await;
-        let data = serde_json::to_string_pretty(&*keys)
-            .map_err(|e| CryptoError::StorageError(e.to_string()))?;
+    /// `Some(reason)` if `keys.json` existed but could not be read or parsed.
+    /// While set, every key change is refused.
+    pub fn load_error(&self) -> Option<String> {
+        self.load_error.clone()
+    }
 
+    fn check_loaded(&self) -> Result<(), CryptoError> {
+        match &self.load_error {
+            Some(err) => {
+                tracing::error!("Refusing to change encryption keys: {}", err);
+                Err(CryptoError::StorageError(format!(
+                    "refusing to save keys: {}",
+                    err
+                )))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Apply a change to the key map durably: the change is made on a copy,
+    /// the copy is written to `keys.json`, and only after a successful write
+    /// is it installed in memory. All key changes go through here while
+    /// holding `save_lock`, so the copy is always current.
+    ///
+    /// `change` returns the value to hand back and whether it modified the map
+    /// (an unchanged map is not rewritten).
+    async fn commit<R>(
+        &self,
+        change: impl FnOnce(&mut HashMap<String, UserKeyPair>) -> Result<(R, bool), CryptoError>,
+    ) -> Result<R, CryptoError> {
+        self.check_loaded()?;
+
+        let _guard = self.save_lock.lock().await;
+        let mut next = self.keys.read().await.clone();
+        let (result, changed) = change(&mut next)?;
+        if !changed {
+            return Ok(result);
+        }
+
+        let data = serde_json::to_vec_pretty(&next)
+            .map_err(|e| CryptoError::StorageError(e.to_string()))?;
+        tokio::fs::create_dir_all(&self.data_dir)
+            .await
+            .map_err(|e| CryptoError::StorageError(e.to_string()))?;
         let keys_path = self.data_dir.join("keys.json");
-        tokio::fs::write(&keys_path, data)
+        crate::storage::write_atomic(&keys_path, data)
             .await
             .map_err(|e| CryptoError::StorageError(e.to_string()))?;
 
-        Ok(())
+        *self.keys.write().await = next;
+        Ok(result)
     }
 
-    /// Generate a new key pair for a user
-    pub async fn generate_keypair(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<UserKeyPair, CryptoError> {
-        // Generate X25519 key pair
+    /// Create a fresh key pair wrapped with `password` (not stored).
+    async fn new_keypair(password: &str) -> Result<UserKeyPair, CryptoError> {
         let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&private_key);
+        let (encrypted_private_key, salt, nonce) = wrap_private_key(&private_key, password).await?;
 
-        // Derive key encryption key from password
-        let salt = generate_random_bytes(SALT_SIZE);
-        let kek = derive_key_from_password(password, &salt)?;
-
-        // Encrypt private key with KEK
-        let nonce = generate_random_bytes(NONCE_SIZE);
-        let cipher = ChaCha20Poly1305::new_from_slice(&kek)
-            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
-
-        let encrypted_private_key = cipher
-            .encrypt(Nonce::from_slice(&nonce), private_key.as_bytes().as_slice())
-            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
-
-        let keypair = UserKeyPair {
+        Ok(UserKeyPair {
             public_key: public_key.as_bytes().to_vec(),
             encrypted_private_key,
             salt,
             nonce,
             version: 1,
             created_at: chrono::Utc::now(),
-        };
+        })
+    }
 
-        // Store key pair
-        {
-            let mut keys = self.keys.write().await;
-            keys.insert(username.to_string(), keypair.clone());
+    /// Generate a key pair for a user if they do not have one yet
+    /// (insert-if-absent). If the user already has keys, the existing key pair
+    /// is returned unchanged. The new key pair is written to disk before it
+    /// becomes visible in memory; nothing is kept if saving fails.
+    pub async fn generate_keypair(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<UserKeyPair, CryptoError> {
+        self.check_loaded()?;
+        if let Some(existing) = self.keys.read().await.get(username).cloned() {
+            return Ok(existing);
         }
-        self.save_keys().await?;
 
-        tracing::info!("Generated encryption keypair for user: {}", username);
+        let keypair = Self::new_keypair(password).await?;
+
+        let (stored, created) = self
+            .commit(|keys| match keys.get(username) {
+                // Someone else won the race while we were deriving.
+                Some(existing) => Ok(((existing.clone(), false), false)),
+                None => {
+                    keys.insert(username.to_string(), keypair.clone());
+                    Ok(((keypair, true), true))
+                }
+            })
+            .await?;
+
+        if created {
+            tracing::info!("Generated encryption keypair for user: {}", username);
+        }
+        Ok(stored)
+    }
+
+    /// Replace a user's key pair with a fresh one wrapped with `password`
+    /// (admin password reset). Saved before it is installed in memory; any
+    /// unlocked session holding the old private key is dropped, so the next
+    /// unlock starts a new generation and `lock_keys` calls for the old one
+    /// become no-ops.
+    pub async fn regenerate_keypair(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<UserKeyPair, CryptoError> {
+        self.check_loaded()?;
+        let keypair = Self::new_keypair(password).await?;
+
+        self.commit(|keys| {
+            keys.insert(username.to_string(), keypair.clone());
+            Ok(((), true))
+        })
+        .await?;
+
+        {
+            // Drop the session only if it holds the old key (a session
+            // unlocked with the new key after the commit is kept).
+            let mut sessions = self.sessions.write().await;
+            let stale = sessions.get(username).is_some_and(|s| {
+                PublicKey::from(&s.keys.private_key).as_bytes().as_slice()
+                    != keypair.public_key.as_slice()
+            });
+            if stale {
+                sessions.remove(username);
+            }
+        }
+        tracing::info!("Regenerated encryption keypair for user: {}", username);
         Ok(keypair)
     }
 
-    /// Unlock a user's private key with their password
-    pub async fn unlock_keys(
+    /// Unwrap a user's private key with their password without registering a
+    /// session.
+    async fn unwrap_keys(
         &self,
         username: &str,
         password: &str,
     ) -> Result<SessionKeys, CryptoError> {
-        let keys = self.keys.read().await;
-        let keypair = keys
-            .get(username)
-            .ok_or_else(|| CryptoError::KeyNotFound(username.to_string()))?;
+        let keypair = {
+            let keys = self.keys.read().await;
+            keys.get(username)
+                .cloned()
+                .ok_or_else(|| CryptoError::KeyNotFound(username.to_string()))?
+        };
 
         // Derive KEK from password
-        let kek = derive_key_from_password(password, &keypair.salt)?;
+        let kek = derive_key_async(password, &keypair.salt).await?;
 
         // Decrypt private key
         let cipher = ChaCha20Poly1305::new_from_slice(&kek)
@@ -252,28 +376,63 @@ impl CryptoManager {
             .try_into()
             .map_err(|_| CryptoError::DecryptionError("Invalid key length".to_string()))?;
 
-        let private_key = StaticSecret::from(private_key_array);
-        let public_key = PublicKey::from(&private_key);
-
-        let session = SessionKeys {
-            private_key,
-            public_key,
-            username: username.to_string(),
-        };
-
-        // Store in active sessions
-        {
-            let mut sessions = self.sessions.write().await;
-            sessions.insert(username.to_string(), session.clone());
-        }
-
-        Ok(session)
+        Ok(SessionKeys {
+            private_key: StaticSecret::from(private_key_array),
+        })
     }
 
-    /// Lock (clear) a user's session keys
-    pub async fn lock_keys(&self, username: &str) {
+    /// Unlock a user's private key with their password and keep it in memory
+    /// for the session. Sessions are reference counted: every successful call
+    /// must be paired with one `lock_keys(username, generation)` call, passing
+    /// the generation returned here.
+    pub async fn unlock_keys(&self, username: &str, password: &str) -> Result<u64, CryptoError> {
+        let unwrapped = self.unwrap_keys(username, password).await?;
+        let public_key = PublicKey::from(&unwrapped.private_key);
+
+        // Lock order: keys, then sessions. Holding the keys read lock means
+        // no regeneration/deletion can commit between the check and the
+        // insert.
+        let keys = self.keys.read().await;
+        let current = keys
+            .get(username)
+            .is_some_and(|k| k.public_key.as_slice() == public_key.as_bytes().as_slice());
+        if !current {
+            return Err(CryptoError::StorageError(
+                "key pair changed concurrently; try again".to_string(),
+            ));
+        }
         let mut sessions = self.sessions.write().await;
-        sessions.remove(username);
+        let session = sessions
+            .entry(username.to_string())
+            .or_insert_with(|| Session {
+                keys: unwrapped.clone(),
+                refs: 0,
+                generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            });
+        session.keys = unwrapped;
+        session.refs += 1;
+        Ok(session.generation)
+    }
+
+    /// Release one reference to the session of `generation`; the decrypted
+    /// key is dropped from memory when the last reference ends. A stale
+    /// generation (the session was dropped by a key regeneration or deletion
+    /// and possibly replaced) is ignored.
+    pub async fn lock_keys(&self, username: &str, generation: u64) {
+        let mut sessions = self.sessions.write().await;
+        match sessions.get_mut(username) {
+            Some(session) if session.generation == generation => {
+                session.refs = session.refs.saturating_sub(1);
+                if session.refs == 0 {
+                    sessions.remove(username);
+                }
+            }
+            Some(_) => tracing::debug!(
+                "Ignoring key release for {} from a previous session generation",
+                username
+            ),
+            None => {}
+        }
     }
 
     /// Get a user's public key
@@ -288,55 +447,53 @@ impl CryptoManager {
         keys.contains_key(username)
     }
 
-    /// Delete a user's keys
+    /// Delete a user's keys (no-op on disk if they have none) and drop any
+    /// unlocked session for them (a later unlock starts a new generation).
     pub async fn delete_keys(&self, username: &str) -> Result<(), CryptoError> {
-        {
-            let mut keys = self.keys.write().await;
-            keys.remove(username);
+        let result = self
+            .commit(|keys| {
+                let removed = keys.remove(username).is_some();
+                Ok(((), removed))
+            })
+            .await;
+        if result.is_ok() {
+            self.sessions.write().await.remove(username);
         }
-        {
-            let mut sessions = self.sessions.write().await;
-            sessions.remove(username);
-        }
-        self.save_keys().await?;
-        Ok(())
+        result
     }
 
-    /// Change a user's password (re-encrypt private key)
+    /// Change a user's password (re-wrap the private key). The re-wrapped key
+    /// is saved before it replaces the old one in memory.
     pub async fn change_password(
         &self,
         username: &str,
         old_password: &str,
         new_password: &str,
     ) -> Result<(), CryptoError> {
-        // Unlock with old password
-        let session = self.unlock_keys(username, old_password).await?;
+        self.check_loaded()?;
 
-        // Generate new salt and encrypt with new password
-        let salt = generate_random_bytes(SALT_SIZE);
-        let kek = derive_key_from_password(new_password, &salt)?;
+        // Unwrap with old password (does not open a session)
+        let session = self.unwrap_keys(username, old_password).await?;
+        let (encrypted_private_key, salt, nonce) =
+            wrap_private_key(&session.private_key, new_password).await?;
+        let public_key = PublicKey::from(&session.private_key);
 
-        let nonce = generate_random_bytes(NONCE_SIZE);
-        let cipher = ChaCha20Poly1305::new_from_slice(&kek)
-            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
-
-        let encrypted_private_key = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                session.private_key.as_bytes().as_slice(),
-            )
-            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
-
-        // Update stored keypair
-        {
-            let mut keys = self.keys.write().await;
-            if let Some(keypair) = keys.get_mut(username) {
-                keypair.encrypted_private_key = encrypted_private_key;
-                keypair.salt = salt;
-                keypair.nonce = nonce;
+        self.commit(|keys| {
+            let keypair = keys
+                .get_mut(username)
+                .ok_or_else(|| CryptoError::KeyNotFound(username.to_string()))?;
+            if keypair.public_key != public_key.as_bytes().as_slice() {
+                // Replaced concurrently (e.g. admin reset); do not clobber it.
+                return Err(CryptoError::StorageError(
+                    "key pair changed concurrently".to_string(),
+                ));
             }
-        }
-        self.save_keys().await?;
+            keypair.encrypted_private_key = encrypted_private_key;
+            keypair.salt = salt;
+            keypair.nonce = nonce;
+            Ok(((), true))
+        })
+        .await?;
 
         tracing::info!(
             "Re-encrypted keys for user after password change: {}",
@@ -412,15 +569,14 @@ impl CryptoManager {
         username: &str,
         encrypted: &EncryptedEmail,
     ) -> Result<Vec<u8>, CryptoError> {
-        if !self.enabled {
-            return Err(CryptoError::Disabled);
-        }
-
+        // Decryption works even when encryption of new mail is disabled, so
+        // mail stored while it was enabled stays readable.
         // Get session keys
         let sessions = self.sessions.read().await;
-        let session = sessions
+        let session = &sessions
             .get(username)
-            .ok_or_else(|| CryptoError::SessionNotFound(username.to_string()))?;
+            .ok_or_else(|| CryptoError::SessionNotFound(username.to_string()))?
+            .keys;
 
         // Reconstruct ephemeral public key
         let ephemeral_pk_array: [u8; 32] = encrypted
@@ -535,6 +691,36 @@ fn derive_key_from_password(password: &str, salt: &[u8]) -> Result<[u8; KEY_SIZE
     Ok(output)
 }
 
+/// Run the (CPU-heavy) Argon2 derivation on the blocking thread pool, bounded
+/// by the process-wide Argon2 concurrency limit.
+async fn derive_key_async(password: &str, salt: &[u8]) -> Result<[u8; KEY_SIZE], CryptoError> {
+    let password = password.to_string();
+    let salt = salt.to_vec();
+    let _permit = crate::users::argon2_permit().await;
+    tokio::task::spawn_blocking(move || derive_key_from_password(&password, &salt))
+        .await
+        .map_err(|e| CryptoError::KeyDerivationError(e.to_string()))?
+}
+
+/// Wrap a private key under a fresh password-derived key.
+/// Returns `(encrypted_private_key, salt, nonce)`.
+async fn wrap_private_key(
+    private_key: &StaticSecret,
+    password: &str,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), CryptoError> {
+    let salt = generate_random_bytes(SALT_SIZE);
+    let kek = derive_key_async(password, &salt).await?;
+
+    let nonce = generate_random_bytes(NONCE_SIZE);
+    let cipher = ChaCha20Poly1305::new_from_slice(&kek)
+        .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
+    let encrypted_private_key = cipher
+        .encrypt(Nonce::from_slice(&nonce), private_key.as_bytes().as_slice())
+        .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
+
+    Ok((encrypted_private_key, salt, nonce))
+}
+
 /// Derive a symmetric key from shared secret using SHA-256
 fn derive_symmetric_key(shared_secret: &[u8]) -> [u8; KEY_SIZE] {
     let mut hasher = Sha256::new();
@@ -620,10 +806,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn enabled_manager(dir: &std::path::Path) -> CryptoManager {
+        CryptoManager::with_enabled(dir.to_path_buf(), true)
+    }
+
     #[tokio::test]
     async fn test_keypair_generation() {
         let dir = tempdir().unwrap();
-        let manager = CryptoManager::new(dir.path().to_path_buf());
+        let manager = enabled_manager(dir.path());
 
         let keypair = manager
             .generate_keypair("alice", "password123")
@@ -638,7 +828,7 @@ mod tests {
     #[tokio::test]
     async fn test_unlock_keys() {
         let dir = tempdir().unwrap();
-        let manager = CryptoManager::new(dir.path().to_path_buf());
+        let manager = enabled_manager(dir.path());
 
         manager
             .generate_keypair("alice", "password123")
@@ -657,7 +847,7 @@ mod tests {
     #[tokio::test]
     async fn test_encrypt_decrypt_email() {
         let dir = tempdir().unwrap();
-        let manager = CryptoManager::new(dir.path().to_path_buf());
+        let manager = enabled_manager(dir.path());
 
         // Setup recipient
         manager.generate_keypair("bob", "bobpass").await.unwrap();
@@ -676,7 +866,7 @@ mod tests {
     #[tokio::test]
     async fn test_password_change() {
         let dir = tempdir().unwrap();
-        let manager = CryptoManager::new(dir.path().to_path_buf());
+        let manager = enabled_manager(dir.path());
 
         manager.generate_keypair("alice", "oldpass").await.unwrap();
 
@@ -698,7 +888,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_encryption() {
         let dir = tempdir().unwrap();
-        let manager = CryptoManager::new(dir.path().to_path_buf());
+        let manager = enabled_manager(dir.path());
 
         manager.generate_keypair("alice", "pass").await.unwrap();
         manager.unlock_keys("alice", "pass").await.unwrap();
@@ -717,5 +907,165 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_reload_inside_runtime() {
+        let dir = tempdir().unwrap();
+        {
+            let manager = enabled_manager(dir.path());
+            manager.generate_keypair("alice", "pass").await.unwrap();
+        }
+        // Constructing (and loading keys) inside a tokio runtime must not panic.
+        let manager = enabled_manager(dir.path());
+        assert!(manager.has_keys("alice").await);
+        assert!(manager.unlock_keys("alice", "pass").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_keys_file_is_not_overwritten() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let manager = enabled_manager(dir.path());
+        assert!(manager.generate_keypair("bob", "pass").await.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[tokio::test]
+    async fn test_session_refcount() {
+        let dir = tempdir().unwrap();
+        let manager = enabled_manager(dir.path());
+        manager.generate_keypair("carol", "pass").await.unwrap();
+        let g1 = manager.unlock_keys("carol", "pass").await.unwrap();
+        let g2 = manager.unlock_keys("carol", "pass").await.unwrap();
+        assert_eq!(g1, g2);
+        manager.lock_keys("carol", g1).await;
+        assert_eq!(manager.stats().await.active_sessions, 1);
+        manager.lock_keys("carol", g2).await;
+        assert_eq!(manager.stats().await.active_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn generation_mismatch_does_not_lock_new_session() {
+        let dir = tempdir().unwrap();
+        let manager = enabled_manager(dir.path());
+        manager.generate_keypair("dan", "pass").await.unwrap();
+        let old = manager.unlock_keys("dan", "pass").await.unwrap();
+
+        // A regeneration drops the old session; a new login opens a new one.
+        manager.regenerate_keypair("dan", "newpass").await.unwrap();
+        let new = manager.unlock_keys("dan", "newpass").await.unwrap();
+        assert_ne!(old, new);
+
+        // The old login ending must not release the new session.
+        manager.lock_keys("dan", old).await;
+        assert_eq!(manager.stats().await.active_sessions, 1);
+        manager.lock_keys("dan", new).await;
+        assert_eq!(manager.stats().await.active_sessions, 0);
+
+        // Same after a deletion and re-creation.
+        let g = manager.unlock_keys("dan", "newpass").await.unwrap();
+        manager.delete_keys("dan").await.unwrap();
+        manager.generate_keypair("dan", "pass3").await.unwrap();
+        let g2 = manager.unlock_keys("dan", "pass3").await.unwrap();
+        assert_ne!(g, g2);
+        manager.lock_keys("dan", g).await;
+        assert_eq!(manager.stats().await.active_sessions, 1);
+    }
+
+    #[tokio::test]
+    async fn generate_keypair_failed_save_does_not_insert() {
+        let dir = tempdir().unwrap();
+        // data_dir is a regular file, so writing keys.json must fail.
+        let not_a_dir = dir.path().join("file");
+        std::fs::write(&not_a_dir, "x").unwrap();
+        let manager = enabled_manager(&not_a_dir);
+        assert!(manager.load_error().is_none());
+
+        assert!(manager.generate_keypair("alice", "pass").await.is_err());
+        assert!(!manager.has_keys("alice").await);
+        assert!(manager.get_public_key("alice").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_error_is_exposed_and_blocks_generation() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("keys.json"), "garbage").unwrap();
+        let manager = enabled_manager(dir.path());
+        assert!(manager.load_error().is_some());
+        assert!(manager.generate_keypair("alice", "pass").await.is_err());
+        assert!(!manager.has_keys("alice").await);
+    }
+
+    #[tokio::test]
+    async fn generate_keypair_is_insert_if_absent() {
+        let dir = tempdir().unwrap();
+        let manager = enabled_manager(dir.path());
+        let first = manager.generate_keypair("alice", "pass1").await.unwrap();
+        let second = manager.generate_keypair("alice", "pass2").await.unwrap();
+        assert_eq!(first.public_key, second.public_key);
+        // The original wrapping is kept.
+        assert!(manager.unlock_keys("alice", "pass1").await.is_ok());
+        assert!(manager.unlock_keys("alice", "pass2").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn regenerate_keypair_replaces_keys_and_drops_session() {
+        let dir = tempdir().unwrap();
+        let manager = enabled_manager(dir.path());
+        let old = manager.generate_keypair("alice", "pass").await.unwrap();
+        manager.unlock_keys("alice", "pass").await.unwrap();
+        assert_eq!(manager.stats().await.active_sessions, 1);
+
+        let new = manager
+            .regenerate_keypair("alice", "newpass")
+            .await
+            .unwrap();
+        assert_ne!(old.public_key, new.public_key);
+        assert_eq!(manager.stats().await.active_sessions, 0);
+        assert!(manager.unlock_keys("alice", "newpass").await.is_ok());
+
+        // Persisted.
+        let reloaded = enabled_manager(dir.path());
+        assert_eq!(
+            reloaded.get_public_key("alice").await.unwrap(),
+            new.public_key
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_keys_drops_session() {
+        let dir = tempdir().unwrap();
+        let manager = enabled_manager(dir.path());
+        manager.generate_keypair("alice", "pass").await.unwrap();
+        manager.unlock_keys("alice", "pass").await.unwrap();
+        manager.delete_keys("alice").await.unwrap();
+        assert!(!manager.has_keys("alice").await);
+        assert_eq!(manager.stats().await.active_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn decrypt_and_unlock_work_when_disabled() {
+        let dir = tempdir().unwrap();
+        let encrypted = {
+            let manager = enabled_manager(dir.path());
+            manager.generate_keypair("bob", "pass").await.unwrap();
+            manager.encrypt_email("bob", b"secret", None).await.unwrap()
+        };
+
+        let disabled = CryptoManager::with_enabled(dir.path().to_path_buf(), false);
+        assert!(!disabled.is_enabled());
+        disabled.unlock_keys("bob", "pass").await.unwrap();
+        assert_eq!(
+            disabled.decrypt_email("bob", &encrypted).await.unwrap(),
+            b"secret"
+        );
+        // New mail is not encrypted while disabled.
+        assert!(matches!(
+            disabled.encrypt_email("bob", b"x", None).await,
+            Err(CryptoError::Disabled)
+        ));
     }
 }

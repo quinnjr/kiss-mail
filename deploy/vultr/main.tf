@@ -24,19 +24,24 @@ variable "vultr_api_key" {
 variable "region" {
   description = "Vultr region"
   type        = string
-  default     = "ewr"  # New Jersey
+  default     = "ewr" # New Jersey
 }
 
 variable "plan" {
   description = "Vultr plan"
   type        = string
-  default     = "vc2-1c-1gb"  # $5/month
+  default     = "vc2-1c-1gb" # $5/month
 }
 
 variable "domain" {
   description = "Mail domain"
   type        = string
   default     = "mail.example.com"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9.-]+$", var.domain))
+    error_message = "The domain may only contain letters, digits, '.' and '-'."
+  }
 }
 
 variable "ssh_keys" {
@@ -56,67 +61,26 @@ provider "vultr" {
 # Startup Script
 # ----------------------------------------------------------------------------
 resource "vultr_startup_script" "kiss_mail" {
-  name   = "kiss-mail-setup"
-  type   = "boot"
-  script = base64encode(<<-EOF
-    #!/bin/bash
-    set -euo pipefail
-    exec > >(tee /var/log/kiss-mail-setup.log) 2>&1
-    
-    # Install Docker
-    curl -fsSL https://get.docker.com | sh
-    systemctl enable docker && systemctl start docker
-    
-    # Install extras
-    apt-get update && apt-get install -y nginx certbot python3-certbot-nginx
-    
-    # Setup directories
-    mkdir -p /opt/kiss-mail/data
-    chown -R 1000:1000 /opt/kiss-mail
-    
-    # Generate API key
-    API_KEY=$(openssl rand -hex 32)
-    
-    # Run KISS Mail
-    docker run -d \
-      --name kiss-mail \
-      --restart unless-stopped \
-      -p 25:2525 -p 587:2525 \
-      -p 143:1143 -p 110:1100 \
-      -p 8080:8080 -p 8025:8025 \
-      -v /opt/kiss-mail/data:/data \
-      -e KISS_MAIL_DOMAIN="${var.domain}" \
-      -e KISS_MAIL_API_KEY="$API_KEY" \
-      -e KISS_MAIL_WEB_BIND=0.0.0.0 \
-      -e KISS_MAIL_API_BIND=0.0.0.0 \
-      ghcr.io/quinnjr/kiss-mail:latest
-    
-    # Configure Nginx
-    cat > /etc/nginx/sites-available/kiss-mail << 'NGINX'
-    server {
-        listen 80;
-        server_name _;
-        location /admin { proxy_pass http://127.0.0.1:8080; proxy_set_header Host $host; }
-        location /api { proxy_pass http://127.0.0.1:8025; proxy_set_header Host $host; }
-        location / { return 301 /admin; }
-    }
-    NGINX
-    
-    ln -sf /etc/nginx/sites-available/kiss-mail /etc/nginx/sites-enabled/
-    rm -f /etc/nginx/sites-enabled/default
-    systemctl restart nginx
-    
-    # Save credentials
-    PUBLIC_IP=$(curl -s ifconfig.me)
-    cat > /opt/kiss-mail/credentials.txt << CREDS
-    KISS Mail Credentials
-    Domain: ${var.domain}
-    API Key: $API_KEY
-    Web Admin: http://$PUBLIC_IP/admin
-    CREDS
-    chmod 600 /opt/kiss-mail/credentials.txt
-  EOF
-  )
+  name = "kiss-mail-setup"
+  # "boot" scripts run on every boot; the script provisions only once.
+  type = "boot"
+  # Shared bootstrap script. The admin password is generated on the server
+  # and kept only in the root-only /opt/kiss-mail/credentials.txt.
+  script = base64encode(templatefile("${path.module}/../common/bootstrap.sh.tftpl", {
+    provider_name = "vultr"
+    domain        = var.domain
+    public_ip_cmd = "curl -s http://169.254.169.254/latest/meta-data/public-ipv4"
+  }))
+}
+
+# ----------------------------------------------------------------------------
+# Image: Ubuntu 24.04 LTS (looked up by name rather than a hard-coded os_id)
+# ----------------------------------------------------------------------------
+data "vultr_os" "ubuntu" {
+  filter {
+    name   = "name"
+    values = ["Ubuntu 24.04 LTS x64"]
+  }
 }
 
 # ----------------------------------------------------------------------------
@@ -190,29 +154,29 @@ resource "vultr_firewall_rule" "https" {
 }
 
 # ----------------------------------------------------------------------------
+# Reserved IP (created first, attached to the instance at creation)
+# ----------------------------------------------------------------------------
+resource "vultr_reserved_ip" "kiss_mail" {
+  region  = var.region
+  ip_type = "v4"
+  label   = "kiss-mail-ip"
+}
+
+# ----------------------------------------------------------------------------
 # Instance
 # ----------------------------------------------------------------------------
 resource "vultr_instance" "kiss_mail" {
   label             = "kiss-mail"
   region            = var.region
   plan              = var.plan
-  os_id             = 1743  # Ubuntu 22.04 LTS
+  os_id             = data.vultr_os.ubuntu.id # Ubuntu 24.04 LTS x64 (id 2284)
   script_id         = vultr_startup_script.kiss_mail.id
   firewall_group_id = vultr_firewall_group.kiss_mail.id
   ssh_key_ids       = var.ssh_keys
   enable_ipv6       = true
-  
-  tags = ["kiss-mail"]
-}
+  reserved_ip_id    = vultr_reserved_ip.kiss_mail.id
 
-# ----------------------------------------------------------------------------
-# Reserved IP
-# ----------------------------------------------------------------------------
-resource "vultr_reserved_ip" "kiss_mail" {
-  region      = var.region
-  ip_type     = "v4"
-  instance_id = vultr_instance.kiss_mail.id
-  label       = "kiss-mail-ip"
+  tags = ["kiss-mail"]
 }
 
 # ----------------------------------------------------------------------------
@@ -228,4 +192,8 @@ output "web_admin_url" {
 
 output "ssh_command" {
   value = "ssh root@${vultr_reserved_ip.kiss_mail.subnet}"
+}
+
+output "credentials_command" {
+  value = "ssh root@${vultr_reserved_ip.kiss_mail.subnet} cat /opt/kiss-mail/credentials.txt"
 }

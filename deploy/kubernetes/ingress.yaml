@@ -41,6 +41,33 @@ spec:
                 port:
                   name: web
           
+          # Self-service password change (any mail user)
+          - path: /account
+            pathType: Prefix
+            backend:
+              service:
+                name: kiss-mail
+                port:
+                  name: web
+
+          # Stylesheet and script of the web UI
+          - path: /static
+            pathType: Prefix
+            backend:
+              service:
+                name: kiss-mail
+                port:
+                  name: web
+
+          # SSO (OIDC) callback
+          - path: /callback
+            pathType: Exact
+            backend:
+              service:
+                name: kiss-mail
+                port:
+                  name: web
+
           # REST API
           - path: /api
             pathType: Prefix

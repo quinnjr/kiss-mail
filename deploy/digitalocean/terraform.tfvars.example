@@ -21,8 +21,8 @@ droplet_size = "s-1vcpu-1gb"
 # Your mail domain
 domain = "mail.example.com"
 
-# Initial admin password (optional - will be auto-generated if empty)
-# admin_password = "your-secure-password"
+# The KISS Mail admin password is generated on the server and saved in the
+# root-only /opt/kiss-mail/credentials.txt (it is not a Terraform variable).
 
 # SSH key IDs or fingerprints (get with: doctl compute ssh-key list)
 # ssh_keys = ["12345678", "ab:cd:ef:..."]

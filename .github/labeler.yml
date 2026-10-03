@@ -76,6 +76,7 @@ docker:
   - changed-files:
       - any-glob-to-any-file:
           - 'Dockerfile'
+          - 'Dockerfile.alpine'
           - 'docker-compose.yml'
           - '.dockerignore'
 
@@ -91,7 +92,18 @@ terraform:
   - changed-files:
       - any-glob-to-any-file:
           - 'deploy/aws/**'
+          - 'deploy/azure/**'
           - 'deploy/digitalocean/**'
+          - 'deploy/gcp/**'
+          - 'deploy/hetzner/**'
+          - 'deploy/linode/**'
+          - 'deploy/vultr/**'
+
+deploy-scripts:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'deploy/scripts/**'
+          - 'deploy/generic/**'
 
 # CI/CD
 ci:
@@ -114,47 +126,6 @@ dependencies:
           - 'Cargo.toml'
           - 'Cargo.lock'
 
-# Size labels (based on lines changed)
-size/XS:
-  - changed-files:
-      - any-glob-to-any-file: '**/*'
-    all:
-      - head-branch: '^(?!dependabot)'
-    size:
-      above: 0
-      below: 10
-
-size/S:
-  - changed-files:
-      - any-glob-to-any-file: '**/*'
-    all:
-      - head-branch: '^(?!dependabot)'
-    size:
-      above: 9
-      below: 50
-
-size/M:
-  - changed-files:
-      - any-glob-to-any-file: '**/*'
-    all:
-      - head-branch: '^(?!dependabot)'
-    size:
-      above: 49
-      below: 200
-
-size/L:
-  - changed-files:
-      - any-glob-to-any-file: '**/*'
-    all:
-      - head-branch: '^(?!dependabot)'
-    size:
-      above: 199
-      below: 500
-
-size/XL:
-  - changed-files:
-      - any-glob-to-any-file: '**/*'
-    all:
-      - head-branch: '^(?!dependabot)'
-    size:
-      above: 499
+# Note: size/* labels (by lines changed) are not supported by actions/labeler,
+# which only matches files and branches. Use a dedicated size-labeler action
+# if size labels are wanted.

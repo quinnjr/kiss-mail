@@ -14,8 +14,8 @@ instance_type = "t3.micro"
 # Your mail domain
 domain = "mail.example.com"
 
-# Initial admin password (optional - will be auto-generated if empty)
-# admin_password = "your-secure-password"
+# The KISS Mail admin password is generated on the server and saved in the
+# root-only /opt/kiss-mail/credentials.txt (it is not a Terraform variable).
 
 # SSH key pair name (optional - for SSH access)
 # ssh_key_name = "my-key-pair"

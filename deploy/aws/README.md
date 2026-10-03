@@ -49,10 +49,20 @@ Edit `terraform.tfvars`:
 region         = "us-east-1"
 instance_type  = "t3.micro"
 domain         = "mail.yourdomain.com"
-admin_password = "your-secure-password"
 ssh_key_name   = "your-key-pair"  # Optional
 volume_size    = 20
 ```
+
+The admin password is not a Terraform variable: it is generated on the
+server (so it never reaches Terraform state or instance metadata) and written
+to the root-only `/opt/kiss-mail/credentials.txt` (`terraform output
+credentials_command`). The server is provisioned by the shared bootstrap
+script `deploy/common/bootstrap.sh.tftpl` on Ubuntu 24.04 LTS. The web admin
+is reached through Nginx on port 80; the REST API is published on
+`127.0.0.1` only (use `ssh -L 8025:127.0.0.1:8025 ...` for the remote CLI).
+After `certbot --nginx`, switch the session cookie to Secure with
+`upgrade.sh --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true` (see the main
+README).
 
 ## Access
 
@@ -67,7 +77,7 @@ smtp_server    = "1.2.3.4:25"
 ### SSH Access (if key provided)
 
 ```bash
-ssh -i ~/.ssh/your-key.pem ec2-user@<public_ip>
+ssh -i ~/.ssh/your-key.pem ubuntu@<public_ip>
 ```
 
 ### SSM Session Manager (no SSH key needed)

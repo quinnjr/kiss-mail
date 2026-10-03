@@ -28,6 +28,21 @@ spec:
     - host: {{ .host | quote }}
       http:
         paths:
+          {{- $listed := list }}
+          {{- range .paths }}{{ $listed = append $listed .path }}{{ end }}
+          {{- /* Web-port paths every host needs: the self-service password
+               page, the stylesheet/script of the web UI and the SSO callback */}}
+          {{- range $extra := list (dict "path" "/account" "type" "Prefix") (dict "path" "/static" "type" "Prefix") (dict "path" "/callback" "type" "Exact") }}
+          {{- if not (has $extra.path $listed) }}
+          - path: {{ $extra.path }}
+            pathType: {{ $extra.type }}
+            backend:
+              service:
+                name: {{ include "kiss-mail.fullname" $ }}
+                port:
+                  name: web
+          {{- end }}
+          {{- end }}
           {{- range .paths }}
           - path: {{ .path }}
             pathType: {{ .pathType }}

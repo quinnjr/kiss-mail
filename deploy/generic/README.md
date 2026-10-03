@@ -30,12 +30,11 @@ This cloud-init configuration works on any provider that supports cloud-init:
 write_files:
   - path: /etc/kiss-mail.conf
     content: |
-      KISS_MAIL_DOMAIN=mail.yourdomain.com
-      KISS_MAIL_ADMIN_PASSWORD=your-secure-password
+      DOMAIN=mail.yourdomain.com
       KISS_MAIL_API_KEY=
 ```
 
-2. **Create a VM** with Ubuntu 22.04 or Debian 12 and paste the cloud-init as user-data
+2. **Create a VM** with Ubuntu 24.04 LTS (or Debian 12 / RHEL family) and paste the cloud-init as user-data
 
 3. **Wait** for setup to complete (2-5 minutes)
 
@@ -51,26 +50,40 @@ curl -fsSL https://raw.githubusercontent.com/quinnjr/kiss-mail/main/deploy/scrip
 
 ## Configuration
 
-Edit `/etc/kiss-mail.conf` before running:
+`/etc/kiss-mail.conf` is parsed as `KEY=VALUE` lines (it is never sourced) by
+the setup script (`/opt/kiss-mail-setup.sh`) only - these are not environment
+variables of the `kiss-mail` binary. Both files are deleted when setup
+finishes:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `KISS_MAIL_DOMAIN` | Your mail domain | mail.example.com |
-| `KISS_MAIL_ADMIN_PASSWORD` | Initial admin password | (none) |
-| `KISS_MAIL_API_KEY` | API key for remote access | (auto-generated) |
+| `DOMAIN` | Your mail domain (passed to the container as `KISS_MAIL_DOMAIN`) | mail.example.com |
+| `KISS_MAIL_API_KEY` | REST API key (leave empty: the provider keeps a copy of user-data) | (auto-generated) |
+
+The admin password is always generated on the VM and handed to the server on
+stdin. It and the API key are written to the root-only
+`/opt/kiss-mail/credentials.txt` (before the container starts, then updated).
+The web admin is reached through Nginx (the SSO `/callback` too); the REST API
+is published on `127.0.0.1` only and Nginx denies `/api` to remote clients
+(remote CLI: `ssh -L 8025:127.0.0.1:8025 ...`). The firewall (ufw or firewalld) opens 22, 25, 587, 143, 110, 80
+and 443.
 
 ## Post-Deployment
 
 ### View Credentials
 
 ```bash
-cat /opt/kiss-mail/credentials.txt
+sudo cat /opt/kiss-mail/credentials.txt
 ```
 
 ### Enable HTTPS
 
 ```bash
 sudo certbot --nginx -d mail.yourdomain.com
+# The container starts with KISS_MAIL_WEB_SECURE_COOKIE=false (plain HTTP).
+# Once HTTPS works, recreate it with a Secure session cookie:
+curl -fsSL https://raw.githubusercontent.com/quinnjr/kiss-mail/main/deploy/scripts/upgrade.sh \
+  | sudo bash -s -- --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true
 ```
 
 ### Configure DNS

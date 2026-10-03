@@ -3,7 +3,7 @@
 //! Provides command-line tools for user and server management.
 
 use crate::storage::Storage;
-use crate::users::{AccountStatus, UserQuota, UserRole};
+use crate::users::{AccountStatus, UserRole};
 use std::sync::Arc;
 
 /// Admin command results
@@ -106,9 +106,11 @@ KISS Mail Admin Commands
 User Management:
   list [filter]         - List all users (filter: active, suspended, locked, admin)
   info <username>       - Show detailed user information
-  create <user> <pass>  - Create a new user
+  create <user> <pass> [--role <role>]
+                        - Create a new user (role: user, admin, superadmin)
   delete <username>     - Delete a user
-  passwd <user> <pass>  - Reset user password
+  passwd <user> <pass> [--require-change]
+                        - Reset user password (optionally force a change at next login)
   status <user> <status> - Set status (active, suspended, disabled)
   role <user> <role>    - Set role (user, admin, superadmin)
   quota <user> <mb>     - Set mailbox quota in MB
@@ -200,17 +202,10 @@ Type 'help' for this message.
     }
 
     async fn cmd_create_user(&self, args: &[&str]) -> AdminResult {
-        if args.len() < 2 {
-            return AdminResult::Error("Usage: create <username> <password> [role]".to_string());
-        }
-
-        let username = args[0];
-        let password = args[1];
-        let role = args.get(2).map(|r| match r.to_lowercase().as_str() {
-            "admin" => UserRole::Admin,
-            "superadmin" => UserRole::SuperAdmin,
-            _ => UserRole::User,
-        });
+        let (username, password, role) = match parse_create_args(args) {
+            Ok(parsed) => parsed,
+            Err(e) => return AdminResult::Error(e),
+        };
 
         match self
             .storage
@@ -219,9 +214,10 @@ Type 'help' for this message.
             .await
         {
             Ok(user) => AdminResult::Success(format!(
-                "Created user: {} ({})",
+                "Created user: {} ({}) role={}",
                 user.username,
-                user.email()
+                user.email(),
+                user.role
             )),
             Err(e) => AdminResult::Error(format!("Failed to create user: {}", e)),
         }
@@ -253,13 +249,15 @@ Type 'help' for this message.
         args: &[&str],
         actor: &crate::users::UserAccount,
     ) -> AdminResult {
-        if args.len() < 2 {
-            return AdminResult::Error("Usage: passwd <username> <new_password>".to_string());
-        }
-
-        let username = args[0];
-        let new_password = args[1];
-        let require_change = args.get(2).is_some_and(|a| *a == "--require-change");
+        const USAGE: &str = "Usage: passwd <username> <new_password> [--require-change]";
+        let (username, new_password, require_change) = match args {
+            [user, pass] => (*user, *pass, false),
+            [user, pass, "--require-change"] => (*user, *pass, true),
+            [_, _, extra, ..] => {
+                return AdminResult::Error(format!("Unexpected argument: {}. {}", extra, USAGE));
+            }
+            _ => return AdminResult::Error(USAGE.to_string()),
+        };
 
         match self
             .storage
@@ -284,16 +282,13 @@ Type 'help' for this message.
         }
 
         let username = args[0];
-        let status = match args[1].to_lowercase().as_str() {
-            "active" => AccountStatus::Active,
-            "suspended" => AccountStatus::Suspended,
-            "disabled" => AccountStatus::Disabled,
-            "locked" => AccountStatus::Locked,
-            "pending" => AccountStatus::PendingVerification,
-            _ => {
-                return AdminResult::Error(
-                    "Invalid status. Use: active, suspended, disabled".to_string(),
-                );
+        let status = match args[1].parse::<AccountStatus>() {
+            Ok(s) => s,
+            Err(e) => {
+                return AdminResult::Error(format!(
+                    "Invalid status ({}). Use: active, suspended, disabled, locked, pending",
+                    e
+                ));
             }
         };
 
@@ -318,14 +313,13 @@ Type 'help' for this message.
         }
 
         let username = args[0];
-        let role = match args[1].to_lowercase().as_str() {
-            "user" => UserRole::User,
-            "admin" => UserRole::Admin,
-            "superadmin" => UserRole::SuperAdmin,
-            _ => {
-                return AdminResult::Error(
-                    "Invalid role. Use: user, admin, superadmin".to_string(),
-                );
+        let role = match args[1].parse::<UserRole>() {
+            Ok(r) => r,
+            Err(e) => {
+                return AdminResult::Error(format!(
+                    "Invalid role ({}). Use: user, admin, superadmin",
+                    e
+                ));
             }
         };
 
@@ -353,9 +347,17 @@ Type 'help' for this message.
             }
         };
 
-        let quota = UserQuota {
-            max_mailbox_size: size_mb * 1024 * 1024,
-            ..Default::default()
+        // Start from the user's current quota so only the mailbox size changes
+        // (message size, message count and outgoing limits are preserved).
+        let mut quota = match self.storage.user_manager().get_user(username).await {
+            Some(u) => u.quota,
+            None => return AdminResult::Error(format!("User not found: {}", username)),
+        };
+        quota.max_mailbox_size = match size_mb.checked_mul(1024 * 1024) {
+            Some(bytes) => bytes,
+            None => {
+                return AdminResult::Error(format!("Quota too large: {} MB", size_mb));
+            }
         };
 
         match self
@@ -430,6 +432,72 @@ Type 'help' for this message.
             Err(e) => AdminResult::Error(format!("Failed to export: {}", e)),
         }
     }
+}
+
+/// Parse arguments for `create`/`add`: `<username> <password> [role]`,
+/// where the role may also be given as `--role <role>` or `--role=<role>`.
+///
+/// Unknown roles and unknown `--options` are rejected instead of silently
+/// defaulting to a regular user.
+pub fn parse_create_args<'a>(
+    args: &[&'a str],
+) -> Result<(&'a str, &'a str, Option<UserRole>), String> {
+    const USAGE: &str = "Usage: create <username> <password> [--role <user|admin|superadmin>]";
+    let mut positionals: Vec<&'a str> = Vec::new();
+    let mut role_arg: Option<&'a str> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "--role" || arg == "-r" {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| format!("--role requires a value. {}", USAGE))?;
+            if role_arg.replace(value).is_some() {
+                return Err("Role specified more than once".to_string());
+            }
+            i += 2;
+            continue;
+        } else if let Some(value) = arg.strip_prefix("--role=") {
+            if role_arg.replace(value).is_some() {
+                return Err("Role specified more than once".to_string());
+            }
+        } else if arg.starts_with("--") {
+            return Err(format!("Unknown option: {}. {}", arg, USAGE));
+        } else {
+            positionals.push(arg);
+        }
+        i += 1;
+    }
+
+    match positionals.len() {
+        0 | 1 => return Err(USAGE.to_string()),
+        2 => {}
+        3 => {
+            if role_arg.replace(positionals[2]).is_some() {
+                return Err("Role specified more than once".to_string());
+            }
+        }
+        _ => return Err(format!("Too many arguments. {}", USAGE)),
+    }
+
+    let role = match role_arg {
+        Some(r) => Some(
+            r.parse::<UserRole>()
+                .map_err(|_| format!("Invalid role '{}'. Use: user, admin, superadmin", r))?,
+        ),
+        None => None,
+    };
+
+    Ok((positionals[0], positionals[1], role))
+}
+
+/// Whether an admin command only reads state (and must never write files).
+pub fn is_read_only_command(command: &str) -> bool {
+    matches!(
+        command.to_lowercase().as_str(),
+        "help" | "list" | "ls" | "info" | "show" | "stats" | "export"
+    )
 }
 
 /// Format admin result for display
@@ -537,15 +605,131 @@ Storage:
     }
 }
 
-/// Parse command line for admin commands
-#[allow(dead_code)]
-pub fn parse_admin_command(input: &str) -> Option<(String, Vec<String>)> {
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    if parts.is_empty() {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_parsing_accepts_known_roles_case_insensitively() {
+        assert_eq!("user".parse::<UserRole>(), Ok(UserRole::User));
+        assert_eq!("Admin".parse::<UserRole>(), Ok(UserRole::Admin));
+        assert_eq!("SUPERADMIN".parse::<UserRole>(), Ok(UserRole::SuperAdmin));
+        assert!("root".parse::<UserRole>().is_err());
+        assert!("".parse::<UserRole>().is_err());
+        // Display output round-trips through FromStr
+        for role in [UserRole::User, UserRole::Admin, UserRole::SuperAdmin] {
+            assert_eq!(role.to_string().parse::<UserRole>(), Ok(role));
+        }
     }
 
-    let command = parts[0].to_string();
-    let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-    Some((command, args))
+    #[test]
+    fn parse_create_args_plain() {
+        let (u, p, r) = parse_create_args(&["alice", "secret123"]).unwrap();
+        assert_eq!((u, p, r), ("alice", "secret123", None));
+    }
+
+    #[test]
+    fn parse_create_args_role_flag_forms() {
+        let (u, p, r) = parse_create_args(&["alice", "secret123", "--role", "superadmin"]).unwrap();
+        assert_eq!(
+            (u, p, r),
+            ("alice", "secret123", Some(UserRole::SuperAdmin))
+        );
+
+        let (_, _, r) = parse_create_args(&["--role=admin", "alice", "secret123"]).unwrap();
+        assert_eq!(r, Some(UserRole::Admin));
+
+        let (_, _, r) = parse_create_args(&["alice", "secret123", "admin"]).unwrap();
+        assert_eq!(r, Some(UserRole::Admin));
+    }
+
+    #[test]
+    fn parse_create_args_rejects_bad_input() {
+        assert!(parse_create_args(&["alice"]).is_err());
+        assert!(parse_create_args(&["alice", "secret123", "--role", "root"]).is_err());
+        assert!(parse_create_args(&["alice", "secret123", "--role"]).is_err());
+        assert!(parse_create_args(&["alice", "secret123", "bogus"]).is_err());
+        assert!(parse_create_args(&["alice", "secret123", "--bogus"]).is_err());
+        assert!(parse_create_args(&["alice", "secret123", "admin", "--role=user"]).is_err());
+        assert!(parse_create_args(&["alice", "secret123", "admin", "extra"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn quota_overflow_is_rejected() {
+        use crate::users::UserManager;
+        let dir = tempfile::tempdir().unwrap();
+        let um = Arc::new(UserManager::new(
+            "example.com".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        um.create_user("admin", "Admin-pass-123", Some(UserRole::SuperAdmin))
+            .await
+            .unwrap();
+        um.create_user("alice", "Alice-pass-123", None)
+            .await
+            .unwrap();
+        let storage = Arc::new(Storage::new(dir.path().to_path_buf(), Arc::clone(&um)));
+        let handler = AdminHandler::new(storage);
+
+        let huge = u64::MAX.to_string();
+        let result = handler.execute("quota", &["alice", &huge], "admin").await;
+        assert!(
+            matches!(&result, AdminResult::Error(m) if m.contains("too large")),
+            "{:?}",
+            result
+        );
+
+        let result = handler.execute("quota", &["alice", "100"], "admin").await;
+        assert!(matches!(result, AdminResult::Success(_)), "{:?}", result);
+        let alice = um.get_user("alice").await.unwrap();
+        assert_eq!(alice.quota.max_mailbox_size, 100 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn passwd_rejects_unknown_trailing_args() {
+        use crate::users::UserManager;
+        let dir = tempfile::tempdir().unwrap();
+        let um = Arc::new(UserManager::new(
+            "example.com".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        um.create_user("admin", "Admin-pass-123", Some(UserRole::SuperAdmin))
+            .await
+            .unwrap();
+        um.create_user("alice", "Alice-pass-123", None)
+            .await
+            .unwrap();
+        let storage = Arc::new(Storage::new(dir.path().to_path_buf(), Arc::clone(&um)));
+        let handler = AdminHandler::new(storage);
+
+        for bad in [
+            &["alice", "New-pass-456", "--require-chnage"][..],
+            &["alice", "New-pass-456", "--require-change", "x"][..],
+            &["alice"][..],
+        ] {
+            let result = handler.execute("passwd", bad, "admin").await;
+            assert!(matches!(result, AdminResult::Error(_)), "{:?}", bad);
+        }
+        assert!(!um.get_user("alice").await.unwrap().password_change_required);
+
+        let result = handler
+            .execute(
+                "passwd",
+                &["alice", "New-pass-456", "--require-change"],
+                "admin",
+            )
+            .await;
+        assert!(matches!(result, AdminResult::Success(_)), "{:?}", result);
+        assert!(um.get_user("alice").await.unwrap().password_change_required);
+    }
+
+    #[test]
+    fn read_only_commands() {
+        assert!(is_read_only_command("list"));
+        assert!(is_read_only_command("INFO"));
+        assert!(is_read_only_command("stats"));
+        assert!(!is_read_only_command("create"));
+        assert!(!is_read_only_command("passwd"));
+        assert!(!is_read_only_command("quota"));
+    }
 }

@@ -33,7 +33,7 @@ terraform apply
 
 | Resource | Description | Cost |
 |----------|-------------|------|
-| Compute Instance | e2-micro (Container-Optimized OS) | Free tier eligible |
+| Compute Instance | e2-micro (Ubuntu 24.04 LTS + Docker + Nginx, set up by the shared bootstrap script) | Free tier eligible |
 | Static IP | External IP address | ~$3/month |
 | VPC Network | Custom network | Free |
 | Firewall Rules | Mail ports | Free |
@@ -51,6 +51,19 @@ terraform apply
 | `domain` | mail.example.com | Mail domain |
 | `disk_size` | 20 | Boot disk GB |
 
+## Admin Password
+
+The admin password is not a Terraform variable: it is generated on the
+server (so it never reaches Terraform state or instance metadata) and written
+to the root-only `/opt/kiss-mail/credentials.txt` (`terraform output
+credentials_command`). The server is provisioned by the shared bootstrap
+script `deploy/common/bootstrap.sh.tftpl` on Ubuntu 24.04 LTS. The web admin
+is reached through Nginx on port 80; the REST API is published on
+`127.0.0.1` only (use `ssh -L 8025:127.0.0.1:8025 ...` for the remote CLI).
+After `certbot --nginx`, switch the session cookie to Secure with
+`upgrade.sh --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true` (see the main
+README).
+
 ## Access
 
 ```bash
@@ -58,7 +71,13 @@ terraform apply
 gcloud compute ssh kiss-mail --zone us-central1-a
 
 # View container logs
-gcloud compute ssh kiss-mail --zone us-central1-a -- docker logs kiss-mail
+gcloud compute ssh kiss-mail --zone us-central1-a -- sudo docker logs kiss-mail
+
+# Show generated credentials (admin password, API key)
+gcloud compute ssh kiss-mail --zone us-central1-a -- sudo cat /opt/kiss-mail/credentials.txt
+
+# Setup log (first boot)
+gcloud compute ssh kiss-mail --zone us-central1-a -- sudo cat /var/log/kiss-mail-setup.log
 ```
 
 ## Cleanup
