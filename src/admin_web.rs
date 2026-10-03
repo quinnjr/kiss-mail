@@ -980,8 +980,16 @@ async fn get_session(data: &WebState, req: &HttpRequest) -> Option<WebSession> {
 }
 
 /// Require a logged-in admin; otherwise redirect to the login page.
-async fn require_session(data: &WebState, req: &HttpRequest) -> Result<WebSession, HttpResponse> {
-    get_session(data, req).await.ok_or_else(to_login)
+///
+/// The rejection response is boxed: `HttpResponse` is large enough to trip
+/// `clippy::result_large_err`.
+async fn require_session(
+    data: &WebState,
+    req: &HttpRequest,
+) -> Result<WebSession, Box<HttpResponse>> {
+    get_session(data, req)
+        .await
+        .ok_or_else(|| Box::new(to_login()))
 }
 
 /// Require a logged-in admin and a matching CSRF token (for POSTs).
@@ -989,11 +997,11 @@ async fn require_session_csrf(
     data: &WebState,
     req: &HttpRequest,
     csrf: &str,
-) -> Result<WebSession, HttpResponse> {
+) -> Result<WebSession, Box<HttpResponse>> {
     let session = require_session(data, req).await?;
     if !csrf_matches(&session.csrf, csrf) {
         tracing::warn!("Rejected admin POST without a valid CSRF token");
-        return Err(csrf_rejected());
+        return Err(Box::new(csrf_rejected()));
     }
     Ok(session)
 }
@@ -1525,7 +1533,7 @@ pub async fn sso_callback(
 pub async fn dashboard(data: web::Data<WebState>, req: HttpRequest) -> HttpResponse {
     let session = match require_session(&data, &req).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let users = data.user_manager.list_users().await;
@@ -1581,7 +1589,7 @@ pub async fn users_list(
 ) -> HttpResponse {
     let session = match require_session(&data, &req).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let users = data.user_manager.list_users().await;
@@ -1662,7 +1670,7 @@ fn render_user_new(
 pub async fn user_new(data: web::Data<WebState>, req: HttpRequest) -> HttpResponse {
     match require_session(&data, &req).await {
         Ok(session) => render_user_new(&data, &session, None, None),
-        Err(resp) => resp,
+        Err(resp) => *resp,
     }
 }
 
@@ -1674,7 +1682,7 @@ pub async fn user_create(
 ) -> HttpResponse {
     let session = match require_session_csrf(&data, &req, &form.csrf).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let actor = match data.user_manager.get_user(&session.username).await {
         Some(u) => u,
@@ -1805,7 +1813,7 @@ pub async fn user_edit(
 ) -> HttpResponse {
     let session = match require_session(&data, &req).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     match data.user_manager.get_user(&path.into_inner()).await {
@@ -1863,7 +1871,7 @@ pub async fn user_update(
 ) -> HttpResponse {
     let session = match require_session_csrf(&data, &req, &form.csrf).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let target_username = path.into_inner();
@@ -1940,7 +1948,7 @@ pub async fn user_delete(
 ) -> HttpResponse {
     let session = match require_session_csrf(&data, &req, &form.csrf).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let target_username = path.into_inner();
@@ -1996,7 +2004,7 @@ pub async fn groups_list(
 ) -> HttpResponse {
     let session = match require_session(&data, &req).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let groups = data.group_manager.list().await;
@@ -2073,7 +2081,7 @@ fn render_group_new(
 pub async fn group_new(data: web::Data<WebState>, req: HttpRequest) -> HttpResponse {
     match require_session(&data, &req).await {
         Ok(session) => render_group_new(&data, &session, None, None),
-        Err(resp) => resp,
+        Err(resp) => *resp,
     }
 }
 
@@ -2086,7 +2094,7 @@ pub async fn group_create(
 ) -> HttpResponse {
     let session = match require_session_csrf(&data, &req, &form.csrf).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let description = form.description.as_deref().filter(|d| !d.is_empty());
@@ -2159,7 +2167,7 @@ pub async fn group_edit(
 ) -> HttpResponse {
     let session = match require_session(&data, &req).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     render_group_edit(
         &data,
@@ -2185,7 +2193,7 @@ pub async fn group_update(
 ) -> HttpResponse {
     let session = match require_session_csrf(&data, &req, &form.csrf).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let group_name = path.into_inner();
@@ -2214,7 +2222,7 @@ pub async fn group_delete(
 ) -> HttpResponse {
     let session = match require_session_csrf(&data, &req, &form.csrf).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let group_name = path.into_inner();
@@ -2243,7 +2251,7 @@ pub async fn group_add_member(
 ) -> HttpResponse {
     let session = match require_session_csrf(&data, &req, &form.csrf).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let group_name = path.into_inner();
@@ -2267,7 +2275,7 @@ pub async fn group_remove_member(
 ) -> HttpResponse {
     let session = match require_session_csrf(&data, &req, &form.csrf).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let (group_name, member) = path.into_inner();
