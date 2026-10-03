@@ -3059,11 +3059,15 @@ mod tests {
         let timeouts = Timeouts {
             pre_auth: Duration::from_secs(30),
             auth: Duration::from_secs(30),
-            idle_max: Duration::from_millis(500),
+            // Generous enough for slow (coverage-instrumented) runs to fill the
+            // pipe first, still far below the 30s write timeout.
+            idle_max: Duration::from_millis(1500),
             idle_poll: Duration::from_millis(5),
             write: Duration::from_secs(30),
         };
-        let (client, server) = tokio::io::duplex(256);
+        // A tiny pipe: two untagged EXISTS updates are enough to block the
+        // server's writes, so the outcome doesn't depend on scheduling speed.
+        let (client, server) = tokio::io::duplex(16);
         let peer: SocketAddr = "127.0.0.1:40004".parse().unwrap();
         let st = Arc::clone(&storage);
         let handle = tokio::spawn(async move { serve_imap_with(server, peer, st, timeouts).await });
@@ -3081,8 +3085,17 @@ mod tests {
         assert_eq!(c.line().await, "+ idling\r\n");
         assert!(first_message_content(&storage).await.contains("body 1"));
 
-        // Stop reading; keep new mail arriving so the server's EXISTS
-        // updates fill the pipe and its writes block.
+        // Stop reading. Deliver a few messages up front so the server's EXISTS
+        // updates fill the pipe well before the deadline, then keep mail
+        // arriving so its writes stay blocked.
+        for i in 0..5 {
+            let raw = format!("Subject: pre{}\r\n\r\nx\r\n", i);
+            storage
+                .deliver_email("bob@example.com", Email::new("a@b".into(), vec![], raw))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let feeder_storage = Arc::clone(&storage);
         let feeder = tokio::spawn(async move {
             for i in 0..1000 {
