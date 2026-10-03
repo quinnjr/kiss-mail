@@ -246,16 +246,16 @@ pub(crate) async fn apply_user_update(
         }
     }
 
-    if let Some(role) = plan.role {
-        if let Err(e) = user_manager.set_role(user, role, actor).await {
-            report.errors.push(format!("Role: {}", e));
-        }
+    if let Some(role) = plan.role
+        && let Err(e) = user_manager.set_role(user, role, actor).await
+    {
+        report.errors.push(format!("Role: {}", e));
     }
 
-    if let Some(status) = plan.status {
-        if let Err(e) = user_manager.set_status(user, status, actor).await {
-            report.errors.push(format!("Status: {}", e));
-        }
+    if let Some(status) = plan.status
+        && let Err(e) = user_manager.set_status(user, status, actor).await
+    {
+        report.errors.push(format!("Status: {}", e));
     }
 
     report
@@ -327,10 +327,10 @@ pub(crate) async fn cleanup_deleted_user(
     if let Err(e) = sso.remove_user(&username).await {
         fail("SSO data", &e);
     }
-    if let Some(crypto) = crypto {
-        if let Err(e) = crypto.delete_keys(&username).await {
-            fail("encryption keys", &e);
-        }
+    if let Some(crypto) = crypto
+        && let Err(e) = crypto.delete_keys(&username).await
+    {
+        fail("encryption keys", &e);
     }
     if let Err(e) = groups.remove_user_everywhere(&username).await {
         fail("group memberships", &e);

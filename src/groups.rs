@@ -770,30 +770,30 @@ impl GroupManager {
         }
 
         self.commit(|groups| {
-            if let Some(new_email) = &new_email {
-                if email_taken(groups, new_email, Some(&name_lower)) {
-                    return Err(GroupError::AlreadyExists(format!(
-                        "Email {} already in use",
-                        new_email
-                    )));
-                }
+            if let Some(new_email) = &new_email
+                && email_taken(groups, new_email, Some(&name_lower))
+            {
+                return Err(GroupError::AlreadyExists(format!(
+                    "Email {} already in use",
+                    new_email
+                )));
             }
             let group = groups
                 .get_mut(&name_lower)
                 .ok_or_else(|| GroupError::NotFound(name.to_string()))?;
 
             let mut changed = false;
-            if let Some(new_email) = new_email {
-                if group.email.to_lowercase() != new_email {
-                    group.email = new_email;
-                    changed = true;
-                }
+            if let Some(new_email) = new_email
+                && group.email.to_lowercase() != new_email
+            {
+                group.email = new_email;
+                changed = true;
             }
-            if let Some(desc) = description {
-                if group.description != desc {
-                    group.description = desc.to_string();
-                    changed = true;
-                }
+            if let Some(desc) = description
+                && group.description != desc
+            {
+                group.description = desc.to_string();
+                changed = true;
             }
             if changed {
                 group.updated_at = Utc::now();

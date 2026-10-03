@@ -1204,7 +1204,7 @@ impl SsoManager {
                         || ap.allowed_protocols.iter().any(|p| p == protocol)
                 })
                 .collect();
-            usable.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            usable.sort_by_key(|ap| std::cmp::Reverse(ap.created_at));
             usable
                 .into_iter()
                 .take(MAX_APP_PASSWORD_CANDIDATES)
@@ -1254,10 +1254,8 @@ impl SsoManager {
             .lock()
             .map(|t| t.is_none_or(|t| t.elapsed() >= LAST_USED_SAVE_INTERVAL))
             .unwrap_or(true);
-        if due {
-            if let Err(e) = self.save().await {
-                tracing::warn!("Failed to persist app password last_used: {}", e);
-            }
+        if due && let Err(e) = self.save().await {
+            tracing::warn!("Failed to persist app password last_used: {}", e);
         }
 
         Ok(true)

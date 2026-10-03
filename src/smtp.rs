@@ -353,14 +353,14 @@ async fn expand_recipients(rcpt_to: &[String], ctx: &SmtpContext) -> Vec<Expande
         }
     };
     for rcpt in rcpt_to {
-        if !is_local_user_address(rcpt, ctx).await {
-            if let Some(members) = ctx.groups.expand_recipients(rcpt).await {
-                tracing::info!("Expanding group {} to {} members", rcpt, members.len());
-                for member in members {
-                    add(member, false);
-                }
-                continue;
+        if !is_local_user_address(rcpt, ctx).await
+            && let Some(members) = ctx.groups.expand_recipients(rcpt).await
+        {
+            tracing::info!("Expanding group {} to {} members", rcpt, members.len());
+            for member in members {
+                add(member, false);
             }
+            continue;
         }
         add(rcpt.clone(), true);
     }
@@ -647,10 +647,10 @@ fn is_valid_helo_domain(s: &str) -> bool {
 /// Parse ESMTP parameters on MAIL FROM; returns the declared SIZE if present.
 fn parse_mail_size(params: &str) -> Result<Option<usize>, ()> {
     for param in params.split_whitespace() {
-        if let Some((key, value)) = param.split_once('=') {
-            if key.eq_ignore_ascii_case("SIZE") {
-                return value.parse::<usize>().map(Some).map_err(|_| ());
-            }
+        if let Some((key, value)) = param.split_once('=')
+            && key.eq_ignore_ascii_case("SIZE")
+        {
+            return value.parse::<usize>().map(Some).map_err(|_| ());
         }
     }
     Ok(None)
@@ -859,15 +859,15 @@ async fn check_recipient(to: &str, session: &mut SmtpSession, ctx: &SmtpContext)
         return SMTP_OK.to_string();
     }
 
-    if let Some((_, domain)) = to.rsplit_once('@') {
-        if !is_local_domain(domain, ctx) {
-            return if session.authenticated {
-                "550 5.7.1 Relaying not supported: this server only delivers to local mailboxes"
-                    .to_string()
-            } else {
-                "550 5.7.1 Relaying denied".to_string()
-            };
-        }
+    if let Some((_, domain)) = to.rsplit_once('@')
+        && !is_local_domain(domain, ctx)
+    {
+        return if session.authenticated {
+            "550 5.7.1 Relaying not supported: this server only delivers to local mailboxes"
+                .to_string()
+        } else {
+            "550 5.7.1 Relaying denied".to_string()
+        };
     }
 
     "550 5.1.1 No such user here".to_string()
@@ -957,10 +957,10 @@ fn decode_b64_string(s: &str) -> Option<String> {
 /// Split `<addr> PARAMS...` into the address and the parameter string.
 fn split_address_and_params(s: &str) -> (String, &str) {
     let s = s.trim();
-    if let Some(rest) = s.strip_prefix('<') {
-        if let Some(end) = rest.find('>') {
-            return (rest[..end].trim().to_string(), rest[end + 1..].trim());
-        }
+    if let Some(rest) = s.strip_prefix('<')
+        && let Some(end) = rest.find('>')
+    {
+        return (rest[..end].trim().to_string(), rest[end + 1..].trim());
     }
     match s.split_once(char::is_whitespace) {
         Some((addr, params)) => (addr.to_string(), params.trim()),

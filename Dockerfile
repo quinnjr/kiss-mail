@@ -28,7 +28,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Build (using DHI Rust Alpine dev image)
 # -----------------------------------------------------------------------------
-FROM dhi.io/rust:1.85-alpine3.21-dev AS builder
+FROM dhi.io/rust:1.94-alpine3.23-dev AS builder
 
 WORKDIR /app
 
@@ -61,7 +61,7 @@ RUN strip /app/target/release/kiss-mail
 # -----------------------------------------------------------------------------
 # Stage 2: Runtime (using DHI Alpine minimal image)
 # -----------------------------------------------------------------------------
-FROM dhi.io/alpine:3.21 AS runtime
+FROM dhi.io/alpine:3.23 AS runtime
 
 ARG VERSION=dev
 ARG COMMIT=unknown
@@ -71,7 +71,7 @@ LABEL org.opencontainers.image.title="KISS Mail Server"
 LABEL org.opencontainers.image.description="Simple SMTP, IMAP, POP3 email server - Hardened Container"
 LABEL org.opencontainers.image.source="https://github.com/quinnjr/kiss-mail"
 LABEL org.opencontainers.image.vendor="Joseph R. Quinn"
-LABEL org.opencontainers.image.base.name="dhi.io/alpine:3.21"
+LABEL org.opencontainers.image.base.name="dhi.io/alpine:3.23"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.version="${VERSION}"
 LABEL org.opencontainers.image.revision="${COMMIT}"

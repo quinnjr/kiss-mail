@@ -151,14 +151,14 @@ jobs:
   # Minimum Supported Rust Version
   # ==========================================================================
   msrv:
-    name: MSRV (1.85.0)
+    name: MSRV (1.94.0)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust 1.85.0
+      - name: Install Rust 1.94.0
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (no release tags; see CONTRIBUTING.md)
         with:
-          toolchain: 1.85.0
+          toolchain: 1.94.0
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check MSRV

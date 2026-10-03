@@ -126,7 +126,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
-            org.opencontainers.image.base.name=dhi.io/alpine:3.21
+            org.opencontainers.image.base.name=dhi.io/alpine:3.23
           cache-from: type=gha,scope=hardened
           cache-to: type=gha,mode=max,scope=hardened
           build-args: |
@@ -157,7 +157,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
-            org.opencontainers.image.base.name=alpine:3.21
+            org.opencontainers.image.base.name=alpine:3.23
           cache-from: type=gha,scope=alpine
           cache-to: type=gha,mode=max,scope=alpine
           build-args: |

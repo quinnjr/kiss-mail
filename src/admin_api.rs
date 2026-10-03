@@ -531,15 +531,13 @@ fn require_admin(auth: &AuthUser) -> Result<(), (StatusCode, Json<ApiResponse<()
 ///
 /// API-key requests act as a synthetic super admin; token requests act as the
 /// logged-in admin so role restrictions (e.g. Admin vs SuperAdmin) apply.
-async fn actor_for(state: &ApiState, auth: &AuthUser) -> Result<UserAccount, Response> {
+///
+/// `None` means the token's account no longer exists (respond 401).
+async fn actor_for(state: &ApiState, auth: &AuthUser) -> Option<UserAccount> {
     if auth.is_api_key {
-        return Ok(api_admin_actor());
+        return Some(api_admin_actor());
     }
-    state
-        .user_manager
-        .get_user(&auth.username)
-        .await
-        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Unauthorized"))
+    state.user_manager.get_user(&auth.username).await
 }
 
 // ============================================================================
@@ -699,9 +697,8 @@ async fn create_user(
         return e.into_response();
     }
 
-    let actor = match actor_for(&state, &auth).await {
-        Ok(a) => a,
-        Err(resp) => return resp,
+    let Some(actor) = actor_for(&state, &auth).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     };
 
     let role = match req.role.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
@@ -781,9 +778,8 @@ async fn update_user(
             }
         },
     };
-    let actor = match actor_for(&state, &auth).await {
-        Ok(a) => a,
-        Err(resp) => return resp,
+    let Some(actor) = actor_for(&state, &auth).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     };
 
     let mut plan = PlannedUserUpdate {
@@ -836,9 +832,8 @@ async fn delete_user(
         return e.into_response();
     }
 
-    let actor = match actor_for(&state, &auth).await {
-        Ok(a) => a,
-        Err(resp) => return resp,
+    let Some(actor) = actor_for(&state, &auth).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     };
     match state.user_manager.delete_user(&username, &actor).await {
         Ok(()) => {
@@ -1029,9 +1024,8 @@ async fn create_app_password(
 
     // App passwords for a super admin may only be issued by a super admin or
     // by that user themselves.
-    let actor = match actor_for(&state, &auth).await {
-        Ok(a) => a,
-        Err(resp) => return resp,
+    let Some(actor) = actor_for(&state, &auth).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     };
     let Some(target) = state.user_manager.get_user(&username).await else {
         return api_error(StatusCode::NOT_FOUND, "User not found");

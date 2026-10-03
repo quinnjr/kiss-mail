@@ -576,14 +576,14 @@ impl Storage {
         *self.mailboxes.write().await = mailboxes;
         tracing::info!("Loaded {} mailboxes from storage", count);
 
-        if merged || uids_changed {
-            if let Err(e) = self.save().await {
-                tracing::error!(
-                    "Could not persist repaired mailboxes to {}: {}",
-                    path.display(),
-                    e
-                );
-            }
+        if (merged || uids_changed)
+            && let Err(e) = self.save().await
+        {
+            tracing::error!(
+                "Could not persist repaired mailboxes to {}: {}",
+                path.display(),
+                e
+            );
         }
 
         Ok(())
@@ -757,22 +757,20 @@ impl Storage {
         let username = username.as_str();
 
         // Try SSO app passwords first if configured.
-        if let Some(sso) = &self.sso_manager {
-            if let Some(user) = self
+        if let Some(sso) = &self.sso_manager
+            && let Some(user) = self
                 .try_app_password(sso, username, password, ip, protocol)
                 .await?
-            {
-                return Ok((user, AuthMethod::AppPassword));
-            }
+        {
+            return Ok((user, AuthMethod::AppPassword));
         }
 
         // Try LDAP if configured.
-        if let Some(ldap) = &self.ldap_client {
-            if ldap.is_enabled() {
-                if let Some(user) = self.try_ldap(ldap, username, password, ip).await? {
-                    return Ok((user, AuthMethod::Ldap));
-                }
-            }
+        if let Some(ldap) = &self.ldap_client
+            && ldap.is_enabled()
+            && let Some(user) = self.try_ldap(ldap, username, password, ip).await?
+        {
+            return Ok((user, AuthMethod::Ldap));
         }
 
         // Local authentication (throttled inside `UserManager::authenticate`).

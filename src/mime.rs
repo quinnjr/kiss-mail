@@ -193,11 +193,11 @@ fn reassemble(sections: &[(u32, bool, String)], last_wins: bool) -> String {
         }
         if *encoded {
             let mut v = val.as_str();
-            if *idx == 0 {
-                if let Some((cs, rest)) = split_charset(v) {
-                    charset = Some(cs.to_ascii_lowercase());
-                    v = rest;
-                }
+            if *idx == 0
+                && let Some((cs, rest)) = split_charset(v)
+            {
+                charset = Some(cs.to_ascii_lowercase());
+                v = rest;
             }
             bytes.extend_from_slice(&urlencoding::decode_binary(v.as_bytes()));
         } else {

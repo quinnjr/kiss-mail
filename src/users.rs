@@ -622,10 +622,10 @@ impl ThrottleEntry {
         if !policy.lockout {
             return Ok(());
         }
-        if let Some(until) = self.locked_until {
-            if until > now {
-                return Err(until - now);
-            }
+        if let Some(until) = self.locked_until
+            && until > now
+        {
+            return Err(until - now);
         }
         if self.failures + self.pending >= policy.threshold {
             // Enough attempts are already in flight to reach the threshold.
@@ -1024,10 +1024,10 @@ impl LoginThrottle {
                 duration.as_secs()
             );
         }
-        if outcome == Outcome::Failure {
-            if let Some(user) = &keys.user {
-                state.users.finish(user, outcome, now);
-            }
+        if outcome == Outcome::Failure
+            && let Some(user) = &keys.user
+        {
+            state.users.finish(user, outcome, now);
         }
     }
 
@@ -1384,16 +1384,16 @@ impl UserManager {
         *self.users.write().await = users;
         tracing::info!("Loaded {} user accounts", count);
 
-        if migrated > 0 {
-            if let Err(e) = self.save().await {
-                // Memory is migrated; the next successful save persists it.
-                tracing::warn!(
-                    "Could not persist {} migrated account(s) to {}: {}",
-                    migrated,
-                    path.display(),
-                    e
-                );
-            }
+        if migrated > 0
+            && let Err(e) = self.save().await
+        {
+            // Memory is migrated; the next successful save persists it.
+            tracing::warn!(
+                "Could not persist {} migrated account(s) to {}: {}",
+                migrated,
+                path.display(),
+                e
+            );
         }
         Ok(())
     }
@@ -1497,11 +1497,11 @@ impl UserManager {
             return Err(io_to_user_error(e));
         }
 
-        if let Some(crypto) = self.active_crypto().await {
-            if let Err(e) = crypto.generate_keypair(&username, password).await {
-                // The account is usable; keys will be generated on next login.
-                tracing::error!("Could not generate encryption keys for {}: {}", username, e);
-            }
+        if let Some(crypto) = self.active_crypto().await
+            && let Err(e) = crypto.generate_keypair(&username, password).await
+        {
+            // The account is usable; keys will be generated on next login.
+            tracing::error!("Could not generate encryption keys for {}: {}", username, e);
         }
 
         tracing::info!("Created user account: {}", username);
@@ -1616,10 +1616,10 @@ impl UserManager {
 
         self.throttle.clear_user(&username);
 
-        if let Some(crypto) = self.attached_crypto().await {
-            if let Err(e) = crypto.delete_keys(&username).await {
-                tracing::warn!("Could not delete encryption keys for {}: {}", username, e);
-            }
+        if let Some(crypto) = self.attached_crypto().await
+            && let Err(e) = crypto.delete_keys(&username).await
+        {
+            tracing::warn!("Could not delete encryption keys for {}: {}", username, e);
         }
 
         tracing::info!("Deleted user account: {} (by {})", username, actor.username);
@@ -1971,10 +1971,10 @@ impl UserManager {
                         e
                     )));
                 }
-            } else if crypto.is_enabled() {
-                if let Err(e) = crypto.generate_keypair(&username, new_password).await {
-                    tracing::error!("Could not generate encryption keys for {}: {}", username, e);
-                }
+            } else if crypto.is_enabled()
+                && let Err(e) = crypto.generate_keypair(&username, new_password).await
+            {
+                tracing::error!("Could not generate encryption keys for {}: {}", username, e);
             }
         }
 
@@ -2225,15 +2225,15 @@ impl UserManager {
             .await
             .values()
             .filter(|u| {
-                if let Some(r) = role {
-                    if u.role != r {
-                        return false;
-                    }
+                if let Some(r) = role
+                    && u.role != r
+                {
+                    return false;
                 }
-                if let Some(s) = status {
-                    if u.status != s {
-                        return false;
-                    }
+                if let Some(s) = status
+                    && u.status != s
+                {
+                    return false;
                 }
                 if let Some(q) = search {
                     let q = q.to_lowercase();

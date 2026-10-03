@@ -2,7 +2,7 @@
 name = "kiss-mail"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.94.0"
 description = "A KISS (Keep It Simple, Stupid) SMTP, IMAP, and POP3 mail server"
 license = "MIT"
 authors = ["Joseph R. Quinn <quinn.josephr@protonmail.com>"]

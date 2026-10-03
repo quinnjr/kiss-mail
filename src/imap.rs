@@ -879,12 +879,9 @@ impl FetchItem {
 
 fn parse_section(atom: &str) -> Option<FetchItem> {
     let upper = atom.to_ascii_uppercase();
-    let (peek, rest) = if let Some(r) = upper.strip_prefix("BODY.PEEK[") {
-        (true, r)
-    } else if let Some(r) = upper.strip_prefix("BODY[") {
-        (false, r)
-    } else {
-        return None;
+    let (peek, rest) = match upper.strip_prefix("BODY.PEEK[") {
+        Some(r) => (true, r),
+        None => (false, upper.strip_prefix("BODY[")?),
     };
     let close = rest.find(']')?;
     let spec_raw = rest[..close].trim();
@@ -904,12 +901,11 @@ fn parse_section(atom: &str) -> Option<FetchItem> {
         (SectionKind::Header, "HEADER".to_string())
     } else if spec_raw == "TEXT" || spec_raw == "1" {
         (SectionKind::Text, spec_raw.to_string())
-    } else if let Some(list) = spec_raw
-        .strip_prefix("HEADER.FIELDS.NOT")
-        .map(|l| (l, true))
-        .or_else(|| spec_raw.strip_prefix("HEADER.FIELDS").map(|l| (l, false)))
-    {
-        let (list, not) = list;
+    } else {
+        let (list, not) = spec_raw
+            .strip_prefix("HEADER.FIELDS.NOT")
+            .map(|l| (l, true))
+            .or_else(|| spec_raw.strip_prefix("HEADER.FIELDS").map(|l| (l, false)))?;
         let toks = tokenize(list.trim())?;
         let names: Vec<String> = match toks.as_slice() {
             [Tok::List(items)] => items
@@ -924,8 +920,6 @@ fn parse_section(atom: &str) -> Option<FetchItem> {
             names.join(" ")
         );
         (SectionKind::HeaderFields(names, not), spec)
-    } else {
-        return None;
     };
 
     Some(FetchItem::Section {

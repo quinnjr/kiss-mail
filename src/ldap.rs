@@ -96,10 +96,10 @@ impl LdapConfig {
             config.user_filter = user_filter;
         }
 
-        if let Ok(user_dn_template) = std::env::var("LDAP_USER_DN_TEMPLATE") {
-            if !user_dn_template.trim().is_empty() {
-                config.user_dn_template = Some(user_dn_template);
-            }
+        if let Ok(user_dn_template) = std::env::var("LDAP_USER_DN_TEMPLATE")
+            && !user_dn_template.trim().is_empty()
+        {
+            config.user_dn_template = Some(user_dn_template);
         }
 
         if let Ok(username_attr) = std::env::var("LDAP_USERNAME_ATTR") {

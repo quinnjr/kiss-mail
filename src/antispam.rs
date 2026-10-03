@@ -336,10 +336,10 @@ impl AntiSpam {
         }
 
         // Very long local part
-        if let Some(local) = from.split('@').next() {
-            if local.len() > 64 {
-                result.add_score(1.0, "Unusually long sender local part");
-            }
+        if let Some(local) = from.split('@').next()
+            && local.len() > 64
+        {
+            result.add_score(1.0, "Unusually long sender local part");
         }
     }
 

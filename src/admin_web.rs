@@ -1225,13 +1225,13 @@ pub async fn logout(
     req: HttpRequest,
     form: web::Form<CsrfForm>,
 ) -> HttpResponse {
-    if let Some(c) = req.cookie(SESSION_COOKIE) {
-        if let Some(session) = data.sessions.lookup(c.value()).await {
-            if !csrf_matches(&session.csrf, &form.csrf) {
-                return csrf_rejected();
-            }
-            data.sessions.remove(c.value()).await;
+    if let Some(c) = req.cookie(SESSION_COOKIE)
+        && let Some(session) = data.sessions.lookup(c.value()).await
+    {
+        if !csrf_matches(&session.csrf, &form.csrf) {
+            return csrf_rejected();
         }
+        data.sessions.remove(c.value()).await;
     }
 
     HttpResponse::Found()

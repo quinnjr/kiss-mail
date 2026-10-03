@@ -169,15 +169,14 @@ fn parse_clamd_reply(response: &[u8]) -> Result<Vec<String>, ClamError> {
     if line == "stream: OK" {
         return Ok(Vec::new());
     }
-    if !line.contains(['\0', '\r', '\n']) {
-        if let Some(name) = line
+    if !line.contains(['\0', '\r', '\n'])
+        && let Some(name) = line
             .strip_prefix("stream: ")
             .and_then(|r| r.strip_suffix(" FOUND"))
             .map(str::trim)
             .filter(|n| !n.is_empty())
-        {
-            return Ok(vec![name.to_string()]);
-        }
+    {
+        return Ok(vec![name.to_string()]);
     }
     let shown: String = line.chars().take(200).collect();
     Err(ClamError::Reply(if shown.is_empty() {
@@ -1298,12 +1297,12 @@ fn decode_quoted_printable(body: &str) -> Vec<u8> {
             i = j;
             continue;
         }
-        if i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
+        if i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
         }
         out.push(b);
         i += 1;
