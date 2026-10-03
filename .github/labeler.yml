@@ -76,7 +76,6 @@ docker:
   - changed-files:
       - any-glob-to-any-file:
           - 'Dockerfile'
-          - 'Dockerfile.alpine'
           - 'docker-compose.yml'
           - '.dockerignore'
 

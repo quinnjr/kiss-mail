@@ -371,7 +371,7 @@ grep -rl 'dtolnay/rust-toolchain@' .github/workflows \
 ```
 
 When you bump the MSRV, update `toolchain: 1.94.0` in `ci.yml`, the Rust
-builder images in `Dockerfile` and `Dockerfile.alpine`, along with
+builder image in `Dockerfile`, along with
 `rust-version` in `Cargo.toml`.
 
 ## Questions?

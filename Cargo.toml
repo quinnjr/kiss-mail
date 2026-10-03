@@ -42,7 +42,9 @@ password-hash = "0.5.0"
 sha2 = "0.10.9"
 urlencoding = "2.1.3"
 axum = { version = "0.8.8", features = ["json"] }
-actix-web = "4.12.1"
+# HTTP/2 and compression are unused (the admin UI sits behind nginx or on
+# localhost); dropping them removes h2 0.3 (RUSTSEC-2026-0258).
+actix-web = { version = "4.15", default-features = false, features = ["macros", "cookies"] }
 handlebars = "6.4.0"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 chacha20poly1305 = { version = "0.10.1", features = ["std"] }
