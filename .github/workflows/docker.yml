@@ -9,7 +9,6 @@ on:
     branches: [main]
     paths:
       - 'Dockerfile'
-      - 'Dockerfile.alpine'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/docker.yml'
@@ -27,9 +26,7 @@ env:
 
 jobs:
   # ==========================================================================
-  # PR check: build the standard Alpine image (no push, no registry secrets).
-  # dhi.io requires credentials that are not available to PRs, so the
-  # hardened Dockerfile is only built on push events.
+  # PR check: build the image (amd64 only, no push, no registry secrets).
   # ==========================================================================
   build-pr:
     name: Build Docker Image (PR)
@@ -41,11 +38,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Build (Standard Alpine, no push)
+      - name: Build (no push)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          file: ./Dockerfile.alpine
+          file: ./Dockerfile
           platforms: linux/amd64
           push: false
           cache-from: type=gha,scope=alpine-amd64
@@ -55,9 +52,9 @@ jobs:
             COMMIT=${{ github.sha }}
 
   # ==========================================================================
-  # Build and push ONLY an immutable sha-<commit> tag (Hardened Alpine, falls
-  # back to standard Alpine). Mutable tags (latest/semver/main) are added by
-  # the promote job, and only after the scan job has passed.
+  # Build and push ONLY an immutable sha-<commit> tag. Mutable tags
+  # (latest/semver/main) are added by the promote job, and only after the
+  # scan job has passed.
   # ==========================================================================
   build:
     name: Build Docker Image
@@ -67,7 +64,7 @@ jobs:
       contents: read
       packages: write
     outputs:
-      digest: ${{ steps.result.outputs.digest }}
+      digest: ${{ steps.build.outputs.digest }}
       version: ${{ steps.meta.outputs.version }}
 
     steps:
@@ -78,21 +75,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      # Login to Docker Hub (required for dhi.io hardened images)
-      - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # Login to DHI registry (Docker Hardened Images)
-      - name: Log in to DHI Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: dhi.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Login to GitHub Container Registry
       - name: Log in to GHCR
@@ -111,45 +93,12 @@ jobs:
           tags: |
             type=sha,prefix=sha-,format=long
 
-      # Try the hardened image first
-      - name: Build and push (Hardened Alpine)
-        id: build-hardened
+      - name: Build and push
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        continue-on-error: true
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          sbom: true
-          provenance: mode=max
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: |
-            ${{ steps.meta.outputs.labels }}
-            org.opencontainers.image.base.name=dhi.io/alpine:3.23
-          cache-from: type=gha,scope=hardened
-          cache-to: type=gha,mode=max,scope=hardened
-          build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-            COMMIT=${{ github.sha }}
-
-      - name: Warn about fallback
-        if: steps.build-hardened.outcome == 'failure'
-        run: |
-          echo "::warning title=Hardened image build failed::Building ./Dockerfile (dhi.io) failed; publishing the standard Alpine image (Dockerfile.alpine) instead."
-          {
-            echo "### :warning: Hardened image build failed"
-            echo "The published image was built from \`Dockerfile.alpine\` (standard Alpine base)."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Fallback to standard Alpine if the hardened build fails
-      - name: Build and push (Standard Alpine Fallback)
-        id: build-fallback
-        if: steps.build-hardened.outcome == 'failure'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: ./Dockerfile.alpine
           platforms: linux/amd64,linux/arm64
           push: true
           sbom: true
@@ -163,24 +112,6 @@ jobs:
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             COMMIT=${{ github.sha }}
-
-      - name: Resolve pushed digest
-        id: result
-        env:
-          HARDENED_DIGEST: ${{ steps.build-hardened.outputs.digest }}
-          FALLBACK_DIGEST: ${{ steps.build-fallback.outputs.digest }}
-          HARDENED_OUTCOME: ${{ steps.build-hardened.outcome }}
-        run: |
-          if [ "$HARDENED_OUTCOME" = "success" ]; then
-            digest="$HARDENED_DIGEST"
-          else
-            digest="$FALLBACK_DIGEST"
-          fi
-          if [ -z "$digest" ]; then
-            echo "::error::No image digest was produced"
-            exit 1
-          fi
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
   # ==========================================================================
   # Scan the pushed image (by digest) for vulnerabilities
