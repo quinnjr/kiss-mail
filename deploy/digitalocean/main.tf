@@ -33,20 +33,18 @@ variable "region" {
 variable "droplet_size" {
   description = "Droplet size"
   type        = string
-  default     = "s-1vcpu-1gb"  # $6/month
+  default     = "s-1vcpu-1gb" # $6/month
 }
 
 variable "domain" {
   description = "Mail domain"
   type        = string
   default     = "mail.example.com"
-}
 
-variable "admin_password" {
-  description = "Initial admin password (leave empty for auto-generated)"
-  type        = string
-  default     = ""
-  sensitive   = true
+  validation {
+    condition     = can(regex("^[A-Za-z0-9.-]+$", var.domain))
+    error_message = "The domain may only contain letters, digits, '.' and '-'."
+  }
 }
 
 variable "ssh_keys" {
@@ -172,15 +170,18 @@ resource "digitalocean_droplet" "kiss_mail" {
   name       = "kiss-mail"
   region     = var.region
   size       = var.droplet_size
-  image      = "docker-20-04"  # Docker pre-installed
+  image      = "ubuntu-24-04-x64" # Docker is installed by the bootstrap script
   backups    = var.enable_backups
   monitoring = var.enable_monitoring
   ssh_keys   = var.ssh_keys
   tags       = ["kiss-mail", "mail-server"]
 
-  user_data = templatefile("${path.module}/user-data.sh", {
-    domain         = var.domain
-    admin_password = var.admin_password
+  # Shared bootstrap script. The admin password is generated on the droplet
+  # and kept only in the root-only /opt/kiss-mail/credentials.txt.
+  user_data = templatefile("${path.module}/../common/bootstrap.sh.tftpl", {
+    provider_name = "digitalocean"
+    domain        = var.domain
+    public_ip_cmd = "curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address"
   })
 
   lifecycle {
@@ -266,6 +267,11 @@ output "pop3_server" {
 output "ssh_command" {
   description = "SSH command"
   value       = "ssh root@${digitalocean_reserved_ip.kiss_mail.ip_address}"
+}
+
+output "credentials_command" {
+  description = "Show the generated credentials (admin password, API key)"
+  value       = "ssh root@${digitalocean_reserved_ip.kiss_mail.ip_address} cat /opt/kiss-mail/credentials.txt"
 }
 
 output "dns_records" {

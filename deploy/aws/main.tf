@@ -10,7 +10,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
   }
 }
@@ -34,13 +34,11 @@ variable "domain" {
   description = "Mail domain"
   type        = string
   default     = "mail.example.com"
-}
 
-variable "admin_password" {
-  description = "Initial admin password (leave empty for auto-generated)"
-  type        = string
-  default     = ""
-  sensitive   = true
+  validation {
+    condition     = can(regex("^[A-Za-z0-9.-]+$", var.domain))
+    error_message = "The domain may only contain letters, digits, '.' and '-'."
+  }
 }
 
 variable "ssh_key_name" {
@@ -89,14 +87,14 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
-# Latest Amazon Linux 2023 AMI
-data "aws_ami" "amazon_linux" {
+# Latest Ubuntu 24.04 LTS (Noble) AMI published by Canonical
+data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["amazon"]
+  owners      = ["099720109477"] # Canonical
 
   filter {
     name   = "name"
-    values = ["al2023-ami-*-x86_64"]
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
   }
 
   filter {
@@ -277,12 +275,20 @@ resource "aws_iam_instance_profile" "kiss_mail" {
 # EC2 Instance
 # ----------------------------------------------------------------------------
 resource "aws_instance" "kiss_mail" {
-  ami                    = data.aws_ami.amazon_linux.id
+  ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.kiss_mail.id]
   iam_instance_profile   = aws_iam_instance_profile.kiss_mail.name
   key_name               = var.ssh_key_name != "" ? var.ssh_key_name : null
+
+  # IMDSv2 only, and a hop limit of 1 so containers cannot reach the
+  # instance metadata (and the instance role credentials).
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
 
   root_block_device {
     volume_size           = var.volume_size
@@ -291,9 +297,13 @@ resource "aws_instance" "kiss_mail" {
     delete_on_termination = true
   }
 
-  user_data = base64encode(templatefile("${path.module}/user-data.sh", {
-    domain         = var.domain
-    admin_password = var.admin_password
+  # Shared bootstrap script. The admin password is generated on the VM and
+  # kept only in the root-only /opt/kiss-mail/credentials.txt.
+  user_data = base64encode(templatefile("${path.module}/../common/bootstrap.sh.tftpl", {
+    provider_name = "aws"
+    domain        = var.domain
+    # IMDSv2 (session token required)
+    public_ip_cmd = "t=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'); curl -s -H \"X-aws-ec2-metadata-token: $t\" http://169.254.169.254/latest/meta-data/public-ipv4"
   }))
 
   tags = {
@@ -360,7 +370,12 @@ output "dns_records" {
 
 output "ssh_command" {
   description = "SSH command (if key was provided)"
-  value       = var.ssh_key_name != "" ? "ssh -i ~/.ssh/${var.ssh_key_name}.pem ec2-user@${aws_eip.kiss_mail.public_ip}" : "SSH not configured (no key provided)"
+  value       = var.ssh_key_name != "" ? "ssh -i ~/.ssh/${var.ssh_key_name}.pem ubuntu@${aws_eip.kiss_mail.public_ip}" : "SSH not configured (no key provided)"
+}
+
+output "credentials_command" {
+  description = "Show the generated credentials (admin password, API key)"
+  value       = "aws ssm start-session --target ${aws_instance.kiss_mail.id} --document-name AWS-StartInteractiveCommand --parameters command='sudo cat /opt/kiss-mail/credentials.txt'"
 }
 
 output "ssm_command" {

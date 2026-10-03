@@ -11,6 +11,7 @@
 //!
 //! For email clients that don't support OAuth2, app passwords can be generated.
 
+use crate::config::env_nonempty;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,23 @@ pub struct SsoConfig {
     pub allow_app_passwords: bool,
     /// App password length
     pub app_password_length: usize,
+    /// Email domains accepted for SSO identities (`user@domain` -> `user`).
+    /// Required: an empty list disables SSO login (see `validate`).
+    /// Matched exactly unless `allow_subdomains` is set; parents are never
+    /// accepted. Read from `SSO_ALLOWED_DOMAIN` (comma-separated), falling
+    /// back to `KISS_MAIL_DOMAIN`.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Also accept subdomains of an allowed domain
+    /// (`SSO_ALLOW_SUBDOMAINS=true`; default `false`).
+    #[serde(default)]
+    pub allow_subdomains: bool,
+    /// Microsoft Entra tenant the provider is pinned to
+    /// (`MICROSOFT_TENANT_ID`). Required for the Microsoft provider: the
+    /// multi-tenant authorities (`common`, `organizations`, `consumers`) are
+    /// refused by `validate`.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 impl Default for SsoConfig {
@@ -110,6 +128,9 @@ impl Default for SsoConfig {
             name_claim: "name".to_string(),
             allow_app_passwords: true,
             app_password_length: 24,
+            allowed_domains: Vec::new(),
+            allow_subdomains: false,
+            tenant_id: None,
         }
     }
 }
@@ -132,6 +153,12 @@ impl SsoConfig {
                 .unwrap_or_else(|_| "https://app.1password.com/oauth/authorize".to_string());
             config.token_url = std::env::var("ONEPASSWORD_TOKEN_URL")
                 .unwrap_or_else(|_| "https://app.1password.com/oauth/token".to_string());
+            // No well-known UserInfo endpoint: must be configured explicitly
+            // (ONEPASSWORD_USERINFO_URL or SSO_USERINFO_URL), otherwise the
+            // provider is disabled by `validate()` below.
+            config.userinfo_url = std::env::var("ONEPASSWORD_USERINFO_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
         } else if let Ok(client_id) = std::env::var("GOOGLE_CLIENT_ID") {
             config.provider = SsoProvider::Google;
             config.client_id = client_id;
@@ -150,8 +177,13 @@ impl SsoConfig {
             if let Ok(secret) = std::env::var("MICROSOFT_CLIENT_SECRET") {
                 config.client_secret = secret;
             }
-            let tenant =
-                std::env::var("MICROSOFT_TENANT_ID").unwrap_or_else(|_| "common".to_string());
+            // No default tenant: `validate()` disables the provider unless a
+            // specific tenant is configured (see `MULTI_TENANT_AUTHORITIES`).
+            config.tenant_id = env_nonempty("MICROSOFT_TENANT_ID").map(|t| t.trim().to_string());
+            let tenant = config
+                .tenant_id
+                .clone()
+                .unwrap_or_else(|| "common".to_string());
             config.auth_url = format!(
                 "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize",
                 tenant
@@ -168,7 +200,7 @@ impl SsoConfig {
             if let Ok(secret) = std::env::var("OKTA_CLIENT_SECRET") {
                 config.client_secret = secret;
             }
-            if let Ok(domain) = std::env::var("OKTA_DOMAIN") {
+            if let Some(domain) = env_nonempty("OKTA_DOMAIN") {
                 config.auth_url = format!("https://{}/oauth2/default/v1/authorize", domain);
                 config.token_url = format!("https://{}/oauth2/default/v1/token", domain);
                 config.userinfo_url =
@@ -181,7 +213,7 @@ impl SsoConfig {
             if let Ok(secret) = std::env::var("AUTH0_CLIENT_SECRET") {
                 config.client_secret = secret;
             }
-            if let Ok(domain) = std::env::var("AUTH0_DOMAIN") {
+            if let Some(domain) = env_nonempty("AUTH0_DOMAIN") {
                 config.auth_url = format!("https://{}/authorize", domain);
                 config.token_url = format!("https://{}/oauth/token", domain);
                 config.userinfo_url = Some(format!("https://{}/userinfo", domain));
@@ -218,10 +250,242 @@ impl SsoConfig {
             config.email_claim = claim;
         }
 
+        let domains =
+            env_nonempty("SSO_ALLOWED_DOMAIN").or_else(|| env_nonempty("KISS_MAIL_DOMAIN"));
+        if let Some(domains) = domains {
+            config.allowed_domains = domains
+                .split(',')
+                .map(|d| d.trim().trim_start_matches('@').to_ascii_lowercase())
+                .filter(|d| !d.is_empty())
+                .collect();
+        }
+
+        config.allow_subdomains = crate::config::env_bool("SSO_ALLOW_SUBDOMAINS", false);
+
+        config.validate();
         config
     }
 
-    /// Create preset for 1Password
+    /// Disable the provider (with a warning) if required endpoints are
+    /// missing, instead of running with empty URLs.
+    fn validate(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let mut missing = Vec::new();
+        if self.auth_url.trim().is_empty() {
+            missing.push("authorization URL");
+        }
+        if self.token_url.trim().is_empty() {
+            missing.push("token URL");
+        }
+        if self
+            .userinfo_url
+            .as_deref()
+            .is_none_or(|u| u.trim().is_empty())
+        {
+            missing.push("UserInfo URL");
+        }
+        if self.allowed_domains.is_empty() {
+            tracing::warn!(
+                "SSO provider {} disabled: SSO_ALLOWED_DOMAIN or KISS_MAIL_DOMAIN is required \
+                 to map SSO identities to local users",
+                self.provider.display_name()
+            );
+            self.enabled = false;
+            return;
+        }
+        if self.provider == SsoProvider::Microsoft {
+            let tenant = self.tenant_id.as_deref().map(str::trim).unwrap_or("");
+            if tenant.is_empty()
+                || MULTI_TENANT_AUTHORITIES
+                    .iter()
+                    .any(|t| tenant.eq_ignore_ascii_case(t))
+            {
+                tracing::warn!(
+                    "SSO provider Microsoft disabled: MICROSOFT_TENANT_ID must name a specific \
+                     tenant; the multi-tenant authorities (common, organizations, consumers) \
+                     would accept identities from any tenant"
+                );
+                self.enabled = false;
+                return;
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let hint = match self.provider {
+            SsoProvider::Okta => " (set OKTA_DOMAIN)",
+            SsoProvider::Auth0 => " (set AUTH0_DOMAIN)",
+            SsoProvider::OnePassword => " (set ONEPASSWORD_USERINFO_URL or SSO_USERINFO_URL)",
+            _ => " (set SSO_AUTH_URL / SSO_TOKEN_URL / SSO_USERINFO_URL)",
+        };
+        tracing::warn!(
+            "SSO provider {} disabled: missing {}{}",
+            self.provider.display_name(),
+            missing.join(", "),
+            hint
+        );
+        self.enabled = false;
+    }
+
+    /// Whether `domain` is acceptable for username mapping.
+    ///
+    /// Matches an allowed domain exactly. Only with `allow_subdomains` is a
+    /// subdomain of an allowed one accepted too (`allowed = example.com`
+    /// accepts `user@mail.example.com`). A parent of an allowed domain is
+    /// never accepted. An empty allow-list accepts nothing.
+    fn domain_allowed(&self, domain: &str) -> bool {
+        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if domain.is_empty() {
+            return false;
+        }
+        self.allowed_domains.iter().any(|a| {
+            let a = a.trim().trim_end_matches('.').to_ascii_lowercase();
+            !a.is_empty()
+                && (domain == a || (self.allow_subdomains && domain.ends_with(&format!(".{}", a))))
+        })
+    }
+
+    /// Map provider claims to a local identity.
+    ///
+    /// Rules:
+    /// - `sub` must be present (it is bound to the local account on first login).
+    /// - The address is taken from the configured email claim; if that claim is
+    ///   absent, the configured username claim is used only when it is an
+    ///   address (`local@domain`). A free-form username without `@` is rejected.
+    /// - The address's domain must pass `domain_allowed`; the local username is
+    ///   the canonicalised local part.
+    /// - The address must be verified: `email_verified` must be `true` (a
+    ///   boolean, or the string `"true"`). A missing claim is rejected, so a
+    ///   provider that lets users set an arbitrary unverified email cannot be
+    ///   used to take over a local account ("nOAuth").
+    /// - Microsoft Entra ID is the exception: it does not send
+    ///   `email_verified`. The provider is pinned to one tenant (`validate`
+    ///   refuses the multi-tenant authorities), the `tid` claim, when present,
+    ///   must equal that tenant, and only then is the address treated as
+    ///   verified, i.e. trust rests on the tenant's administrators controlling
+    ///   the `email` attribute of their accounts. An explicit
+    ///   `email_verified: false` is still rejected.
+    fn identity_from_claims(
+        &self,
+        claims: HashMap<String, serde_json::Value>,
+    ) -> Result<SsoUserInfo, String> {
+        let claim_str = |name: &str| {
+            claims
+                .get(name)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+
+        let sub = claim_str("sub").ok_or_else(|| "SSO provider returned no subject".to_string())?;
+
+        let email_claim = claim_str(&self.config_email_claim());
+        let address = match email_claim {
+            Some(e) => e,
+            None => match claim_str(&self.username_claim) {
+                Some(u) if u.contains('@') => u,
+                Some(_) => {
+                    return Err(
+                        "SSO identity has no email address; free-form usernames are not accepted"
+                            .to_string(),
+                    );
+                }
+                None => return Err("SSO provider returned no email address".to_string()),
+            },
+        };
+
+        let email_verified = match claims.get("email_verified") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Bool(b)) => Some(*b),
+            // Some providers (e.g. Cognito) send the flag as a string.
+            Some(serde_json::Value::String(s)) => Some(s.eq_ignore_ascii_case("true")),
+            Some(_) => Some(false),
+        };
+        let email_verified = match email_verified {
+            Some(true) => true,
+            Some(false) => return Err("SSO email address is not verified".to_string()),
+            None if self.provider == SsoProvider::Microsoft => {
+                self.microsoft_tenant_matches(claim_str("tid").as_deref())?
+            }
+            None => {
+                return Err(
+                    "SSO email address is not verified (no email_verified claim)".to_string(),
+                );
+            }
+        };
+        if !email_verified {
+            return Err("SSO email address is not verified".to_string());
+        }
+
+        let (local, domain) = address
+            .rsplit_once('@')
+            .ok_or_else(|| "SSO email address is malformed".to_string())?;
+        if !self.domain_allowed(domain) {
+            tracing::warn!("SSO login rejected: email domain '{}' not allowed", domain);
+            return Err(format!("Email domain '{}' is not allowed", domain));
+        }
+        let username = crate::users::canonical_username(local);
+        if username.is_empty() || username.contains('@') {
+            return Err("SSO provider returned no usable username".to_string());
+        }
+
+        let name = claim_str(&self.name_claim);
+
+        Ok(SsoUserInfo {
+            sub,
+            username,
+            email: Some(address),
+            name,
+            email_verified: Some(true),
+            claims,
+        })
+    }
+
+    /// Microsoft only (no `email_verified` claim): the address counts as
+    /// verified when the provider is pinned to a specific tenant and the
+    /// token's `tid`, when present, is that tenant. A `tid` from another
+    /// tenant is rejected.
+    fn microsoft_tenant_matches(&self, tid: Option<&str>) -> Result<bool, String> {
+        let Some(tenant) = self
+            .tenant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .filter(|t| {
+                !MULTI_TENANT_AUTHORITIES
+                    .iter()
+                    .any(|m| t.eq_ignore_ascii_case(m))
+            })
+        else {
+            return Err("SSO email address is not verified (no tenant configured)".to_string());
+        };
+        match tid {
+            Some(tid) if !tid.eq_ignore_ascii_case(tenant) => {
+                tracing::warn!(
+                    "SSO login rejected: token tenant does not match the configured tenant"
+                );
+                Err("SSO identity belongs to a different tenant".to_string())
+            }
+            _ => Ok(true),
+        }
+    }
+
+    fn config_email_claim(&self) -> String {
+        if self.email_claim.trim().is_empty() {
+            "email".to_string()
+        } else {
+            self.email_claim.clone()
+        }
+    }
+
+    /// Create preset for 1Password.
+    ///
+    /// 1Password has no well-known UserInfo endpoint; set `userinfo_url`
+    /// before use or SSO logins will fail.
+    #[cfg(test)]
     pub fn onepassword(client_id: &str, client_secret: &str) -> Self {
         Self {
             enabled: true,
@@ -235,6 +499,7 @@ impl SsoConfig {
     }
 
     /// Create preset for Google
+    #[cfg(test)]
     pub fn google(client_id: &str, client_secret: &str) -> Self {
         Self {
             enabled: true,
@@ -249,6 +514,7 @@ impl SsoConfig {
     }
 
     /// Create preset for Microsoft
+    #[cfg(test)]
     pub fn microsoft(client_id: &str, client_secret: &str, tenant_id: &str) -> Self {
         Self {
             enabled: true,
@@ -264,10 +530,16 @@ impl SsoConfig {
                 tenant_id
             ),
             userinfo_url: Some("https://graph.microsoft.com/oidc/userinfo".to_string()),
+            tenant_id: Some(tenant_id.to_string()),
             ..Default::default()
         }
     }
 }
+
+/// Entra ID authorities that accept accounts from any tenant. Refused: with
+/// them, any tenant's administrator (or any personal account) could assert an
+/// email address in an allowed domain.
+const MULTI_TENANT_AUTHORITIES: &[&str] = &["common", "organizations", "consumers"];
 
 /// SSO user info from OIDC provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,26 +577,9 @@ pub struct AppPassword {
     pub allowed_protocols: Vec<String>,
 }
 
-/// SSO session/token
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SsoSession {
-    /// Access token
-    pub access_token: String,
-    /// Refresh token (optional)
-    pub refresh_token: Option<String>,
-    /// Token expiration
-    pub expires_at: Option<DateTime<Utc>>,
-    /// User info
-    pub user_info: SsoUserInfo,
-    /// Created timestamp
-    pub created_at: DateTime<Utc>,
-}
-
 /// Pending authorization state
 #[derive(Debug, Clone)]
 pub struct PendingAuth {
-    /// CSRF token
-    pub csrf_token: String,
     /// PKCE verifier
     pub pkce_verifier: String,
     /// Created timestamp
@@ -335,35 +590,16 @@ pub struct PendingAuth {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
-    #[serde(default)]
-    token_type: String,
-    #[serde(default)]
-    expires_in: Option<u64>,
-    #[serde(default)]
-    refresh_token: Option<String>,
-}
-
-/// SSO authentication result
-#[derive(Debug, Clone)]
-pub enum SsoAuthResult {
-    /// Success with user info
-    Success(SsoUserInfo),
-    /// Invalid token
-    InvalidToken,
-    /// Token expired
-    TokenExpired,
-    /// Provider error
-    ProviderError(String),
-    /// SSO not enabled
-    NotEnabled,
 }
 
 /// User's SSO data
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserSsoData {
-    /// SSO provider subject ID
+    /// SSO provider subject ID. Together with `provider` this is the bound
+    /// identity: bindings are keyed on (provider, sub).
     pub provider_sub: Option<String>,
-    /// SSO provider type
+    /// SSO provider (display name). `None` with a `provider_sub` is a legacy
+    /// binding (see `SsoManager::bind_identity`).
     pub provider: Option<String>,
     /// App passwords
     pub app_passwords: Vec<AppPassword>,
@@ -376,25 +612,70 @@ pub struct UserSsoData {
 pub struct SsoManager {
     /// Configuration
     config: SsoConfig,
-    /// HTTP client
-    http_client: HttpClient,
+    /// HTTP client (with timeouts). `None` if it could not be built, in
+    /// which case SSO is disabled.
+    http_client: Option<HttpClient>,
     /// Pending authorizations (CSRF token -> state)
     pending_auth: Arc<RwLock<HashMap<String, PendingAuth>>>,
     /// User SSO data
     user_data: Arc<RwLock<HashMap<String, UserSsoData>>>,
     /// Data directory
     data_dir: PathBuf,
+    /// Serializes snapshot+write of sso_data.json so saves land in order.
+    save_lock: tokio::sync::Mutex<()>,
+    /// `last_used` updates not yet persisted.
+    last_used_dirty: std::sync::atomic::AtomicBool,
+    /// When `last_used` updates were last persisted (debounce).
+    last_used_saved: std::sync::Mutex<Option<std::time::Instant>>,
 }
+
+/// Minimum interval between saves triggered only by `last_used` updates.
+const LAST_USED_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Connect timeout for requests to the identity provider.
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Total timeout for requests to the identity provider.
+const HTTP_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Build the IdP HTTP client. Never falls back to a client without
+/// timeouts: on failure SSO is disabled instead (see `SsoManager::new`).
+fn build_http_client() -> Option<HttpClient> {
+    match HttpClient::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_TOTAL_TIMEOUT)
+        .build()
+    {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::error!(
+                "Failed to build SSO HTTP client with timeouts: {}; SSO login disabled",
+                e
+            );
+            None
+        }
+    }
+}
+
+/// At most this many (most recent, non-expired) app passwords are tried per
+/// login, bounding the Argon2 work one request can cause.
+const MAX_APP_PASSWORD_CANDIDATES: usize = 20;
 
 impl SsoManager {
     /// Create a new SSO manager
-    pub fn new(config: SsoConfig, data_dir: PathBuf) -> Self {
+    pub fn new(mut config: SsoConfig, data_dir: PathBuf) -> Self {
+        let http_client = build_http_client();
+        if http_client.is_none() {
+            config.enabled = false;
+        }
         Self {
             config,
-            http_client: HttpClient::new(),
+            http_client,
             pending_auth: Arc::new(RwLock::new(HashMap::new())),
             user_data: Arc::new(RwLock::new(HashMap::new())),
             data_dir,
+            save_lock: tokio::sync::Mutex::new(()),
+            last_used_dirty: std::sync::atomic::AtomicBool::new(false),
+            last_used_saved: std::sync::Mutex::new(None),
         }
     }
 
@@ -405,7 +686,17 @@ impl SsoManager {
 
     /// Check if SSO is enabled
     pub fn is_enabled(&self) -> bool {
-        self.config.enabled && !self.config.client_id.is_empty()
+        self.config.enabled && !self.config.client_id.is_empty() && self.http_client.is_some()
+    }
+
+    fn http(&self) -> Result<&HttpClient, String> {
+        self.http_client
+            .as_ref()
+            .ok_or_else(|| "SSO is not enabled".to_string())
+    }
+
+    fn provider_name(&self) -> &'static str {
+        self.config.provider.display_name()
     }
 
     /// Get SSO status
@@ -418,30 +709,103 @@ impl SsoManager {
         }
     }
 
-    /// Load user SSO data from disk
+    /// Load user SSO data from disk. Keys are canonicalised.
     pub async fn load(&self) -> Result<(), std::io::Error> {
         let path = self.data_dir.join("sso_data.json");
-        if !path.exists() {
+        let Some(raw) = crate::storage::read_json::<HashMap<String, UserSsoData>>(&path).await?
+        else {
             return Ok(());
-        }
+        };
 
-        let data = tokio::fs::read_to_string(&path).await?;
-        let user_data: HashMap<String, UserSsoData> = serde_json::from_str(&data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut user_data: HashMap<String, UserSsoData> = HashMap::new();
+        for (key, value) in raw {
+            match user_data.entry(crate::users::canonical_username(&key)) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(value);
+                }
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    let existing = o.into_mut();
+                    existing.app_passwords.extend(value.app_passwords);
+                    if existing.provider_sub.is_none() {
+                        existing.provider_sub = value.provider_sub;
+                        existing.provider = value.provider;
+                    } else if value.provider_sub.is_some()
+                        && (value.provider_sub != existing.provider_sub
+                            || value.provider != existing.provider)
+                    {
+                        tracing::warn!(
+                            "sso_data.json: entry '{}' canonicalises to an existing user with a \
+                             different SSO identity binding; dropping the binding from '{}'",
+                            key,
+                            key
+                        );
+                    }
+                    existing.last_sso_login = existing.last_sso_login.max(value.last_sso_login);
+                }
+            }
+        }
 
         *self.user_data.write().await = user_data;
         Ok(())
     }
 
-    /// Save user SSO data to disk
+    /// Save user SSO data to disk (atomic, 0600, fsync'd).
+    ///
+    /// Persists everything in memory, including pending `last_used` updates.
     pub async fn save(&self) -> Result<(), std::io::Error> {
+        let guard = self.save_lock.lock().await;
+        self.save_locked(&guard).await
+    }
+
+    /// Snapshot and write `sso_data.json`. The caller must hold `save_lock`
+    /// (proved by the guard), so a mutation + save + rollback sequence done
+    /// under the same guard can never be interleaved with another save.
+    async fn save_locked(
+        &self,
+        _guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), std::io::Error> {
         tokio::fs::create_dir_all(&self.data_dir).await?;
         let path = self.data_dir.join("sso_data.json");
 
-        let data = serde_json::to_string_pretty(&*self.user_data.read().await)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let was_dirty = self
+            .last_used_dirty
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        let restore_dirty = || {
+            if was_dirty {
+                self.last_used_dirty
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+        let data = match serde_json::to_vec_pretty(&*self.user_data.read().await) {
+            Ok(d) => d,
+            Err(e) => {
+                restore_dirty();
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+            }
+        };
 
-        tokio::fs::write(&path, data).await
+        let result = crate::storage::write_atomic(&path, data).await;
+        match &result {
+            Ok(()) => {
+                if let Ok(mut t) = self.last_used_saved.lock() {
+                    *t = Some(std::time::Instant::now());
+                }
+            }
+            Err(_) => restore_dirty(),
+        }
+        result
+    }
+
+    /// Persist pending `last_used` updates, if any (call on shutdown).
+    pub async fn flush(&self) -> Result<(), std::io::Error> {
+        if self
+            .last_used_dirty
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.save().await
+        } else {
+            Ok(())
+        }
     }
 
     /// Start OAuth2 authorization flow
@@ -469,7 +833,6 @@ impl SsoManager {
 
         // Store pending auth state
         let pending = PendingAuth {
-            csrf_token: state.clone(),
             pkce_verifier,
             created_at: Utc::now(),
         };
@@ -491,22 +854,26 @@ impl SsoManager {
             return Err("SSO is not enabled".to_string());
         }
 
-        // Verify CSRF state
+        // Verify CSRF state. The pending entry is only consumed after the
+        // token exchange succeeds, so a transient provider failure can be
+        // retried within the 10-minute window.
         let pending = self
             .pending_auth
-            .write()
+            .read()
             .await
-            .remove(state)
+            .get(state)
+            .cloned()
             .ok_or_else(|| "Invalid or expired authorization state".to_string())?;
 
         // Check if expired (10 minute window)
         if Utc::now() - pending.created_at > Duration::minutes(10) {
+            self.pending_auth.write().await.remove(state);
             return Err("Authorization expired".to_string());
         }
 
         // Exchange code for token
         let token_response = self
-            .http_client
+            .http()?
             .post(&self.config.token_url)
             .form(&[
                 ("grant_type", "authorization_code"),
@@ -530,21 +897,182 @@ impl SsoManager {
             .await
             .map_err(|e| format!("Failed to parse token response: {}", e))?;
 
-        // Get user info
+        // Token exchange succeeded: consume the state (single use). If a
+        // concurrent callback already consumed it, fail this one.
+        if self.pending_auth.write().await.remove(state).is_none() {
+            return Err("Authorization state already used".to_string());
+        }
+
+        // Get user info. The caller must then call `bind_identity` before
+        // treating the user as logged in.
         let user_info = self.fetch_user_info(&token_data.access_token).await?;
-
-        // Store user SSO data
-        let mut data = self.user_data.write().await;
-        let user_data = data.entry(user_info.username.clone()).or_default();
-        user_data.provider_sub = Some(user_info.sub.clone());
-        user_data.provider = Some(self.config.provider.display_name().to_string());
-        user_data.last_sso_login = Some(Utc::now());
-        drop(data);
-
-        let _ = self.save().await;
 
         tracing::info!("SSO authentication successful for {}", user_info.username);
         Ok(user_info)
+    }
+
+    /// Enforce or record the (provider, sub) binding for an identity
+    /// returned by `complete_auth`, and record the login time.
+    ///
+    /// - Account bound to (provider, sub): must match exactly.
+    /// - Legacy binding (sub without provider): enforced when the sub
+    ///   matches (the provider is then recorded); otherwise it cannot be
+    ///   attributed to this provider, so it is treated as unbound (warning).
+    /// - Unbound: bound now only if `allow_first_bind`; the caller passes
+    ///   `false` for accounts that must be linked explicitly (admins).
+    ///
+    /// A new binding is persisted before success is returned; if it cannot
+    /// be saved it is rolled back and the login fails.
+    pub async fn bind_identity(
+        &self,
+        info: &SsoUserInfo,
+        allow_first_bind: bool,
+    ) -> Result<(), String> {
+        let username = crate::users::canonical_username(&info.username);
+        let provider = self.provider_name();
+        if username.is_empty() || info.sub.trim().is_empty() {
+            return Err("SSO identity is incomplete".to_string());
+        }
+
+        let guard = self.save_lock.lock().await;
+        let mut data = self.user_data.write().await;
+        let previous = data.get(&username).cloned();
+        let user_data = data.entry(username.clone()).or_default();
+        let bound = match (&user_data.provider, &user_data.provider_sub) {
+            (Some(p), Some(sub)) => {
+                if p != provider || *sub != info.sub {
+                    drop(data);
+                    tracing::warn!(
+                        "SSO login for '{}' rejected: identity does not match the bound identity",
+                        username
+                    );
+                    return Err(
+                        "SSO identity does not match the account's bound identity".to_string()
+                    );
+                }
+                true
+            }
+            (None, Some(sub)) if *sub == info.sub => {
+                // Legacy binding confirmed by this provider: record it.
+                user_data.provider = Some(provider.to_string());
+                false
+            }
+            (None, Some(_)) => {
+                tracing::warn!(
+                    "SSO account '{}' has a legacy identity binding without a provider; \
+                     treating it as unbound for provider {}",
+                    username,
+                    provider
+                );
+                false
+            }
+            (_, None) => false,
+        };
+        let first_binding = !bound;
+        if first_binding && user_data.provider_sub.as_deref() != Some(info.sub.as_str()) {
+            if !allow_first_bind {
+                // Restore exactly what was there (entry() may have created it).
+                match &previous {
+                    Some(p) => *user_data = p.clone(),
+                    None => {
+                        data.remove(&username);
+                    }
+                }
+                drop(data);
+                tracing::warn!(
+                    "SSO login for '{}' rejected: account has no SSO identity bound and \
+                     automatic binding is not allowed for it",
+                    username
+                );
+                return Err(
+                    "This account must be linked to an SSO identity by an administrator"
+                        .to_string(),
+                );
+            }
+            user_data.provider_sub = Some(info.sub.clone());
+            user_data.provider = Some(provider.to_string());
+            tracing::info!("Bound SSO identity ({}) to '{}'", provider, username);
+        }
+        user_data.last_sso_login = Some(Utc::now());
+        drop(data);
+
+        if let Err(e) = self.save_locked(&guard).await {
+            if first_binding {
+                // The binding is security-relevant: do not keep it only in
+                // memory, and do not let the login proceed unbound.
+                self.restore_user(&username, previous).await;
+                tracing::error!(
+                    "Failed to persist SSO identity binding for {}: {}",
+                    username,
+                    e
+                );
+                return Err(format!("Failed to persist SSO login data: {}", e));
+            }
+            tracing::warn!("Failed to persist SSO login data: {}", e);
+        }
+        Ok(())
+    }
+
+    /// Put a user's entry back to `previous` (rollback after a failed save).
+    async fn restore_user(&self, username: &str, previous: Option<UserSsoData>) {
+        let mut data = self.user_data.write().await;
+        match previous {
+            Some(p) => {
+                data.insert(username.to_string(), p);
+            }
+            None => {
+                data.remove(username);
+            }
+        }
+    }
+
+    /// Bind `user` to (provider, sub), replacing any existing binding
+    /// (administrative link). Persisted; rolled back on failure.
+    pub async fn link_identity(&self, user: &str, provider: &str, sub: &str) -> Result<(), String> {
+        let username = crate::users::canonical_username(user);
+        let (provider, sub) = (provider.trim(), sub.trim());
+        if username.is_empty() || provider.is_empty() || sub.is_empty() {
+            return Err("User, provider and subject are required".to_string());
+        }
+        let guard = self.save_lock.lock().await;
+        let mut data = self.user_data.write().await;
+        let previous = data.get(&username).cloned();
+        let entry = data.entry(username.clone()).or_default();
+        entry.provider = Some(provider.to_string());
+        entry.provider_sub = Some(sub.to_string());
+        drop(data);
+        if let Err(e) = self.save_locked(&guard).await {
+            self.restore_user(&username, previous).await;
+            tracing::error!("Failed to save SSO identity link for {}: {}", username, e);
+            return Err(format!("Failed to save SSO identity link: {}", e));
+        }
+        tracing::info!("Linked SSO identity ({}) to '{}'", provider, username);
+        Ok(())
+    }
+
+    /// Remove `user`'s identity binding (app passwords are kept).
+    /// `Ok(false)` = there was no binding. Persisted; rolled back on failure.
+    pub async fn unlink_identity(&self, user: &str) -> Result<bool, String> {
+        let username = crate::users::canonical_username(user);
+        let guard = self.save_lock.lock().await;
+        let mut data = self.user_data.write().await;
+        let Some(entry) = data.get_mut(&username) else {
+            return Ok(false);
+        };
+        if entry.provider_sub.is_none() && entry.provider.is_none() {
+            return Ok(false);
+        }
+        let previous = entry.clone();
+        entry.provider_sub = None;
+        entry.provider = None;
+        drop(data);
+        if let Err(e) = self.save_locked(&guard).await {
+            self.restore_user(&username, Some(previous)).await;
+            tracing::error!("Failed to save SSO identity unlink for {}: {}", username, e);
+            return Err(format!("Failed to save SSO identity unlink: {}", e));
+        }
+        tracing::info!("Unlinked SSO identity from '{}'", username);
+        Ok(true)
     }
 
     /// Fetch user info from provider
@@ -556,7 +1084,7 @@ impl SsoManager {
             .ok_or_else(|| "UserInfo endpoint not configured".to_string())?;
 
         let response = self
-            .http_client
+            .http()?
             .get(userinfo_url)
             .bearer_auth(access_token)
             .send()
@@ -572,47 +1100,7 @@ impl SsoManager {
             .await
             .map_err(|e| format!("Failed to parse UserInfo: {}", e))?;
 
-        // Extract fields based on configured claims
-        let sub = claims
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let username = claims
-            .get(&self.config.username_claim)
-            .and_then(|v| v.as_str())
-            .or_else(|| claims.get("email").and_then(|v| v.as_str()))
-            .unwrap_or(&sub)
-            .to_string();
-
-        // Extract local part from email for username
-        let username = if username.contains('@') {
-            username.split('@').next().unwrap_or(&username).to_string()
-        } else {
-            username
-        };
-
-        let email = claims
-            .get(&self.config.email_claim)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let name = claims
-            .get(&self.config.name_claim)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let email_verified = claims.get("email_verified").and_then(|v| v.as_bool());
-
-        Ok(SsoUserInfo {
-            sub,
-            username,
-            email,
-            name,
-            email_verified,
-            claims,
-        })
+        self.config.identity_from_claims(claims)
     }
 
     /// Generate an app password for a user
@@ -628,7 +1116,13 @@ impl SsoManager {
 
         // Generate random password
         let password = generate_app_password(self.config.app_password_length);
-        let password_hash = hash_app_password(&password)?;
+        let password_hash = {
+            let password = password.clone();
+            let _permit = crate::users::argon2_permit().await;
+            tokio::task::spawn_blocking(move || hash_app_password(&password))
+                .await
+                .map_err(|e| format!("App password hashing task failed: {}", e))??
+        };
 
         let app_password = AppPassword {
             id: uuid::Uuid::new_v4().to_string(),
@@ -640,61 +1134,141 @@ impl SsoManager {
             allowed_protocols: vec![],
         };
 
-        // Store app password
+        // Store app password (mutation, save and rollback all under save_lock)
+        let username = crate::users::canonical_username(username);
+        let username = username.as_str();
+        let id = app_password.id.clone();
+        let guard = self.save_lock.lock().await;
         let mut data = self.user_data.write().await;
         let user_data = data.entry(username.to_string()).or_default();
         user_data.app_passwords.push(app_password);
         drop(data);
 
-        let _ = self.save().await;
+        if let Err(e) = self.save_locked(&guard).await {
+            // Roll back the in-memory change so state matches disk.
+            let mut data = self.user_data.write().await;
+            if let Some(user_data) = data.get_mut(username) {
+                user_data.app_passwords.retain(|ap| ap.id != id);
+                if user_data.app_passwords.is_empty()
+                    && user_data.provider_sub.is_none()
+                    && user_data.last_sso_login.is_none()
+                {
+                    data.remove(username);
+                }
+            }
+            drop(data);
+            tracing::error!("Failed to save app password for {}: {}", username, e);
+            return Err(format!("Failed to save app password: {}", e));
+        }
 
         tracing::info!("Generated app password '{}' for {}", label, username);
         Ok(password)
     }
 
-    /// Verify an app password
+    /// Verify an app password.
+    ///
+    /// Only the `MAX_APP_PASSWORD_CANDIDATES` most recently created,
+    /// non-expired app passwords allowed for `protocol` are tried. Argon2
+    /// verification runs on a blocking thread, under the shared Argon2
+    /// permit and without holding the user-data lock. `last_used` is updated
+    /// in memory immediately but only persisted at most every 5 minutes (or
+    /// by any other save / `flush`).
+    ///
+    /// `Ok(false)` = no match; `Err` = internal failure (never treat it as a
+    /// wrong password).
     pub async fn verify_app_password(
         &self,
         username: &str,
         password: &str,
         protocol: &str,
-    ) -> bool {
-        let mut data = self.user_data.write().await;
+    ) -> Result<bool, String> {
+        if password.is_empty() {
+            return Ok(false);
+        }
+        let username = crate::users::canonical_username(username);
+        let username = username.as_str();
 
-        if let Some(user_data) = data.get_mut(username) {
-            for app_pw in &mut user_data.app_passwords {
-                // Check expiration
-                if let Some(expires_at) = app_pw.expires_at {
-                    if Utc::now() > expires_at {
-                        continue;
-                    }
-                }
+        // Snapshot candidate hashes under a short read lock.
+        let now = Utc::now();
+        let candidates: Vec<(String, String)> = {
+            let data = self.user_data.read().await;
+            let Some(user_data) = data.get(username) else {
+                return Ok(false);
+            };
+            let mut usable: Vec<&AppPassword> = user_data
+                .app_passwords
+                .iter()
+                .filter(|ap| ap.expires_at.is_none_or(|exp| now <= exp))
+                .filter(|ap| {
+                    ap.allowed_protocols.is_empty()
+                        || ap.allowed_protocols.iter().any(|p| p == protocol)
+                })
+                .collect();
+            usable.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            usable
+                .into_iter()
+                .take(MAX_APP_PASSWORD_CANDIDATES)
+                .map(|ap| (ap.id.clone(), ap.password_hash.clone()))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return Ok(false);
+        }
 
-                // Check protocol restrictions
-                if !app_pw.allowed_protocols.is_empty()
-                    && !app_pw.allowed_protocols.contains(&protocol.to_string())
-                {
-                    continue;
-                }
+        let password = password.to_string();
+        let matched = {
+            let _permit = crate::users::argon2_permit().await;
+            tokio::task::spawn_blocking(move || {
+                candidates
+                    .into_iter()
+                    .find(|(_, hash)| verify_app_password(&password, hash))
+                    .map(|(id, _)| id)
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!("App password verification task failed: {}", e);
+                format!("App password verification failed: {}", e)
+            })?
+        };
 
-                // Verify password
-                if verify_app_password(password, &app_pw.password_hash) {
-                    app_pw.last_used = Some(Utc::now());
-                    drop(data);
-                    let _ = self.save().await;
-                    return true;
-                }
+        let Some(id) = matched else {
+            return Ok(false);
+        };
+
+        // Short write lock to record last use (entry may have been revoked meanwhile).
+        {
+            let mut data = self.user_data.write().await;
+            let Some(app_pw) = data
+                .get_mut(username)
+                .and_then(|u| u.app_passwords.iter_mut().find(|ap| ap.id == id))
+            else {
+                return Ok(false);
+            };
+            app_pw.last_used = Some(Utc::now());
+        }
+        self.last_used_dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let due = self
+            .last_used_saved
+            .lock()
+            .map(|t| t.is_none_or(|t| t.elapsed() >= LAST_USED_SAVE_INTERVAL))
+            .unwrap_or(true);
+        if due {
+            if let Err(e) = self.save().await {
+                tracing::warn!("Failed to persist app password last_used: {}", e);
             }
         }
 
-        false
+        Ok(true)
     }
 
     /// List app passwords for a user
     pub async fn list_app_passwords(&self, username: &str) -> Vec<AppPasswordInfo> {
+        let username = crate::users::canonical_username(username);
         let data = self.user_data.read().await;
 
-        data.get(username)
+        data.get(&username)
             .map(|user_data| {
                 user_data
                     .app_passwords
@@ -711,22 +1285,104 @@ impl SsoManager {
             .unwrap_or_default()
     }
 
-    /// Revoke an app password
-    pub async fn revoke_app_password(&self, username: &str, password_id: &str) -> bool {
+    /// Revoke an app password.
+    ///
+    /// `Ok(true)` = revoked and persisted, `Ok(false)` = not found,
+    /// `Err` = the change could not be persisted (it is rolled back).
+    pub async fn revoke_app_password(
+        &self,
+        username: &str,
+        password_id: &str,
+    ) -> Result<bool, String> {
+        let username = crate::users::canonical_username(username);
+        let guard = self.save_lock.lock().await;
         let mut data = self.user_data.write().await;
 
-        if let Some(user_data) = data.get_mut(username) {
-            let initial_len = user_data.app_passwords.len();
-            user_data.app_passwords.retain(|ap| ap.id != password_id);
+        let Some(user_data) = data.get_mut(&username) else {
+            return Ok(false);
+        };
+        let Some(pos) = user_data
+            .app_passwords
+            .iter()
+            .position(|ap| ap.id == password_id)
+        else {
+            return Ok(false);
+        };
+        let removed = user_data.app_passwords.remove(pos);
+        drop(data);
 
-            if user_data.app_passwords.len() < initial_len {
-                drop(data);
-                let _ = self.save().await;
-                return true;
-            }
+        if let Err(e) = self.save_locked(&guard).await {
+            // Roll back: restore the revoked entry (still under save_lock, so
+            // no other save can have persisted the removal meanwhile).
+            let mut data = self.user_data.write().await;
+            let user_data = data.entry(username.clone()).or_default();
+            let pos = pos.min(user_data.app_passwords.len());
+            user_data.app_passwords.insert(pos, removed);
+            drop(data);
+            tracing::error!(
+                "Failed to save revocation of app password {} for {}: {}",
+                password_id,
+                username,
+                e
+            );
+            return Err(format!("Failed to save app password revocation: {}", e));
         }
 
-        false
+        Ok(true)
+    }
+
+    /// Revoke every app password of `user`; returns how many were revoked.
+    /// Persisted atomically; rolled back (and `Err`) if the save fails.
+    pub async fn revoke_all_app_passwords(&self, user: &str) -> Result<usize, String> {
+        let username = crate::users::canonical_username(user);
+        let guard = self.save_lock.lock().await;
+        let mut data = self.user_data.write().await;
+        let Some(entry) = data.get_mut(&username) else {
+            return Ok(0);
+        };
+        if entry.app_passwords.is_empty() {
+            return Ok(0);
+        }
+        let removed = std::mem::take(&mut entry.app_passwords);
+        let count = removed.len();
+        drop(data);
+        if let Err(e) = self.save_locked(&guard).await {
+            let mut data = self.user_data.write().await;
+            let entry = data.entry(username.clone()).or_default();
+            // Still under save_lock, so no save can have persisted the
+            // removal; `last_used` updates cannot touch the taken entries.
+            entry.app_passwords = removed;
+            drop(data);
+            tracing::error!(
+                "Failed to save revocation of all app passwords for {}: {}",
+                username,
+                e
+            );
+            return Err(format!("Failed to save app password revocation: {}", e));
+        }
+        tracing::info!("Revoked {} app password(s) for {}", count, username);
+        Ok(count)
+    }
+
+    /// Remove all SSO data (app passwords, identity binding) for a user,
+    /// e.g. when the local account is deleted. Missing user is not an error.
+    pub async fn remove_user(&self, username: &str) -> Result<(), String> {
+        let username = crate::users::canonical_username(username);
+        let guard = self.save_lock.lock().await;
+        let Some(removed) = self.user_data.write().await.remove(&username) else {
+            return Ok(());
+        };
+
+        if let Err(e) = self.save_locked(&guard).await {
+            self.user_data
+                .write()
+                .await
+                .insert(username.clone(), removed);
+            tracing::error!("Failed to save SSO data removal for {}: {}", username, e);
+            return Err(format!("Failed to save SSO data removal: {}", e));
+        }
+        tracing::info!("Removed SSO data for {}", username);
+        Ok(())
     }
 
     /// Clean up expired pending authorizations
@@ -737,8 +1393,10 @@ impl SsoManager {
     }
 
     /// Get user's SSO data
+    #[cfg(test)]
     pub async fn get_user_data(&self, username: &str) -> Option<UserSsoData> {
-        self.user_data.read().await.get(username).cloned()
+        let username = crate::users::canonical_username(username);
+        self.user_data.read().await.get(&username).cloned()
     }
 }
 
@@ -885,11 +1543,939 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_app_password_lifecycle_and_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SsoManager::new(SsoConfig::default(), dir.path().to_path_buf());
+        let pw = manager
+            .generate_app_password("alice", "phone", None)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .verify_app_password("alice", &pw, "imap")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .verify_app_password("alice", "nope", "imap")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .verify_app_password("alice", "", "imap")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .verify_app_password("bob", &pw, "imap")
+                .await
+                .unwrap()
+        );
+
+        // Persisted
+        let reloaded = SsoManager::new(SsoConfig::default(), dir.path().to_path_buf());
+        reloaded.load().await.unwrap();
+        let list = reloaded.list_app_passwords("alice").await;
+        assert_eq!(list.len(), 1);
+
+        assert_eq!(
+            manager.revoke_app_password("alice", &list[0].id).await,
+            Ok(true)
+        );
+        assert!(
+            !manager
+                .verify_app_password("alice", &pw, "imap")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            manager.revoke_app_password("alice", &list[0].id).await,
+            Ok(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_app_password_save_failure_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        // data_dir is a regular file -> create_dir_all fails -> save fails
+        let file_path = dir.path().join("not_a_dir");
+        std::fs::write(&file_path, b"x").unwrap();
+        let manager = SsoManager::new(SsoConfig::default(), file_path);
+        assert!(
+            manager
+                .generate_app_password("alice", "x", None)
+                .await
+                .is_err()
+        );
+        assert!(manager.list_app_passwords("alice").await.is_empty());
+
+        // Revoke rollback: insert directly, then fail to save.
+        let hash = hash_app_password("abcd").unwrap();
+        manager.user_data.write().await.insert(
+            "alice".to_string(),
+            UserSsoData {
+                app_passwords: vec![AppPassword {
+                    id: "id1".to_string(),
+                    password_hash: hash,
+                    label: "l".to_string(),
+                    created_at: Utc::now(),
+                    last_used: None,
+                    expires_at: None,
+                    allowed_protocols: vec![],
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(manager.revoke_app_password("alice", "id1").await.is_err());
+        assert_eq!(manager.list_app_passwords("alice").await.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_disables_incomplete_providers() {
+        let mut okta = SsoConfig {
+            enabled: true,
+            provider: SsoProvider::Okta,
+            client_id: "id".to_string(),
+            ..Default::default()
+        };
+        okta.validate();
+        assert!(!okta.enabled);
+
+        let mut op = SsoConfig::onepassword("id", "secret");
+        op.validate();
+        assert!(
+            !op.enabled,
+            "1Password without userinfo_url must be disabled"
+        );
+
+        let mut google = SsoConfig::google("id", "secret");
+        google.allowed_domains = vec!["example.com".to_string()];
+        google.validate();
+        assert!(google.enabled);
+    }
+
+    #[test]
+    fn validate_disables_without_allowed_domains() {
+        let mut google = SsoConfig::google("id", "secret");
+        assert!(google.allowed_domains.is_empty());
+        google.validate();
+        assert!(!google.enabled);
+    }
+
+    #[test]
+    fn test_domain_allowed() {
+        let mut c = SsoConfig::default();
+        // Empty allow-list accepts nothing.
+        assert!(!c.domain_allowed("anything.org"));
+
+        c.allowed_domains = vec!["example.com".to_string()];
+        assert!(c.domain_allowed("example.com"));
+        assert!(c.domain_allowed("EXAMPLE.com"));
+        // Subdomains are only accepted with allow_subdomains (see
+        // subdomain_rejected_by_default_and_allowed_with_flag).
+        c.allow_subdomains = true;
+        assert!(c.domain_allowed("mail.example.com"));
+        assert!(!c.domain_allowed("evil.com"));
+        assert!(!c.domain_allowed("ample.com"));
+        assert!(!c.domain_allowed("notexample.com"));
+        assert!(!c.domain_allowed("example.com.evil.com"));
+        assert!(!c.domain_allowed(""));
+
+        // A parent of an allowed domain is never accepted.
+        c.allowed_domains = vec!["mail.example.com".to_string()];
+        assert!(!c.domain_allowed("example.com"));
+        assert!(c.domain_allowed("mail.example.com"));
+    }
+
+    fn sso_config() -> SsoConfig {
+        SsoConfig {
+            allowed_domains: vec!["example.com".to_string()],
+            ..SsoConfig::google("id", "secret")
+        }
+    }
+
+    fn claims(v: serde_json::Value) -> HashMap<String, serde_json::Value> {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn identity_username_from_email_local_part() {
+        let c = sso_config();
+        let info = c
+            .identity_from_claims(claims(serde_json::json!({
+                "sub": "s1",
+                "preferred_username": "root",
+                "email": "Alice@Example.com",
+                "email_verified": true,
+            })))
+            .unwrap();
+        // preferred_username is ignored; the email local part wins.
+        assert_eq!(info.username, "alice");
+        assert_eq!(info.sub, "s1");
+    }
+
+    #[test]
+    fn identity_rejects_unverified_email() {
+        let c = sso_config();
+        let r = c.identity_from_claims(claims(serde_json::json!({
+            "sub": "s1", "email": "alice@example.com", "email_verified": false,
+        })));
+        assert!(r.is_err());
+        let r = c.identity_from_claims(claims(serde_json::json!({
+            "sub": "s1", "email": "alice@example.com", "email_verified": "false",
+        })));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn email_verified_missing_rejected() {
+        let c = sso_config();
+        // From the email claim without the flag: rejected (nOAuth).
+        let r = c.identity_from_claims(claims(serde_json::json!({
+            "sub": "s1", "email": "alice@example.com",
+        })));
+        assert!(r.is_err());
+        // Non-boolean junk is not "verified".
+        let r = c.identity_from_claims(claims(serde_json::json!({
+            "sub": "s1", "email": "alice@example.com", "email_verified": 1,
+        })));
+        assert!(r.is_err());
+        // String "true" (Cognito style) is accepted.
+        assert!(
+            c.identity_from_claims(claims(serde_json::json!({
+                "sub": "s1", "email": "alice@example.com", "email_verified": "TRUE",
+            })))
+            .is_ok()
+        );
+        // From the username claim (no email claim): rejected without the flag...
+        let r = c.identity_from_claims(claims(serde_json::json!({
+            "sub": "s1", "preferred_username": "alice@example.com",
+        })));
+        assert!(r.is_err());
+        // ...and accepted when explicitly verified.
+        let info = c
+            .identity_from_claims(claims(serde_json::json!({
+                "sub": "s1", "preferred_username": "alice@example.com", "email_verified": true,
+            })))
+            .unwrap();
+        assert_eq!(info.username, "alice");
+    }
+
+    #[test]
+    fn identity_rejects_free_form_username() {
+        let c = sso_config();
+        let r = c.identity_from_claims(claims(serde_json::json!({
+            "sub": "s1", "preferred_username": "admin", "email_verified": true,
+        })));
+        assert!(r.is_err());
+        // Nothing at all -> rejected, never falls back to `sub`.
+        let r = c.identity_from_claims(claims(serde_json::json!({ "sub": "admin" })));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn identity_rejects_foreign_and_parent_domains() {
+        let mut c = sso_config();
+        let r = c.identity_from_claims(claims(serde_json::json!({
+            "sub": "s1", "email": "admin@evil.com", "email_verified": true,
+        })));
+        assert!(r.is_err());
+        c.allowed_domains = vec!["mail.example.com".to_string()];
+        let r = c.identity_from_claims(claims(serde_json::json!({
+            "sub": "s1", "email": "admin@example.com", "email_verified": true,
+        })));
+        assert!(r.is_err());
+        c.allowed_domains.clear();
+        let r = c.identity_from_claims(claims(serde_json::json!({
+            "sub": "s1", "email": "admin@example.com", "email_verified": true,
+        })));
+        assert!(r.is_err(), "empty allow-list must reject");
+    }
+
+    #[test]
+    fn identity_requires_sub() {
+        let c = sso_config();
+        let r = c.identity_from_claims(claims(serde_json::json!({
+            "email": "alice@example.com", "email_verified": true,
+        })));
+        assert!(r.is_err());
+    }
+
+    fn user_info(username: &str, sub: &str) -> SsoUserInfo {
+        SsoUserInfo {
+            sub: sub.to_string(),
+            username: username.to_string(),
+            email: Some(format!("{}@example.com", username)),
+            name: None,
+            email_verified: Some(true),
+            claims: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_sub_bound_on_first_login_and_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SsoManager::new(sso_config(), dir.path().to_path_buf());
+        manager
+            .bind_identity(&user_info("alice", "sub-1"), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_user_data("alice")
+                .await
+                .unwrap()
+                .provider_sub
+                .as_deref(),
+            Some("sub-1")
+        );
+        // Same subject again: fine.
+        manager
+            .bind_identity(&user_info("alice", "sub-1"), true)
+            .await
+            .unwrap();
+        // Different subject claiming the same local user: rejected.
+        assert!(
+            manager
+                .bind_identity(&user_info("alice", "sub-2"), true)
+                .await
+                .is_err()
+        );
+
+        // Binding persisted.
+        let reloaded = SsoManager::new(sso_config(), dir.path().to_path_buf());
+        reloaded.load().await.unwrap();
+        assert!(
+            reloaded
+                .bind_identity(&user_info("alice", "sub-2"), true)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn app_password_usernames_are_canonicalised() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SsoManager::new(SsoConfig::default(), dir.path().to_path_buf());
+        let pw = manager
+            .generate_app_password(" Alice ", "phone", None)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .verify_app_password("alice", &pw, "imap")
+                .await
+                .unwrap()
+        );
+        assert!(
+            manager
+                .verify_app_password("ALICE", &pw, "imap")
+                .await
+                .unwrap()
+        );
+        let list = manager.list_app_passwords("aLiCe").await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            manager.revoke_app_password("ALICE", &list[0].id).await,
+            Ok(true)
+        );
+        assert!(manager.list_app_passwords("alice").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_user_drops_all_sso_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SsoManager::new(SsoConfig::default(), dir.path().to_path_buf());
+        let pw = manager
+            .generate_app_password("alice", "a", None)
+            .await
+            .unwrap();
+        manager
+            .generate_app_password("alice", "b", None)
+            .await
+            .unwrap();
+        manager.remove_user("ALICE").await.unwrap();
+        assert!(
+            !manager
+                .verify_app_password("alice", &pw, "imap")
+                .await
+                .unwrap()
+        );
+        assert!(manager.get_user_data("alice").await.is_none());
+        // Missing user is not an error.
+        manager.remove_user("nobody").await.unwrap();
+
+        let reloaded = SsoManager::new(SsoConfig::default(), dir.path().to_path_buf());
+        reloaded.load().await.unwrap();
+        assert!(reloaded.list_app_passwords("alice").await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sso_data_written_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SsoManager::new(SsoConfig::default(), dir.path().to_path_buf());
+        manager
+            .generate_app_password("alice", "a", None)
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(dir.path().join("sso_data.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn test_app_password_charset() {
+        let pw = generate_app_password(24);
+        let charset = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789-";
+        assert!(pw.chars().all(|c| charset.contains(c)));
+    }
+
+    #[tokio::test]
     async fn test_disabled_sso() {
-        let manager = SsoManager::new(SsoConfig::default(), PathBuf::from("/tmp"));
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SsoManager::new(SsoConfig::default(), dir.path().to_path_buf());
         assert!(!manager.is_enabled());
 
         let result = manager.start_auth().await;
         assert!(result.is_err());
+    }
+
+    // ---- stub IdP -------------------------------------------------------
+
+    /// Minimal OAuth2 IdP: `POST /token` succeeds for code `good` (500 for
+    /// anything else) and `GET /userinfo` returns the configured claims.
+    struct StubIdp {
+        base: String,
+        claims: Arc<std::sync::Mutex<serde_json::Value>>,
+        token_calls: Arc<std::sync::atomic::AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for StubIdp {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn stub_idp(claims: serde_json::Value) -> StubIdp {
+        use axum::{
+            Form, Json, Router,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::{get, post},
+        };
+        let claims = Arc::new(std::sync::Mutex::new(claims));
+        let token_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = token_calls.clone();
+        let c = claims.clone();
+        let app = Router::new()
+            .route(
+                "/token",
+                post(move |Form(f): Form<HashMap<String, String>>| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if f.get("code").map(String::as_str) == Some("good")
+                            && f.get("code_verifier").is_some_and(|v| !v.is_empty())
+                        {
+                            Json(serde_json::json!({
+                                "access_token": "tok",
+                                "token_type": "Bearer",
+                                "expires_in": 3600,
+                            }))
+                            .into_response()
+                        } else {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "nope").into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/userinfo",
+                get(move || {
+                    let c = c.clone();
+                    async move { Json(c.lock().unwrap().clone()) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        StubIdp {
+            base: format!("http://{}", addr),
+            claims,
+            token_calls,
+            task,
+        }
+    }
+
+    fn stub_config(idp: &StubIdp) -> SsoConfig {
+        SsoConfig {
+            enabled: true,
+            client_id: "cid".to_string(),
+            client_secret: "secret".to_string(),
+            auth_url: format!("{}/authorize", idp.base),
+            token_url: format!("{}/token", idp.base),
+            userinfo_url: Some(format!("{}/userinfo", idp.base)),
+            allowed_domains: vec!["example.com".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn alice_claims() -> serde_json::Value {
+        serde_json::json!({
+            "sub": "sub-alice", "email": "alice@example.com", "email_verified": true,
+        })
+    }
+
+    #[tokio::test]
+    async fn complete_auth_unknown_state_is_rejected() {
+        let idp = stub_idp(alice_claims()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(stub_config(&idp), dir.path().to_path_buf());
+        assert!(m.complete_auth("good", "no-such-state").await.is_err());
+        assert_eq!(
+            idp.token_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no token request for an unknown state"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_auth_expired_state_is_removed() {
+        let idp = stub_idp(alice_claims()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(stub_config(&idp), dir.path().to_path_buf());
+        let (_, state) = m.start_auth().await.unwrap();
+        m.pending_auth
+            .write()
+            .await
+            .get_mut(&state)
+            .unwrap()
+            .created_at = Utc::now() - Duration::minutes(11);
+        assert!(m.complete_auth("good", &state).await.is_err());
+        assert!(!m.pending_auth.read().await.contains_key(&state));
+        assert_eq!(idp.token_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn complete_auth_token_failure_keeps_state_for_retry() {
+        let idp = stub_idp(alice_claims()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(stub_config(&idp), dir.path().to_path_buf());
+        let (_, state) = m.start_auth().await.unwrap();
+        assert!(m.complete_auth("bad", &state).await.is_err());
+        assert!(m.pending_auth.read().await.contains_key(&state));
+        let info = m.complete_auth("good", &state).await.unwrap();
+        assert_eq!(info.username, "alice");
+        assert_eq!(info.sub, "sub-alice");
+    }
+
+    #[tokio::test]
+    async fn complete_auth_state_is_single_use() {
+        let idp = stub_idp(alice_claims()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(stub_config(&idp), dir.path().to_path_buf());
+        let (_, state) = m.start_auth().await.unwrap();
+        m.complete_auth("good", &state).await.unwrap();
+        assert!(m.complete_auth("good", &state).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_auth_does_not_bind() {
+        let idp = stub_idp(alice_claims()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(stub_config(&idp), dir.path().to_path_buf());
+        let (_, state) = m.start_auth().await.unwrap();
+        let info = m.complete_auth("good", &state).await.unwrap();
+        assert!(m.get_user_data("alice").await.is_none());
+        assert!(!dir.path().join("sso_data.json").exists());
+        m.bind_identity(&info, true).await.unwrap();
+        let d = m.get_user_data("alice").await.unwrap();
+        assert_eq!(d.provider_sub.as_deref(), Some("sub-alice"));
+        assert_eq!(d.provider.as_deref(), Some("OIDC"));
+        assert!(d.last_sso_login.is_some());
+    }
+
+    #[tokio::test]
+    async fn complete_auth_rejects_unverified_identity_from_idp() {
+        let idp = stub_idp(serde_json::json!({
+            "sub": "attacker", "email": "admin@example.com",
+        }))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(stub_config(&idp), dir.path().to_path_buf());
+        let (_, state) = m.start_auth().await.unwrap();
+        assert!(m.complete_auth("good", &state).await.is_err());
+        // Verified now: accepted.
+        *idp.claims.lock().unwrap() = alice_claims();
+        let (_, state) = m.start_auth().await.unwrap();
+        assert!(m.complete_auth("good", &state).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bind_identity_first_bind_allowed_and_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(sso_config(), dir.path().to_path_buf());
+        // Denied: nothing recorded at all.
+        assert!(
+            m.bind_identity(&user_info("root", "s-r"), false)
+                .await
+                .is_err()
+        );
+        assert!(m.get_user_data("root").await.is_none());
+        // Denied with existing (unbound) data: the data is left untouched.
+        m.generate_app_password("bob", "x", None).await.unwrap();
+        assert!(
+            m.bind_identity(&user_info("bob", "s-b"), false)
+                .await
+                .is_err()
+        );
+        let bob = m.get_user_data("bob").await.unwrap();
+        assert!(bob.provider_sub.is_none());
+        assert!(bob.last_sso_login.is_none());
+        assert_eq!(bob.app_passwords.len(), 1);
+        // Allowed.
+        m.bind_identity(&user_info("bob", "s-b"), true)
+            .await
+            .unwrap();
+        // Once bound, a matching identity passes even with allow_first_bind=false.
+        m.bind_identity(&user_info("bob", "s-b"), false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bind_identity_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(sso_config(), dir.path().to_path_buf());
+        m.bind_identity(&user_info("alice", "s1"), true)
+            .await
+            .unwrap();
+        assert!(
+            m.bind_identity(&user_info("alice", "s2"), true)
+                .await
+                .is_err()
+        );
+        // Same sub but bound to another provider: rejected.
+        m.link_identity("carol", "Okta", "s1").await.unwrap();
+        assert!(
+            m.bind_identity(&user_info("carol", "s1"), true)
+                .await
+                .is_err()
+        );
+        // Unlink then rebind.
+        assert_eq!(m.unlink_identity("carol").await, Ok(true));
+        assert_eq!(m.unlink_identity("carol").await, Ok(false));
+        m.bind_identity(&user_info("carol", "s1"), true)
+            .await
+            .unwrap();
+        // link_identity replaces a binding and persists it.
+        m.link_identity("alice", "Google", "s9").await.unwrap();
+        let reloaded = SsoManager::new(sso_config(), dir.path().to_path_buf());
+        reloaded.load().await.unwrap();
+        reloaded
+            .bind_identity(&user_info("alice", "s9"), false)
+            .await
+            .unwrap();
+        assert!(
+            reloaded
+                .bind_identity(&user_info("alice", "s1"), true)
+                .await
+                .is_err()
+        );
+        assert!(m.link_identity("alice", "", "s").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_identity_legacy_binding_without_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(sso_config(), dir.path().to_path_buf());
+        let legacy = |sub: &str| UserSsoData {
+            provider_sub: Some(sub.to_string()),
+            provider: None,
+            ..Default::default()
+        };
+        // Same sub: accepted and the provider recorded (then enforced).
+        m.user_data
+            .write()
+            .await
+            .insert("alice".to_string(), legacy("s1"));
+        m.bind_identity(&user_info("alice", "s1"), false)
+            .await
+            .unwrap();
+        let d = m.get_user_data("alice").await.unwrap();
+        assert_eq!(d.provider.as_deref(), Some("Google"));
+        assert!(
+            m.bind_identity(&user_info("alice", "s2"), true)
+                .await
+                .is_err()
+        );
+
+        // Different sub (e.g. a binding made by another provider): treated
+        // as unbound, so it follows the first-bind rule.
+        m.user_data
+            .write()
+            .await
+            .insert("bob".to_string(), legacy("other"));
+        assert!(
+            m.bind_identity(&user_info("bob", "s3"), false)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            m.get_user_data("bob")
+                .await
+                .unwrap()
+                .provider_sub
+                .as_deref(),
+            Some("other")
+        );
+        m.bind_identity(&user_info("bob", "s3"), true)
+            .await
+            .unwrap();
+        let d = m.get_user_data("bob").await.unwrap();
+        assert_eq!(d.provider_sub.as_deref(), Some("s3"));
+        assert_eq!(d.provider.as_deref(), Some("Google"));
+    }
+
+    #[tokio::test]
+    async fn first_binding_save_failure_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("not_a_dir");
+        std::fs::write(&file_path, b"x").unwrap();
+        let m = SsoManager::new(sso_config(), file_path);
+        assert!(
+            m.bind_identity(&user_info("alice", "s1"), true)
+                .await
+                .is_err()
+        );
+        assert!(m.get_user_data("alice").await.is_none());
+        // Link / unlink roll back too.
+        assert!(m.link_identity("alice", "Google", "s1").await.is_err());
+        assert!(m.get_user_data("alice").await.is_none());
+        m.user_data.write().await.insert(
+            "bob".to_string(),
+            UserSsoData {
+                provider_sub: Some("s".to_string()),
+                provider: Some("Google".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(m.unlink_identity("bob").await.is_err());
+        assert_eq!(
+            m.get_user_data("bob")
+                .await
+                .unwrap()
+                .provider_sub
+                .as_deref(),
+            Some("s")
+        );
+    }
+
+    #[test]
+    fn microsoft_common_tenant_disabled() {
+        for tenant in ["common", "organizations", "Consumers", ""] {
+            let mut c = SsoConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                ..SsoConfig::microsoft("id", "secret", tenant)
+            };
+            c.validate();
+            assert!(!c.enabled, "tenant '{}' must be refused", tenant);
+        }
+        let mut c = SsoConfig {
+            allowed_domains: vec!["example.com".to_string()],
+            tenant_id: None,
+            ..SsoConfig::microsoft("id", "secret", "x")
+        };
+        c.validate();
+        assert!(!c.enabled, "no tenant must be refused");
+
+        let mut c = SsoConfig {
+            allowed_domains: vec!["example.com".to_string()],
+            ..SsoConfig::microsoft("id", "secret", "tenant-1")
+        };
+        c.validate();
+        assert!(c.enabled);
+    }
+
+    #[test]
+    fn microsoft_email_verified_via_tenant() {
+        let c = SsoConfig {
+            allowed_domains: vec!["example.com".to_string()],
+            ..SsoConfig::microsoft("id", "secret", "tenant-1")
+        };
+        // No email_verified, matching tid: verified.
+        let info = c
+            .identity_from_claims(claims(serde_json::json!({
+                "sub": "s", "email": "alice@example.com", "tid": "TENANT-1",
+            })))
+            .unwrap();
+        assert_eq!(info.email_verified, Some(true));
+        // No tid (Graph UserInfo): the pinned tenant suffices.
+        assert!(
+            c.identity_from_claims(claims(serde_json::json!({
+                "sub": "s", "email": "alice@example.com",
+            })))
+            .is_ok()
+        );
+        // Foreign tenant: rejected.
+        assert!(
+            c.identity_from_claims(claims(serde_json::json!({
+                "sub": "s", "email": "alice@example.com", "tid": "tenant-2",
+            })))
+            .is_err()
+        );
+        // Explicitly unverified: rejected.
+        assert!(
+            c.identity_from_claims(claims(serde_json::json!({
+                "sub": "s", "email": "alice@example.com", "email_verified": false,
+            })))
+            .is_err()
+        );
+        // Multi-tenant config never treats the address as verified.
+        let c = SsoConfig {
+            allowed_domains: vec!["example.com".to_string()],
+            ..SsoConfig::microsoft("id", "secret", "common")
+        };
+        assert!(
+            c.identity_from_claims(claims(serde_json::json!({
+                "sub": "s", "email": "alice@example.com",
+            })))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subdomain_rejected_by_default_and_allowed_with_flag() {
+        let mut c = sso_config();
+        let sub = claims(serde_json::json!({
+            "sub": "s", "email": "alice@mail.example.com", "email_verified": true,
+        }));
+        assert!(!c.allow_subdomains);
+        assert!(!c.domain_allowed("mail.example.com"));
+        assert!(c.identity_from_claims(sub.clone()).is_err());
+        c.allow_subdomains = true;
+        assert!(c.domain_allowed("mail.example.com"));
+        assert!(!c.domain_allowed("notexample.com"));
+        assert_eq!(c.identity_from_claims(sub).unwrap().username, "alice");
+    }
+
+    #[tokio::test]
+    async fn revoke_all_app_passwords() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(SsoConfig::default(), dir.path().to_path_buf());
+        assert_eq!(m.revoke_all_app_passwords("alice").await, Ok(0));
+        let a = m.generate_app_password("alice", "a", None).await.unwrap();
+        m.generate_app_password("alice", "b", None).await.unwrap();
+        m.bind_identity(&user_info("alice", "s1"), true)
+            .await
+            .unwrap();
+        assert_eq!(m.revoke_all_app_passwords("ALICE").await, Ok(2));
+        assert!(!m.verify_app_password("alice", &a, "imap").await.unwrap());
+        // The identity binding is kept.
+        assert_eq!(
+            m.get_user_data("alice")
+                .await
+                .unwrap()
+                .provider_sub
+                .as_deref(),
+            Some("s1")
+        );
+        assert_eq!(m.revoke_all_app_passwords("alice").await, Ok(0));
+        let reloaded = SsoManager::new(SsoConfig::default(), dir.path().to_path_buf());
+        reloaded.load().await.unwrap();
+        assert!(reloaded.list_app_passwords("alice").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoke_all_app_passwords_save_failure_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("not_a_dir");
+        std::fs::write(&file_path, b"x").unwrap();
+        let m = SsoManager::new(SsoConfig::default(), file_path);
+        m.user_data.write().await.insert(
+            "alice".to_string(),
+            UserSsoData {
+                app_passwords: vec![AppPassword {
+                    id: "id1".to_string(),
+                    password_hash: hash_app_password("abcd").unwrap(),
+                    label: "l".to_string(),
+                    created_at: Utc::now(),
+                    last_used: None,
+                    expires_at: None,
+                    allowed_protocols: vec![],
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(m.revoke_all_app_passwords("alice").await.is_err());
+        assert_eq!(m.list_app_passwords("alice").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_app_password_checks_only_recent_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = SsoManager::new(SsoConfig::default(), dir.path().to_path_buf());
+        let oldest = m.generate_app_password("alice", "old", None).await.unwrap();
+        // Push MAX newer entries (cheap fake hashes; they never match).
+        {
+            let mut data = m.user_data.write().await;
+            let entry = data.get_mut("alice").unwrap();
+            entry.app_passwords[0].created_at = Utc::now() - Duration::days(1);
+            for i in 0..MAX_APP_PASSWORD_CANDIDATES {
+                entry.app_passwords.push(AppPassword {
+                    id: format!("n{}", i),
+                    password_hash: "not-a-phc-string".to_string(),
+                    label: "n".to_string(),
+                    created_at: Utc::now(),
+                    last_used: None,
+                    expires_at: None,
+                    allowed_protocols: vec![],
+                });
+            }
+        }
+        assert!(
+            !m.verify_app_password("alice", &oldest, "imap")
+                .await
+                .unwrap()
+        );
+        // An expired newer entry does not count towards the limit.
+        {
+            let mut data = m.user_data.write().await;
+            let entry = data.get_mut("alice").unwrap();
+            entry.app_passwords[1].expires_at = Some(Utc::now() - Duration::days(1));
+        }
+        assert!(
+            m.verify_app_password("alice", &oldest, "imap")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_merge_of_conflicting_bindings_keeps_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({
+            "alice": {"provider_sub": "s1", "provider": "Google", "app_passwords": [], "last_sso_login": null},
+            "ALICE": {"provider_sub": "s2", "provider": "Google", "app_passwords": [], "last_sso_login": null},
+        });
+        std::fs::write(
+            dir.path().join("sso_data.json"),
+            serde_json::to_vec(&raw).unwrap(),
+        )
+        .unwrap();
+        let m = SsoManager::new(sso_config(), dir.path().to_path_buf());
+        m.load().await.unwrap();
+        let d = m.get_user_data("alice").await.unwrap();
+        assert!(matches!(d.provider_sub.as_deref(), Some("s1") | Some("s2")));
     }
 }

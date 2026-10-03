@@ -1,9 +1,11 @@
 # ============================================================================
 # KISS Mail Server - Docker Compose
 # ============================================================================
-# Start:  docker-compose up -d
-# Stop:   docker-compose down
-# Logs:   docker-compose logs -f
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Logs:   docker compose logs -f
+#
+# Requires Docker Compose v2.20 or newer (uses depends_on.required: false).
 #
 # Uses the official container image from GitHub Container Registry.
 # To build locally instead, uncomment the 'build' line below.
@@ -18,6 +20,10 @@ services:
     # build: .  # Uncomment to build from source instead
     container_name: kiss-mail
     restart: unless-stopped
+    # Run a tiny init as PID 1: it forwards SIGTERM to kiss-mail (which shuts
+    # down gracefully) and reaps zombie processes.
+    init: true
+    stop_grace_period: 30s
     ports:
       # SMTP
       - "2525:2525"
@@ -25,17 +31,37 @@ services:
       - "1143:1143"
       # POP3
       - "1100:1100"
-      # Web Admin
-      - "8080:8080"
-      # REST API
-      - "8025:8025"
+      # Web Admin and REST API are published on the loopback interface only.
+      # Put a TLS reverse proxy in front of the web admin for remote access, or
+      # use an SSH tunnel (ssh -L 8080:127.0.0.1:8080 -L 8025:127.0.0.1:8025 host).
+      # The session cookie is marked Secure because the web UI binds 0.0.0.0
+      # inside the container; browsers accept it on http://localhost. Set
+      # KISS_MAIL_WEB_SECURE_COOKIE=false only for plain-HTTP access on a
+      # non-localhost address (testing only).
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8025:8025"
     volumes:
       - kiss-mail-data:/data
     environment:
+      # Data directory (KISS_MAIL_DATA is a deprecated alias; it logs a warning
+      # and is removed in 0.3.0)
+      KISS_MAIL_DATA_DIR: /data
+
       # Domain configuration
       KISS_MAIL_DOMAIN: ${KISS_MAIL_DOMAIN:-mail.example.com}
+
+      # Public base URL of the web interface, used in "password change
+      # required" replies to mail clients (optional):
+      # KISS_MAIL_PUBLIC_URL: https://mail.example.com
+
+      # Proxies whose X-Real-IP / X-Forwarded-For headers are trusted for the
+      # client IP (lockout, allowed_ips). Default: 127.0.0.1/32,::1/128. A
+      # reverse proxy on the host reaches the container from the Docker
+      # bridge, so add that range when you put one in front:
+      # KISS_MAIL_TRUSTED_PROXIES: "127.0.0.1/32,::1/128,172.16.0.0/12"
       
-      # Port configuration (internal)
+      # Port configuration (inside the container; SMTP_PORT/IMAP_PORT/POP3_PORT
+      # are deprecated aliases, log a warning and are removed in 0.3.0)
       KISS_MAIL_SMTP_PORT: 2525
       KISS_MAIL_IMAP_PORT: 1143
       KISS_MAIL_POP3_PORT: 1100
@@ -46,26 +72,44 @@ services:
       KISS_MAIL_WEB_BIND: "0.0.0.0"
       KISS_MAIL_API_BIND: "0.0.0.0"
       
-      # API key (set this for remote administration)
-      KISS_MAIL_API_KEY: ${KISS_MAIL_API_KEY:-}
-      
-      # LDAP configuration (optional)
-      KISS_MAIL_LDAP_URL: ${KISS_MAIL_LDAP_URL:-}
-      KISS_MAIL_LDAP_BIND_DN: ${KISS_MAIL_LDAP_BIND_DN:-}
-      KISS_MAIL_LDAP_BIND_PASSWORD: ${KISS_MAIL_LDAP_BIND_PASSWORD:-}
-      KISS_MAIL_LDAP_BASE_DN: ${KISS_MAIL_LDAP_BASE_DN:-}
-      
-      # SSO configuration (optional)
-      KISS_MAIL_SSO_PROVIDER: ${KISS_MAIL_SSO_PROVIDER:-}
-      KISS_MAIL_SSO_CLIENT_ID: ${KISS_MAIL_SSO_CLIENT_ID:-}
-      KISS_MAIL_SSO_CLIENT_SECRET: ${KISS_MAIL_SSO_CLIENT_SECRET:-}
-      
-      # ClamAV configuration (optional - connect to clamav service)
-      KISS_MAIL_CLAMAV_ADDRESS: ${KISS_MAIL_CLAMAV_ADDRESS:-clamav:3310}
-      KISS_MAIL_CLAMAV_ENABLED: ${KISS_MAIL_CLAMAV_ENABLED:-false}
-      
-      # Logging
-      RUST_LOG: ${RUST_LOG:-info}
+      # REST API key. Leave unset to keep the REST API disabled (an empty key
+      # also means "disabled"). To enable remote administration, uncomment and
+      # set it in a .env file next to this compose file:
+      #   KISS_MAIL_API_KEY=<long random string>
+      # KISS_MAIL_API_KEY: ${KISS_MAIL_API_KEY}
+
+      # LDAP configuration (optional). Setting LDAP_URL enables LDAP auth, so
+      # only uncomment these when you actually use LDAP.
+      # LDAP_URL: ldap://ldap.example.com:389
+      # LDAP_BASE_DN: dc=example,dc=com
+      # LDAP_BIND_DN: cn=admin,dc=example,dc=com
+      # LDAP_BIND_PASSWORD: ${LDAP_BIND_PASSWORD}
+      # LDAP_USER_FILTER: "(uid={username})"
+      # LDAP_USE_STARTTLS: "true"
+      # LDAP_FALLBACK_LOCAL: "true"
+
+      # SSO configuration (optional). Use either a provider-specific pair
+      # (GOOGLE_*, MICROSOFT_* + MICROSOFT_TENANT_ID (your own tenant;
+      # common/organizations are refused), OKTA_* + OKTA_DOMAIN,
+      # AUTH0_* + AUTH0_DOMAIN, ONEPASSWORD_* + ONEPASSWORD_USERINFO_URL) or
+      # generic OIDC (SSO_*). Email domains match exactly
+      # (SSO_ALLOW_SUBDOMAINS=true to accept subdomains).
+      # GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      # GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      # SSO_REDIRECT_URI: https://mail.example.com/callback
+
+      # ClamAV (optional). Antivirus scanning is ON by default in the binary,
+      # so it is disabled here unless you start the "antivirus" profile:
+      #   CLAMAV_ENABLED=true docker compose --profile antivirus up -d
+      CLAMAV_ADDRESS: clamav:3310
+      CLAMAV_ENABLED: ${CLAMAV_ENABLED:-false}
+      # Set to true to temporarily reject (451) mail that could not be scanned
+      # by ClamAV instead of accepting it with the built-in scanner only.
+      CLAMAV_REQUIRED: ${CLAMAV_REQUIRED:-false}
+
+      # Logging (standard tracing filter syntax, e.g. "kiss_mail=debug").
+      # "kiss_mail=info" logs only the server; "info" adds dependency logs.
+      RUST_LOG: ${RUST_LOG:-kiss_mail=info}
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "2525"]
       interval: 30s
@@ -74,6 +118,8 @@ services:
       start_period: 10s
     networks:
       - kiss-mail-network
+    # The clamav dependency only applies when the "antivirus" profile is active
+    # (required: false needs Docker Compose >= 2.20).
     depends_on:
       clamav:
         condition: service_healthy

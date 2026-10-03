@@ -12,8 +12,19 @@ metadata:
 data:
   # Domain configuration
   KISS_MAIL_DOMAIN: "mail.example.com"
+
+  # Public base URL of the web interface, used in "password change required"
+  # replies to mail clients:
+  # KISS_MAIL_PUBLIC_URL: "https://mail.example.com"
+
+  # Proxies trusted for X-Real-IP / X-Forwarded-For (client IP used for
+  # lockout and allowed_ips). Set this to your ingress controller pod CIDR
+  # (e.g. the cluster pod CIDR "10.244.0.0/16"), otherwise every web/API
+  # client appears to come from the ingress controller pod.
+  KISS_MAIL_TRUSTED_PROXIES: "127.0.0.1/32,::1/128"
   
-  # Port configuration
+  # Port configuration (SMTP_PORT/IMAP_PORT/POP3_PORT are deprecated aliases,
+  # removed in 0.3.0)
   KISS_MAIL_SMTP_PORT: "2525"
   KISS_MAIL_IMAP_PORT: "1143"
   KISS_MAIL_POP3_PORT: "1100"
@@ -23,13 +34,22 @@ data:
   # Bind addresses
   KISS_MAIL_WEB_BIND: "0.0.0.0"
   KISS_MAIL_API_BIND: "0.0.0.0"
+
+  # The web UI binds 0.0.0.0, so the session cookie is Secure by default and
+  # logins only work over HTTPS. Uncomment to allow plain HTTP (port-forward,
+  # an Ingress without TLS):
+  # KISS_MAIL_WEB_SECURE_COOKIE: "false"
   
-  # Data directory
+  # Data directory (alias: KISS_MAIL_DATA). Must be the writable volume
+  # mounted in deployment.yaml - the root filesystem is read-only.
   KISS_MAIL_DATA_DIR: "/data"
   
   # Logging
-  RUST_LOG: "info"
+  # "kiss_mail=info" logs only the server; "info" also enables dependency logs
+  RUST_LOG: "kiss_mail=info"
   
-  # ClamAV (optional)
-  KISS_MAIL_CLAMAV_ADDRESS: "clamav:3310"
-  KISS_MAIL_CLAMAV_ENABLED: "false"
+  # ClamAV (optional). Scanning is enabled by default in the binary, so it is
+  # explicitly disabled here; set CLAMAV_ENABLED to "true" when a clamd
+  # service is reachable at CLAMAV_ADDRESS.
+  CLAMAV_ADDRESS: "clamav:3310"
+  CLAMAV_ENABLED: "false"

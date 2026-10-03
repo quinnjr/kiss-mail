@@ -355,6 +355,24 @@ For significant changes, update CHANGELOG.md:
 - Fixed connection timeout issue (#456)
 ```
 
+## CI Action Pins
+
+Every GitHub Action is pinned to a full commit SHA, with the version in a
+trailing comment. Dependabot updates tagged actions, but
+`dtolnay/rust-toolchain` has no release tags, so Dependabot can't track it.
+All workflows use one pin of its `master` branch and pick the toolchain with
+`with: toolchain: stable` (or `1.85.0` for the MSRV job). Re-pin it by hand
+now and then, replacing the SHA everywhere at once:
+
+```bash
+git ls-remote https://github.com/dtolnay/rust-toolchain.git refs/heads/master
+grep -rl 'dtolnay/rust-toolchain@' .github/workflows \
+  | xargs sed -i 's|dtolnay/rust-toolchain@[0-9a-f]*|dtolnay/rust-toolchain@<new-sha>|'
+```
+
+When you bump the MSRV, update `toolchain: 1.85.0` in `ci.yml`, along with
+`rust-version` in `Cargo.toml`.
+
 ## Questions?
 
 - Open a [Discussion](https://github.com/quinnjr/kiss-mail/discussions)

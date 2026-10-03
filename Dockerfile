@@ -15,11 +15,14 @@
 #     -v kiss-mail-data:/data ghcr.io/quinnjr/kiss-mail:latest
 #
 # Security Features:
-#   - Docker Hardened Images base (CVE-free, SBOM included)
+#   - Docker Hardened Images base (minimal, regularly patched)
 #   - Alpine Linux (minimal attack surface)
-#   - Non-root user
-#   - Read-only filesystem compatible
-#   - No shell in runtime image
+#   - Non-root user (uid 1000)
+#   - Pure-Rust TLS (rustls) - no OpenSSL in the build or the runtime image
+#   - Compatible with a read-only root filesystem, PROVIDED /data is mounted
+#     as a writable volume (all state is written to the data directory)
+#   - Note: the runtime image still contains busybox (a shell) because it is
+#     used by apk at build time and by the nc-based healthcheck
 # ============================================================================
 
 # -----------------------------------------------------------------------------
@@ -29,15 +32,12 @@ FROM dhi.io/rust:1.85-alpine3.21-dev AS builder
 
 WORKDIR /app
 
-# Install build dependencies for native compilation
-# Note: ldap3's default "tls" feature and reqwest's default-tls feature both
-# pull in native-tls/openssl-sys even though this app's own TLS usage is
-# rustls-based, so openssl-dev is required to satisfy that transitive build dependency.
+# Install build dependencies.
+# All TLS is rustls-based (reqwest "rustls-tls", ldap3 "tls-rustls-ring"), so
+# no OpenSSL headers/libraries are needed; ring only needs a C toolchain.
 RUN apk add --no-cache \
     musl-dev \
-    pkgconfig \
-    openssl-dev \
-    openssl-libs-static
+    gcc
 
 # Copy manifests first for dependency caching
 COPY Cargo.toml Cargo.lock ./
@@ -47,12 +47,12 @@ RUN mkdir src && \
     echo 'fn main() { println!("dummy"); }' > src/main.rs
 
 # Build dependencies (cached layer)
-RUN cargo build --release && rm -rf src target/release/deps/kiss_mail*
+RUN cargo build --release --locked && rm -rf src target/release/deps/kiss_mail*
 
 # Copy actual source
 COPY src/ src/
 
-# Build release binary (uses rustls for TLS - no native deps needed)
+# Build release binary
 RUN cargo build --release --locked
 
 # Strip binary for smaller size
@@ -63,6 +63,9 @@ RUN strip /app/target/release/kiss-mail
 # -----------------------------------------------------------------------------
 FROM dhi.io/alpine:3.21 AS runtime
 
+ARG VERSION=dev
+ARG COMMIT=unknown
+
 # Labels
 LABEL org.opencontainers.image.title="KISS Mail Server"
 LABEL org.opencontainers.image.description="Simple SMTP, IMAP, POP3 email server - Hardened Container"
@@ -70,6 +73,8 @@ LABEL org.opencontainers.image.source="https://github.com/quinnjr/kiss-mail"
 LABEL org.opencontainers.image.vendor="Joseph R. Quinn"
 LABEL org.opencontainers.image.base.name="dhi.io/alpine:3.21"
 LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.version="${VERSION}"
+LABEL org.opencontainers.image.revision="${COMMIT}"
 
 # Install minimal runtime dependencies
 # - ca-certificates: for TLS connections
@@ -92,12 +97,15 @@ COPY --from=builder /app/target/release/kiss-mail /usr/local/bin/kiss-mail
 RUN chmod +x /usr/local/bin/kiss-mail
 
 # Create data directory
+# The data directory must stay writable (mount a volume here)
 RUN mkdir -p /data && chown kissmail:kissmail /data
+WORKDIR /data
 
 # Switch to non-root user
 USER kissmail
 
 # Environment defaults
+# KISS_MAIL_DATA_DIR (alias: KISS_MAIL_DATA) - where all state is stored
 ENV KISS_MAIL_DATA_DIR=/data
 ENV KISS_MAIL_DOMAIN=localhost
 ENV KISS_MAIL_SMTP_PORT=2525
@@ -107,7 +115,7 @@ ENV KISS_MAIL_WEB_PORT=8080
 ENV KISS_MAIL_WEB_BIND=0.0.0.0
 ENV KISS_MAIL_API_PORT=8025
 ENV KISS_MAIL_API_BIND=0.0.0.0
-ENV RUST_LOG=info
+ENV RUST_LOG=kiss_mail=info
 
 # Expose ports
 EXPOSE 2525 1143 1100 8080 8025
@@ -119,6 +127,12 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Data volume
 VOLUME ["/data"]
 
-# Default command
+# Entry point
+# The server shuts down gracefully on SIGTERM (Docker's default stop signal);
+# stated explicitly so it is not lost if a base image changes it.
+STOPSIGNAL SIGTERM
+
 ENTRYPOINT ["kiss-mail"]
-CMD ["server"]
+# No CMD: running kiss-mail without arguments starts the server.
+# CLI example (password read from stdin, so it never appears in `ps` output):
+#   printf '%s' "$NEW_PASSWORD" | docker exec -i kiss-mail kiss-mail passwd admin --stdin

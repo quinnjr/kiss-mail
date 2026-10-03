@@ -2,18 +2,15 @@
 //!
 //! Provides LDAP authentication and directory services:
 //! - User authentication via LDAP bind
-//! - User/group synchronization from LDAP directory
+//! - User directory lookups
 //! - Fallback to local authentication when LDAP unavailable
 
-use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, dn_escape, ldap_escape};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::time::Instant;
 
 /// LDAP configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LdapConfig {
     /// LDAP server URL (e.g., "ldap://localhost:389" or "ldaps://ldap.example.com:636")
     pub url: String,
@@ -26,7 +23,9 @@ pub struct LdapConfig {
     /// User search filter template (use {username} as placeholder)
     /// e.g., "(&(objectClass=person)(uid={username}))"
     pub user_filter: String,
-    /// User DN template for direct bind (use {username} as placeholder)
+    /// User DN template for direct bind (use {username} as placeholder;
+    /// the username is RFC 4514-escaped). Defaults to `None` (search-then-bind)
+    /// unless `LDAP_USER_DN_TEMPLATE` is set.
     /// e.g., "uid={username},ou=users,dc=example,dc=com"
     pub user_dn_template: Option<String>,
     /// Attribute containing the username
@@ -35,13 +34,8 @@ pub struct LdapConfig {
     pub email_attr: String,
     /// Attribute containing the display name
     pub display_name_attr: String,
-    /// Group search base DN (optional)
-    pub group_base_dn: Option<String>,
-    /// Group search filter template
-    pub group_filter: String,
-    /// Group member attribute
-    pub group_member_attr: String,
-    /// Connection timeout in seconds
+    /// Per-operation (connect/bind/search) timeout in seconds; minimum 1.
+    /// One authentication may take up to 6x this in total.
     pub timeout_seconds: u64,
     /// Enable TLS/SSL
     pub use_tls: bool,
@@ -61,13 +55,12 @@ impl Default for LdapConfig {
             bind_dn: None,
             bind_password: None,
             user_filter: "(&(objectClass=inetOrgPerson)(uid={username}))".to_string(),
-            user_dn_template: Some("uid={username},ou=users,dc=example,dc=com".to_string()),
+            // No default template: when unset, authentication uses
+            // search-then-bind with `user_filter`.
+            user_dn_template: None,
             username_attr: "uid".to_string(),
             email_attr: "mail".to_string(),
             display_name_attr: "cn".to_string(),
-            group_base_dn: None,
-            group_filter: "(&(objectClass=groupOfNames)(member={user_dn}))".to_string(),
-            group_member_attr: "member".to_string(),
             timeout_seconds: 10,
             use_tls: false,
             use_starttls: false,
@@ -104,7 +97,9 @@ impl LdapConfig {
         }
 
         if let Ok(user_dn_template) = std::env::var("LDAP_USER_DN_TEMPLATE") {
-            config.user_dn_template = Some(user_dn_template);
+            if !user_dn_template.trim().is_empty() {
+                config.user_dn_template = Some(user_dn_template);
+            }
         }
 
         if let Ok(username_attr) = std::env::var("LDAP_USERNAME_ATTR") {
@@ -119,33 +114,36 @@ impl LdapConfig {
             config.display_name_attr = display_name_attr;
         }
 
-        if let Ok(group_base_dn) = std::env::var("LDAP_GROUP_BASE_DN") {
-            config.group_base_dn = Some(group_base_dn);
-        }
-
-        if let Ok(group_filter) = std::env::var("LDAP_GROUP_FILTER") {
-            config.group_filter = group_filter;
-        }
-
-        if let Ok(val) = std::env::var("LDAP_USE_TLS") {
-            config.use_tls = val == "1" || val.to_lowercase() == "true";
-        }
-
-        if let Ok(val) = std::env::var("LDAP_USE_STARTTLS") {
-            config.use_starttls = val == "1" || val.to_lowercase() == "true";
-        }
-
-        if let Ok(val) = std::env::var("LDAP_FALLBACK_LOCAL") {
-            config.fallback_to_local = val != "0" && val.to_lowercase() != "false";
-        }
+        config.use_tls = crate::config::env_bool("LDAP_USE_TLS", config.use_tls);
+        config.use_starttls = crate::config::env_bool("LDAP_USE_STARTTLS", config.use_starttls);
+        config.fallback_to_local =
+            crate::config::env_bool("LDAP_FALLBACK_LOCAL", config.fallback_to_local);
 
         if let Ok(timeout) = std::env::var("LDAP_TIMEOUT") {
-            if let Ok(secs) = timeout.parse() {
-                config.timeout_seconds = secs;
-            }
+            config.timeout_seconds = parse_timeout(&timeout, config.timeout_seconds);
         }
 
         config
+    }
+}
+
+/// Parse `LDAP_TIMEOUT` (whole seconds, minimum 1). Invalid values keep
+/// `default` and log a warning; 0 is raised to 1 with a warning.
+fn parse_timeout(value: &str, default: u64) -> u64 {
+    match value.trim().parse::<u64>() {
+        Ok(0) => {
+            tracing::warn!("LDAP_TIMEOUT=0 is below the minimum of 1 second; using 1");
+            1
+        }
+        Ok(secs) => secs,
+        Err(_) => {
+            tracing::warn!(
+                "Ignoring invalid LDAP_TIMEOUT '{}' (whole seconds, minimum 1); using {}",
+                value,
+                default
+            );
+            default
+        }
     }
 }
 
@@ -160,21 +158,6 @@ pub struct LdapUser {
     pub email: Option<String>,
     /// Display name
     pub display_name: Option<String>,
-    /// Group memberships
-    pub groups: Vec<String>,
-    /// Additional attributes
-    pub attributes: HashMap<String, Vec<String>>,
-}
-
-/// LDAP group information
-#[derive(Debug, Clone)]
-pub struct LdapGroup {
-    /// Distinguished Name
-    pub dn: String,
-    /// Group name (CN)
-    pub name: String,
-    /// Group members (DNs)
-    pub members: Vec<String>,
 }
 
 /// LDAP authentication result
@@ -197,16 +180,67 @@ pub enum LdapAuthResult {
 pub struct LdapClient {
     /// LDAP configuration
     config: LdapConfig,
-    /// Connection pool (simple: just track if we have a working connection)
-    last_error: Arc<RwLock<Option<String>>>,
+    /// URL actually used to connect (may differ from `config.url` when
+    /// `use_tls` forces an `ldap://` URL to `ldaps://`).
+    effective_url: String,
+    /// Whether StartTLS is actually requested on connect.
+    effective_starttls: bool,
+}
+
+/// Resolve the URL and StartTLS flag actually used for connecting.
+///
+/// - `ldaps://` URLs always use implicit TLS (StartTLS ignored).
+/// - `use_tls` with an `ldap://` URL rewrites the scheme to `ldaps://`
+///   (and an explicit `:389` port to `:636`), logging a warning.
+/// - `use_starttls` with an `ldap://` URL enables StartTLS.
+fn resolve_connection(config: &LdapConfig) -> (String, bool) {
+    let url = config.url.trim().to_string();
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("ldaps://") {
+        if config.use_starttls {
+            tracing::warn!("LDAP_USE_STARTTLS ignored: URL already uses ldaps:// (implicit TLS)");
+        }
+        return (url, false);
+    }
+    if lower.starts_with("ldap://") {
+        if config.use_tls {
+            let rest = &url["ldap://".len()..];
+            let (hostport, path) = match rest.find('/') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, ""),
+            };
+            let hostport = match hostport.strip_suffix(":389") {
+                Some(h) => format!("{}:636", h),
+                None => hostport.to_string(),
+            };
+            let new_url = format!("ldaps://{}{}", hostport, path);
+            tracing::warn!(
+                "LDAP_USE_TLS is set but LDAP_URL uses ldap://; connecting with implicit TLS to {}",
+                new_url
+            );
+            if config.use_starttls {
+                tracing::warn!("LDAP_USE_STARTTLS ignored because LDAP_USE_TLS takes precedence");
+            }
+            return (new_url, false);
+        }
+        return (url, config.use_starttls);
+    }
+    // Unknown scheme (e.g. ldapi://): pass through, let ldap3 report errors.
+    (url, config.use_starttls)
 }
 
 impl LdapClient {
     /// Create a new LDAP client
     pub fn new(config: LdapConfig) -> Self {
+        let (effective_url, effective_starttls) = if config.enabled {
+            resolve_connection(&config)
+        } else {
+            (config.url.clone(), config.use_starttls)
+        };
         Self {
             config,
-            last_error: Arc::new(RwLock::new(None)),
+            effective_url,
+            effective_starttls,
         }
     }
 
@@ -225,29 +259,74 @@ impl LdapClient {
         self.config.fallback_to_local
     }
 
-    /// Get the last error message
-    pub async fn last_error(&self) -> Option<String> {
-        self.last_error.read().await.clone()
-    }
-
-    /// Get LDAP status
+    /// Get LDAP status (reflects the connection mode actually used).
     pub fn status(&self) -> LdapStatus {
+        let use_tls = self
+            .effective_url
+            .to_ascii_lowercase()
+            .starts_with("ldaps://");
         LdapStatus {
             enabled: self.config.enabled,
-            url: self.config.url.clone(),
+            url: self.effective_url.clone(),
             base_dn: self.config.base_dn.clone(),
-            use_tls: self.config.use_tls,
-            use_starttls: self.config.use_starttls,
+            use_tls,
+            use_starttls: !use_tls && self.effective_starttls,
             fallback_to_local: self.config.fallback_to_local,
         }
     }
 
-    /// Connect to LDAP server
+    /// Per-operation timeout (bind/search/unbind) and connect timeout.
+    fn op_timeout(&self) -> Duration {
+        Duration::from_secs(self.config.timeout_seconds.max(1))
+    }
+
+    /// Overall budget for one call (`authenticate`: connect + binds +
+    /// searches, across the direct-bind and search-then-bind phases).
+    /// Backstop for the per-operation timeouts, since ldap3 resets a
+    /// search's timer on every reply.
+    fn overall_timeout(&self) -> Duration {
+        self.op_timeout() * 6
+    }
+
+    /// A fresh deadline for one call.
+    fn deadline(&self) -> Instant {
+        Instant::now() + self.overall_timeout()
+    }
+
+    /// Run `fut` until `deadline`, mapping expiry to an error.
+    async fn until<T>(
+        &self,
+        deadline: Instant,
+        what: &str,
+        fut: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        match tokio::time::timeout_at(deadline, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(format!(
+                "LDAP {} timed out after {}s",
+                what,
+                self.overall_timeout().as_secs()
+            )),
+        }
+    }
+
+    /// Unbind in the background (bounded by the operation timeout; errors
+    /// ignored), so a slow unbind never delays or changes a result that is
+    /// already known.
+    fn spawn_unbind(&self, mut ldap: Ldap) {
+        let timeout = self.op_timeout();
+        tokio::spawn(async move {
+            let _ = ldap.with_timeout(timeout).unbind().await;
+        });
+    }
+
+    /// Connect to LDAP server (one connection per call; no pooling).
     async fn connect(&self) -> Result<Ldap, String> {
         let settings = LdapConnSettings::new()
-            .set_conn_timeout(Duration::from_secs(self.config.timeout_seconds));
+            .set_conn_timeout(self.op_timeout())
+            .set_starttls(self.effective_starttls);
 
-        let (conn, ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
+        let (conn, ldap) = LdapConnAsync::with_settings(settings, &self.effective_url)
             .await
             .map_err(|e| format!("LDAP connection failed: {}", e))?;
 
@@ -258,9 +337,6 @@ impl LdapClient {
             }
         });
 
-        // Note: For TLS, use ldaps:// URL. StartTLS would require additional setup.
-        // The ldap3 crate handles TLS automatically when using ldaps:// URLs.
-
         Ok(ldap)
     }
 
@@ -269,7 +345,8 @@ impl LdapClient {
         if let (Some(bind_dn), Some(bind_password)) =
             (&self.config.bind_dn, &self.config.bind_password)
         {
-            ldap.simple_bind(bind_dn, bind_password)
+            ldap.with_timeout(self.op_timeout())
+                .simple_bind(bind_dn, bind_password)
                 .await
                 .map_err(|e| format!("LDAP bind failed: {}", e))?
                 .success()
@@ -278,62 +355,119 @@ impl LdapClient {
         Ok(())
     }
 
+    /// Attributes requested for user entries.
+    fn user_attrs(&self) -> Vec<&str> {
+        vec![
+            &self.config.username_attr as &str,
+            &self.config.email_attr,
+            &self.config.display_name_attr,
+        ]
+    }
+
+    /// Build the user search filter with the username safely escaped.
+    fn user_filter_for(&self, username: &str) -> String {
+        self.config
+            .user_filter
+            .replace("{username}", &ldap_escape(username))
+    }
+
+    /// Search for a single user entry on an already-bound connection.
+    async fn search_user_entry(
+        &self,
+        ldap: &mut Ldap,
+        username: &str,
+    ) -> Result<Option<SearchEntry>, String> {
+        let filter = self.user_filter_for(username);
+        let (rs, _) = ldap
+            .with_timeout(self.op_timeout())
+            .search(
+                &self.config.base_dn,
+                Scope::Subtree,
+                &filter,
+                self.user_attrs(),
+            )
+            .await
+            .map_err(|e| format!("LDAP search failed: {}", e))?
+            .success()
+            .map_err(|e| format!("LDAP search error: {}", e))?;
+        Ok(rs.into_iter().next().map(SearchEntry::construct))
+    }
+
+    /// Minimal user record when the directory entry cannot be read.
+    fn minimal_user(user_dn: String, username: &str) -> LdapUser {
+        LdapUser {
+            dn: user_dn,
+            username: username.to_string(),
+            email: None,
+            display_name: None,
+        }
+    }
+
     /// Authenticate a user with username and password
     pub async fn authenticate(&self, username: &str, password: &str) -> LdapAuthResult {
         if !self.config.enabled {
             return LdapAuthResult::NotEnabled;
         }
 
-        // Clear previous error
-        *self.last_error.write().await = None;
+        // An empty password would be an "unauthenticated bind" (RFC 4513 5.1.2),
+        // which many servers report as success. Never send one.
+        if password.is_empty() || username.is_empty() {
+            return LdapAuthResult::InvalidCredentials;
+        }
+
+        // One deadline covers every phase of this call.
+        let deadline = self.deadline();
 
         // Try direct bind first if user_dn_template is set
         if let Some(ref template) = self.config.user_dn_template {
-            let user_dn = template.replace("{username}", username);
-            match self.authenticate_direct_bind(&user_dn, password).await {
-                Ok(true) => {
-                    // Fetch user details
-                    match self.get_user(username).await {
-                        Ok(Some(user)) => return LdapAuthResult::Success(user),
-                        Ok(None) => {
-                            // User authenticated but not found in search
-                            // Create minimal user info
-                            return LdapAuthResult::Success(LdapUser {
-                                dn: user_dn,
-                                username: username.to_string(),
-                                email: None,
-                                display_name: None,
-                                groups: vec![],
-                                attributes: HashMap::new(),
-                            });
-                        }
+            let user_dn = template.replace("{username}", &dn_escape(username));
+            match self
+                .until(
+                    deadline,
+                    "bind",
+                    self.direct_bind_and_lookup(&user_dn, username, password),
+                )
+                .await
+            {
+                Ok(Some(user)) => return LdapAuthResult::Success(user),
+                Ok(None) => {
+                    // Invalid credentials / no such object for the templated DN.
+                    // Fall through to search-then-bind, which may locate the
+                    // user elsewhere in the tree. If that search itself fails
+                    // (e.g. anonymous search denied), the direct bind's answer
+                    // stands.
+                    return match self
+                        .until(
+                            deadline,
+                            "search-then-bind",
+                            self.search_and_bind_authenticate(username, password),
+                        )
+                        .await
+                    {
+                        Ok(Some(user)) => LdapAuthResult::Success(user),
+                        Ok(None) => LdapAuthResult::InvalidCredentials,
                         Err(e) => {
-                            tracing::warn!("LDAP user lookup failed after auth: {}", e);
-                            return LdapAuthResult::Success(LdapUser {
-                                dn: user_dn,
-                                username: username.to_string(),
-                                email: None,
-                                display_name: None,
-                                groups: vec![],
-                                attributes: HashMap::new(),
-                            });
+                            tracing::debug!("LDAP search-then-bind fallback failed: {}", e);
+                            LdapAuthResult::InvalidCredentials
                         }
-                    }
+                    };
                 }
-                Ok(false) => return LdapAuthResult::InvalidCredentials,
-                Err(e) => {
-                    *self.last_error.write().await = Some(e.clone());
-                    return LdapAuthResult::Error(e);
-                }
+                Err(e) => return LdapAuthResult::Error(e),
             }
         }
 
         // Search-then-bind approach
-        match self.search_and_bind_authenticate(username, password).await {
+        match self
+            .until(
+                deadline,
+                "search-then-bind",
+                self.search_and_bind_authenticate(username, password),
+            )
+            .await
+        {
             Ok(Some(user)) => LdapAuthResult::Success(user),
             Ok(None) => LdapAuthResult::InvalidCredentials,
             Err(e) => {
-                *self.last_error.write().await = Some(e.clone());
                 if e.contains("not found") {
                     LdapAuthResult::UserNotFound
                 } else {
@@ -343,32 +477,53 @@ impl LdapClient {
         }
     }
 
-    /// Direct bind authentication
-    async fn authenticate_direct_bind(
+    /// Bind as `user_dn` and, on success, look up the user's entry over the
+    /// same connection. Returns `Ok(None)` for invalidCredentials (49) or
+    /// noSuchObject (32).
+    async fn direct_bind_and_lookup(
         &self,
         user_dn: &str,
+        username: &str,
         password: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<LdapUser>, String> {
         let mut ldap = self.connect().await?;
 
         let result = ldap
+            .with_timeout(self.op_timeout())
             .simple_bind(user_dn, password)
             .await
             .map_err(|e| format!("LDAP bind error: {}", e))?;
 
-        let _ = ldap.unbind().await;
-
         match result.rc {
-            0 => Ok(true),
-            49 => Ok(false), // Invalid credentials
-            _ => Err(format!(
-                "LDAP bind failed with code {}: {}",
-                result.rc, result.text
-            )),
+            0 => {}
+            32 | 49 => {
+                self.spawn_unbind(ldap);
+                return Ok(None);
+            }
+            _ => {
+                self.spawn_unbind(ldap);
+                return Err(format!(
+                    "LDAP bind failed with code {}: {}",
+                    result.rc, result.text
+                ));
+            }
         }
+
+        // Authenticated. Look up details on the same (user-bound) connection.
+        let user = match self.search_user_entry(&mut ldap, username).await {
+            Ok(Some(entry)) => self.entry_to_user(entry),
+            Ok(None) => Self::minimal_user(user_dn.to_string(), username),
+            Err(e) => {
+                tracing::warn!("LDAP user lookup failed after auth: {}", e);
+                Self::minimal_user(user_dn.to_string(), username)
+            }
+        };
+        self.spawn_unbind(ldap);
+        Ok(Some(user))
     }
 
-    /// Search for user, then bind with their DN
+    /// Search for user (as the service account), then bind with their DN on
+    /// the same connection.
     async fn search_and_bind_authenticate(
         &self,
         username: &str,
@@ -377,41 +532,31 @@ impl LdapClient {
         let mut ldap = self.connect().await?;
         self.bind_service(&mut ldap).await?;
 
-        // Search for user
-        let filter = self.config.user_filter.replace("{username}", username);
-        let attrs = vec![
-            &self.config.username_attr as &str,
-            &self.config.email_attr,
-            &self.config.display_name_attr,
-            "memberOf",
-        ];
-
-        let (rs, _) = ldap
-            .search(&self.config.base_dn, Scope::Subtree, &filter, attrs)
-            .await
-            .map_err(|e| format!("LDAP search failed: {}", e))?
-            .success()
-            .map_err(|e| format!("LDAP search error: {}", e))?;
-
-        let _ = ldap.unbind().await;
-
-        if rs.is_empty() {
-            return Err(format!("User '{}' not found in LDAP", username));
-        }
-
-        let entry = SearchEntry::construct(rs.into_iter().next().unwrap());
-        let user_dn = entry.dn.clone();
+        let entry = match self.search_user_entry(&mut ldap, username).await? {
+            Some(entry) => entry,
+            None => {
+                self.spawn_unbind(ldap);
+                return Err(format!("User '{}' not found in LDAP", username));
+            }
+        };
 
         // Now bind as the user to verify password
-        let auth_result = self.authenticate_direct_bind(&user_dn, password).await?;
+        let result = ldap
+            .with_timeout(self.op_timeout())
+            .simple_bind(&entry.dn, password)
+            .await
+            .map_err(|e| format!("LDAP bind error: {}", e));
+        self.spawn_unbind(ldap);
+        let result = result?;
 
-        if !auth_result {
-            return Ok(None);
+        match result.rc {
+            0 => Ok(Some(self.entry_to_user(entry))),
+            49 => Ok(None),
+            _ => Err(format!(
+                "LDAP bind failed with code {}: {}",
+                result.rc, result.text
+            )),
         }
-
-        // Build user info
-        let user = self.entry_to_user(entry);
-        Ok(Some(user))
     }
 
     /// Get user information by username
@@ -420,132 +565,14 @@ impl LdapClient {
             return Ok(None);
         }
 
-        let mut ldap = self.connect().await?;
-        self.bind_service(&mut ldap).await?;
-
-        let filter = self.config.user_filter.replace("{username}", username);
-        let attrs = vec![
-            &self.config.username_attr as &str,
-            &self.config.email_attr,
-            &self.config.display_name_attr,
-            "memberOf",
-        ];
-
-        let (rs, _) = ldap
-            .search(&self.config.base_dn, Scope::Subtree, &filter, attrs)
-            .await
-            .map_err(|e| format!("LDAP search failed: {}", e))?
-            .success()
-            .map_err(|e| format!("LDAP search error: {}", e))?;
-
-        let _ = ldap.unbind().await;
-
-        if rs.is_empty() {
-            return Ok(None);
-        }
-
-        let entry = SearchEntry::construct(rs.into_iter().next().unwrap());
-        Ok(Some(self.entry_to_user(entry)))
-    }
-
-    /// Search for users matching a filter
-    pub async fn search_users(&self, filter: &str) -> Result<Vec<LdapUser>, String> {
-        if !self.config.enabled {
-            return Ok(vec![]);
-        }
-
-        let mut ldap = self.connect().await?;
-        self.bind_service(&mut ldap).await?;
-
-        let attrs = vec![
-            &self.config.username_attr as &str,
-            &self.config.email_attr,
-            &self.config.display_name_attr,
-            "memberOf",
-        ];
-
-        let (rs, _) = ldap
-            .search(&self.config.base_dn, Scope::Subtree, filter, attrs)
-            .await
-            .map_err(|e| format!("LDAP search failed: {}", e))?
-            .success()
-            .map_err(|e| format!("LDAP search error: {}", e))?;
-
-        let _ = ldap.unbind().await;
-
-        let users = rs
-            .into_iter()
-            .map(|entry| self.entry_to_user(SearchEntry::construct(entry)))
-            .collect();
-
-        Ok(users)
-    }
-
-    /// Get groups for a user
-    pub async fn get_user_groups(&self, user_dn: &str) -> Result<Vec<LdapGroup>, String> {
-        if !self.config.enabled {
-            return Ok(vec![]);
-        }
-
-        let group_base = self
-            .config
-            .group_base_dn
-            .as_ref()
-            .unwrap_or(&self.config.base_dn);
-
-        let mut ldap = self.connect().await?;
-        self.bind_service(&mut ldap).await?;
-
-        let filter = self.config.group_filter.replace("{user_dn}", user_dn);
-        let attrs = vec!["cn", &self.config.group_member_attr as &str];
-
-        let (rs, _) = ldap
-            .search(group_base, Scope::Subtree, &filter, attrs)
-            .await
-            .map_err(|e| format!("LDAP group search failed: {}", e))?
-            .success()
-            .map_err(|e| format!("LDAP group search error: {}", e))?;
-
-        let _ = ldap.unbind().await;
-
-        let groups = rs
-            .into_iter()
-            .map(|entry| {
-                let se = SearchEntry::construct(entry);
-                LdapGroup {
-                    dn: se.dn.clone(),
-                    name: se
-                        .attrs
-                        .get("cn")
-                        .and_then(|v| v.first())
-                        .cloned()
-                        .unwrap_or_default(),
-                    members: se
-                        .attrs
-                        .get(&self.config.group_member_attr)
-                        .cloned()
-                        .unwrap_or_default(),
-                }
-            })
-            .collect();
-
-        Ok(groups)
-    }
-
-    /// Sync all users from LDAP
-    pub async fn sync_all_users(&self) -> Result<Vec<LdapUser>, String> {
-        if !self.config.enabled {
-            return Ok(vec![]);
-        }
-
-        // Use a broad filter to get all users
-        let filter = self
-            .config
-            .user_filter
-            .replace("{username}", "*")
-            .replace("(uid=*)", "(objectClass=inetOrgPerson)");
-
-        self.search_users(&filter).await
+        self.until(self.deadline(), "user lookup", async {
+            let mut ldap = self.connect().await?;
+            self.bind_service(&mut ldap).await?;
+            let entry = self.search_user_entry(&mut ldap, username).await;
+            self.spawn_unbind(ldap);
+            Ok(entry?.map(|e| self.entry_to_user(e)))
+        })
+        .await
     }
 
     /// Convert LDAP entry to LdapUser
@@ -569,15 +596,11 @@ impl LdapClient {
             .and_then(|v| v.first())
             .cloned();
 
-        let groups = entry.attrs.get("memberOf").cloned().unwrap_or_default();
-
         LdapUser {
             dn: entry.dn,
             username,
             email,
             display_name,
-            groups,
-            attributes: entry.attrs,
         }
     }
 
@@ -586,24 +609,33 @@ impl LdapClient {
         if !self.config.enabled {
             return Err("LDAP is not enabled".to_string());
         }
+        self.until(
+            self.deadline(),
+            "connection test",
+            self.test_connection_inner(),
+        )
+        .await
+    }
 
+    async fn test_connection_inner(&self) -> Result<String, String> {
         let mut ldap = self.connect().await?;
         self.bind_service(&mut ldap).await?;
 
         // Try to get root DSE
-        let (rs, _) = ldap
+        let result = ldap
+            .with_timeout(self.op_timeout())
             .search(
                 "",
                 Scope::Base,
                 "(objectClass=*)",
                 vec!["namingContexts", "supportedLDAPVersion"],
             )
-            .await
+            .await;
+        self.spawn_unbind(ldap);
+        let (rs, _) = result
             .map_err(|e| format!("LDAP search failed: {}", e))?
             .success()
             .map_err(|e| format!("LDAP search error: {}", e))?;
-
-        let _ = ldap.unbind().await;
 
         if let Some(entry) = rs.into_iter().next() {
             let se = SearchEntry::construct(entry);
@@ -652,11 +684,140 @@ mod tests {
     }
 
     #[test]
-    fn test_user_dn_template() {
+    fn test_user_dn_template_default_none() {
         let config = LdapConfig::default();
-        let template = config.user_dn_template.unwrap();
-        let dn = template.replace("{username}", "alice");
-        assert_eq!(dn, "uid=alice,ou=users,dc=example,dc=com");
+        assert!(config.user_dn_template.is_none());
+    }
+
+    #[test]
+    fn test_dn_escape_in_template() {
+        // ldap3::dn_escape uses RFC 4514 hex escapes.
+        assert_eq!(dn_escape("alice"), "alice");
+        assert_eq!(
+            dn_escape("a,b+c\"d\\e<f>g;h=i"),
+            "a\\2cb\\2bc\\22d\\5ce\\3cf\\3eg\\3bh\\3di"
+        );
+        assert_eq!(dn_escape("#lead"), "\\23lead");
+        assert_eq!(dn_escape("mid#dle"), "mid#dle");
+        assert_eq!(dn_escape(" x "), "\\20x\\20");
+        assert_eq!(dn_escape("a\0b"), "a\\00b");
+        assert_eq!(dn_escape("ünï"), "ünï");
+        let template = "uid={username},ou=users,dc=example,dc=com";
+        let dn = template.replace("{username}", &dn_escape("x,ou=admins"));
+        assert_eq!(dn, "uid=x\\2cou\\3dadmins,ou=users,dc=example,dc=com");
+    }
+
+    #[test]
+    fn test_filter_escaping() {
+        let client = LdapClient::new(LdapConfig::default());
+        let f = client.user_filter_for("*)(uid=*");
+        assert_eq!(
+            f,
+            "(&(objectClass=inetOrgPerson)(uid=\\2a\\29\\28uid=\\2a))"
+        );
+        // Backslash and NUL are escaped too.
+        let f = client.user_filter_for("a\\b\0c");
+        assert_eq!(f, "(&(objectClass=inetOrgPerson)(uid=a\\5cb\\00c))");
+    }
+
+    #[tokio::test]
+    async fn test_unresponsive_server_times_out_as_error() {
+        // A server that accepts connections but never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let client = LdapClient::new(LdapConfig {
+            enabled: true,
+            url: format!("ldap://{}", addr),
+            user_dn_template: Some("uid={username},dc=example,dc=com".to_string()),
+            timeout_seconds: 1,
+            ..LdapConfig::default()
+        });
+        let started = std::time::Instant::now();
+        let result = client.authenticate("alice", "pw").await;
+        assert!(
+            matches!(result, LdapAuthResult::Error(_)),
+            "timeout must map to Error so local fallback runs: {:?}",
+            result
+        );
+        // One overall budget (6 x 1s) for both phases, not one per phase.
+        assert!(started.elapsed() < Duration::from_secs(8));
+        match result {
+            LdapAuthResult::Error(e) => assert!(!e.is_empty()),
+            other => panic!("expected Error, got {:?}", other),
+        }
+        accept.abort();
+    }
+
+    #[test]
+    fn test_parse_timeout() {
+        assert_eq!(parse_timeout("5", 10), 5);
+        assert_eq!(parse_timeout(" 7 ", 10), 7);
+        assert_eq!(parse_timeout("0", 10), 1);
+        assert_eq!(parse_timeout("abc", 10), 10);
+        assert_eq!(parse_timeout("-3", 10), 10);
+    }
+
+    #[tokio::test]
+    async fn test_empty_password_rejected() {
+        let config = LdapConfig {
+            enabled: true,
+            // Unroutable: if a bind were attempted this would be an Error.
+            url: "ldap://127.0.0.1:1".to_string(),
+            user_dn_template: Some("uid={username},dc=example,dc=com".to_string()),
+            ..LdapConfig::default()
+        };
+        let client = LdapClient::new(config);
+        assert!(matches!(
+            client.authenticate("alice", "").await,
+            LdapAuthResult::InvalidCredentials
+        ));
+        assert!(matches!(
+            client.authenticate("", "pw").await,
+            LdapAuthResult::InvalidCredentials
+        ));
+    }
+
+    #[test]
+    fn test_resolve_connection_modes() {
+        let mut c = LdapConfig {
+            enabled: true,
+            url: "ldap://host:389".to_string(),
+            ..LdapConfig::default()
+        };
+        assert_eq!(
+            resolve_connection(&c),
+            ("ldap://host:389".to_string(), false)
+        );
+        c.use_starttls = true;
+        assert_eq!(
+            resolve_connection(&c),
+            ("ldap://host:389".to_string(), true)
+        );
+        c.use_tls = true;
+        assert_eq!(
+            resolve_connection(&c),
+            ("ldaps://host:636".to_string(), false)
+        );
+        c.url = "ldaps://host".to_string();
+        assert_eq!(resolve_connection(&c), ("ldaps://host".to_string(), false));
+
+        let client = LdapClient::new(LdapConfig {
+            enabled: true,
+            url: "ldap://h".to_string(),
+            use_tls: true,
+            ..LdapConfig::default()
+        });
+        let st = client.status();
+        assert!(st.use_tls);
+        assert!(!st.use_starttls);
+        assert_eq!(st.url, "ldaps://h");
     }
 
     #[tokio::test]

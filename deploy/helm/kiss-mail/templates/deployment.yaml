@@ -60,14 +60,21 @@ spec:
             {{- if .Values.secrets.create }}
             - secretRef:
                 name: {{ include "kiss-mail.secretName" . }}
+            {{- else if .Values.secrets.existingSecret }}
+            - secretRef:
+                name: {{ .Values.secrets.existingSecret }}
             {{- end }}
           {{- with .Values.extraEnv }}
           env:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          # readOnlyRootFilesystem is on by default: all state is written to
+          # the data volume (KISS_MAIL_DATA_DIR=/data).
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -105,6 +112,8 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        - name: tmp
+          emptyDir: {}
         {{- if .Values.clamav.sidecar.enabled }}
         - name: clamav-data
           emptyDir: {}

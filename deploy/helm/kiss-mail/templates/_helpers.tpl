@@ -84,3 +84,33 @@ Secret name
 {{- define "kiss-mail.secretName" -}}
 {{- include "kiss-mail.fullname" . }}-secrets
 {{- end }}
+
+{{/*
+SSO environment variable prefix. The binary selects the SSO provider from
+provider-specific variables (GOOGLE_*, MICROSOFT_*, OKTA_*, AUTH0_*,
+ONEPASSWORD_*); anything else (e.g. "oidc" or "") uses the generic SSO_*
+variables.
+*/}}
+{{- define "kiss-mail.ssoPrefix" -}}
+{{- $p := lower (default "" .Values.sso.provider) -}}
+{{- if eq $p "google" -}}GOOGLE
+{{- else if eq $p "microsoft" -}}MICROSOFT
+{{- else if eq $p "okta" -}}OKTA
+{{- else if eq $p "auth0" -}}AUTH0
+{{- else if eq $p "onepassword" -}}ONEPASSWORD
+{{- else -}}SSO
+{{- end -}}
+{{- end }}
+
+{{/*
+KISS_MAIL_WEB_SECURE_COOKIE: webAdmin.secureCookie when set, otherwise "true"
+only when the Ingress terminates TLS.
+*/}}
+{{- define "kiss-mail.secureCookie" -}}
+{{- $raw := .Values.webAdmin.secureCookie -}}
+{{- if kindIs "bool" $raw -}}{{ $raw }}
+{{- else if and (not (kindIs "invalid" $raw)) (ne (toString $raw) "") -}}{{ toString $raw }}
+{{- else if and .Values.ingress.enabled .Values.ingress.tls -}}true
+{{- else -}}false
+{{- end -}}
+{{- end }}

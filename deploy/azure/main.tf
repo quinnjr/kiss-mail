@@ -9,7 +9,7 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "~> 3.0"
+      version = "~> 4.0"
     }
   }
 }
@@ -17,6 +17,12 @@ terraform {
 # ----------------------------------------------------------------------------
 # Variables
 # ----------------------------------------------------------------------------
+variable "subscription_id" {
+  description = "Azure subscription ID (or leave null and export ARM_SUBSCRIPTION_ID)"
+  type        = string
+  default     = null
+}
+
 variable "location" {
   description = "Azure region"
   type        = string
@@ -26,26 +32,24 @@ variable "location" {
 variable "vm_size" {
   description = "Virtual machine size"
   type        = string
-  default     = "Standard_B1s"  # Cheapest option
+  default     = "Standard_B1s" # Cheapest option
 }
 
 variable "domain" {
   description = "Mail domain"
   type        = string
   default     = "mail.example.com"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9.-]+$", var.domain))
+    error_message = "The domain may only contain letters, digits, '.' and '-'."
+  }
 }
 
 variable "admin_username" {
   description = "VM admin username"
   type        = string
   default     = "azureuser"
-}
-
-variable "admin_password" {
-  description = "Initial admin password"
-  type        = string
-  default     = ""
-  sensitive   = true
 }
 
 variable "ssh_public_key" {
@@ -63,8 +67,11 @@ variable "disk_size" {
 # ----------------------------------------------------------------------------
 # Provider
 # ----------------------------------------------------------------------------
+# azurerm 4.x no longer falls back to the Azure CLI's default subscription:
+# set subscription_id here or export ARM_SUBSCRIPTION_ID.
 provider "azurerm" {
   features {}
+  subscription_id = var.subscription_id
 }
 
 # ----------------------------------------------------------------------------
@@ -250,20 +257,30 @@ resource "azurerm_linux_virtual_machine" "kiss_mail" {
 
   source_image_reference {
     publisher = "Canonical"
-    offer     = "0001-com-ubuntu-server-jammy"
-    sku       = "22_04-lts-gen2"
+    offer     = "ubuntu-24_04-lts"
+    sku       = "server"
     version   = "latest"
   }
 
-  custom_data = base64encode(templatefile("${path.module}/cloud-init.yml", {
-    domain         = var.domain
-    admin_password = var.admin_password
+  # Shared bootstrap script (cloud-init runs a custom_data that starts with
+  # "#!" as a user script). The admin password is generated on the VM and
+  # kept only in the root-only /opt/kiss-mail/credentials.txt.
+  custom_data = base64encode(templatefile("${path.module}/../common/bootstrap.sh.tftpl", {
+    provider_name = "azure"
+    domain        = var.domain
+    public_ip_cmd = "curl -s -H Metadata:true 'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text'"
   }))
 
   tags = {
     app     = "kiss-mail"
     env     = "production"
     managed = "terraform"
+  }
+
+  # The bootstrap script only runs on first boot; a template change must not
+  # replace the VM (and its mail data).
+  lifecycle {
+    ignore_changes = [custom_data]
   }
 }
 
@@ -283,6 +300,11 @@ output "web_admin_url" {
 output "ssh_command" {
   description = "SSH command"
   value       = "ssh ${var.admin_username}@${azurerm_public_ip.kiss_mail.ip_address}"
+}
+
+output "credentials_command" {
+  description = "Show the generated credentials (admin password, API key)"
+  value       = "ssh ${var.admin_username}@${azurerm_public_ip.kiss_mail.ip_address} sudo cat /opt/kiss-mail/credentials.txt"
 }
 
 output "dns_records" {
