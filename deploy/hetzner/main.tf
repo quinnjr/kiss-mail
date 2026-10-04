@@ -112,6 +112,27 @@ resource "hcloud_firewall" "kiss_mail" {
   rule {
     direction  = "in"
     protocol   = "tcp"
+    port       = "465"
+    source_ips = ["0.0.0.0/0", "::/0"]
+  }
+
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "993"
+    source_ips = ["0.0.0.0/0", "::/0"]
+  }
+
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "995"
+    source_ips = ["0.0.0.0/0", "::/0"]
+  }
+
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
     port       = "80"
     source_ips = ["0.0.0.0/0", "::/0"]
   }

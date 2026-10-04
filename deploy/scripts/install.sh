@@ -358,13 +358,67 @@ install_certbot() {
     return 0
 }
 
+# Certbot runs every executable in renewal-hooks/deploy after each renewal,
+# with RENEWED_LINEAGE (the live/ directory of the certificate) and
+# RENEWED_DOMAINS set. This hook copies the KISS Mail certificate to the
+# fixed location the server watches ($DATA_DIR/tls/key.pem and cert.pem,
+# owned by the container user 1000:1000) and sends SIGHUP so it reloads at
+# once; the server also notices new files on its own within 60 seconds. It is
+# installed before certbot ever runs. On the first issuance, certbot runs
+# directory hooks only when the same path is passed as --deploy-hook (see
+# credentials.txt); renewals run it once. Never put upgrade.sh in a certbot
+# hook: it snapshots the data directory on every run.
+# The hook is written to KM_TLS_HOOK.
+KM_TLS_HOOK="/etc/letsencrypt/renewal-hooks/deploy/kiss-mail.sh"
+install_tls_hook() {
+    local hook="$KM_TLS_HOOK"
+    log "Installing the certbot deploy hook $hook..."
+    mkdir -p "$(dirname "$hook")"
+    {
+        echo '#!/bin/bash'
+        echo '# KISS Mail certbot deploy hook, written by the KISS Mail installer.'
+        printf 'DOMAIN=%q\n' "$DOMAIN"
+        printf 'DATA_DIR=%q\n' "$DATA_DIR"
+        cat << 'HOOK'
+# No "set -u": certbot sets RENEWED_LINEAGE and RENEWED_DOMAINS.
+set -eo pipefail
+TLS_DIR="$DATA_DIR/tls"
+if [[ -z "$RENEWED_LINEAGE" ]]; then
+    echo "kiss-mail deploy hook: RENEWED_LINEAGE is not set (this hook is run by certbot)" >&2
+    exit 1
+fi
+# Certbot runs this for every certificate on the machine; only act on ours.
+case " $RENEWED_DOMAINS " in
+    *" $DOMAIN "*) ;;
+    *) exit 0 ;;
+esac
+install -d -m 0700 -o 1000 -g 1000 "$TLS_DIR"
+# Key first, then the chain. Each is written under a temp name and renamed,
+# so the server never reads a half-written file.
+install -m 0600 -o 1000 -g 1000 "$RENEWED_LINEAGE/privkey.pem" "$TLS_DIR/key.pem.new"
+mv -f "$TLS_DIR/key.pem.new" "$TLS_DIR/key.pem"
+install -m 0600 -o 1000 -g 1000 "$RENEWED_LINEAGE/fullchain.pem" "$TLS_DIR/cert.pem.new"
+mv -f "$TLS_DIR/cert.pem.new" "$TLS_DIR/cert.pem"
+# During upgrade.sh the container may be stopped or named kiss-mail-old; the
+# new container loads the copied files when it starts.
+docker kill --signal=HUP kiss-mail >/dev/null || true
+echo "kiss-mail deploy hook: installed the certificate for $DOMAIN in $TLS_DIR"
+HOOK
+    } > "$hook.new"
+    chmod 0755 "$hook.new"
+    mv -f "$hook.new" "$hook"
+}
+
 configure_firewall() {
+    # Ports published by Docker bypass ufw/firewalld (Docker's iptables rules
+    # come first); the cloud firewall is what really limits exposure. These
+    # rules are kept for consistency.
     log "Configuring firewall..."
     local port
     if command -v ufw >/dev/null 2>&1; then
         ufw default deny incoming
         ufw default allow outgoing
-        for port in 22 25 587 143 110 80 443; do
+        for port in 22 25 587 143 110 465 993 995 80 443; do
             ufw allow "$port/tcp"
         done
         ufw --force enable || warn "Could not enable ufw"
@@ -373,12 +427,12 @@ configure_firewall() {
         firewall-cmd --permanent --add-service=smtp
         firewall-cmd --permanent --add-service=http
         firewall-cmd --permanent --add-service=https
-        for port in 587 143 110; do
+        for port in 587 143 110 465 993 995; do
             firewall-cmd --permanent --add-port="$port/tcp"
         done
         firewall-cmd --reload || warn "Could not reload firewalld"
     else
-        warn "No host firewall (ufw/firewalld) found; restrict inbound traffic to ports 22, 25, 587, 143, 110, 80 and 443 yourself"
+        warn "No host firewall (ufw/firewalld) found; restrict inbound traffic to ports 22, 25, 587, 143, 110, 465, 993, 995, 80 and 443 yourself"
     fi
 }
 
@@ -477,17 +531,22 @@ Change the admin password later in the web admin, or offline:
 (never run "passwd" against the running container: the server would
 overwrite the change with its in-memory copy)
 
-HTTPS: certbot --nginx -d $DOMAIN
+Mail TLS: IMAPS 993, SMTPS 465 (submission) and POP3S 995, plus STARTTLS on
+143, 587/25 and 110. Logins without TLS are refused.
+TLS starts with a self-signed certificate. Outlook and Gmail refuse
+self-signed certificates, so they cannot connect until a real one is installed.
+
+HTTPS and the mail certificate: once DNS for $DOMAIN points at this server, run
+  certbot --nginx --redirect -d $DOMAIN --deploy-hook $KM_TLS_HOOK
+The deploy hook ($KM_TLS_HOOK) copies the certificate to
+$DATA_DIR/tls/ and reloads KISS Mail, now and on every renewal.
+
 The session cookie is currently sent with KISS_MAIL_WEB_SECURE_COOKIE=$SECURE_COOKIE
 and KISS_MAIL_PUBLIC_URL is "$PUBLIC_URL".
-Once HTTPS works, recreate the container with a Secure cookie and an https URL:
+Once HTTPS works, recreate the container once with a Secure cookie and an
+https URL (a one-off command; never put it in a certbot hook, because every
+renewal would re-run it):
   curl -fsSL $KM_REPO_URL/raw/main/deploy/scripts/upgrade.sh | sudo bash -s -- --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true --env KISS_MAIL_PUBLIC_URL=https://$DOMAIN
-Or let certbot do it once the certificate is issued (the hook is a no-op
-after the first run):
-  certbot --nginx -d $DOMAIN --deploy-hook 'docker inspect kiss-mail --format "{{.Config.Env}}" | grep -q KISS_MAIL_WEB_SECURE_COOKIE=true || curl -fsSL $KM_REPO_URL/raw/main/deploy/scripts/upgrade.sh | bash -s -- --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true --env KISS_MAIL_PUBLIC_URL=https://$DOMAIN'
-
-Note: SMTP/IMAP/POP3 are plaintext (no STARTTLS). Use a TLS-terminating
-proxy in front of them before sending real passwords over the internet.
 
 Generated: $(date)
 CREDS
@@ -504,7 +563,9 @@ run_container() {
     # The web UI binds 0.0.0.0 inside the container, which would make the
     # session cookie Secure by default; it stays non-Secure (SECURE_COOKIE)
     # until HTTPS is enabled in front of it. An empty KISS_MAIL_PUBLIC_URL is
-    # treated as unset by the server.
+    # treated as unset by the server. KISS_MAIL_TLS=auto is the default; it is
+    # set explicitly so upgrade.sh sees a TLS-aware install and does not turn
+    # plaintext logins back on.
     docker run -d \
         --name kiss-mail \
         --restart unless-stopped \
@@ -512,6 +573,9 @@ run_container() {
         -p 587:2525 \
         -p 143:1143 \
         -p 110:1100 \
+        -p 465:4465 \
+        -p 993:1993 \
+        -p 995:1995 \
         -p 127.0.0.1:8080:8080 \
         -p 127.0.0.1:8025:8025 \
         -v "$DATA_DIR":/data \
@@ -523,6 +587,7 @@ run_container() {
         -e KISS_MAIL_WEB_SECURE_COOKIE="$SECURE_COOKIE" \
         -e KISS_MAIL_TRUSTED_PROXIES="$trusted_proxies" \
         -e KISS_MAIL_PUBLIC_URL="$PUBLIC_URL" \
+        -e KISS_MAIL_TLS=auto \
         -e CLAMAV_ENABLED=false \
         -e RUST_LOG=kiss_mail=info \
         "$IMAGE" >/dev/null
@@ -628,9 +693,9 @@ print_summary() {
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo "  Web Admin:    http://$PUBLIC_IP/admin"
-    echo "  SMTP:         $PUBLIC_IP:25"
-    echo "  IMAP:         $PUBLIC_IP:143"
-    echo "  POP3:         $PUBLIC_IP:110"
+    echo "  IMAPS:        $PUBLIC_IP:993 (IMAP with STARTTLS: 143)"
+    echo "  SMTPS:        $PUBLIC_IP:465 (submission with STARTTLS: 587; MX: 25)"
+    echo "  POP3S:        $PUBLIC_IP:995 (POP3 with STARTTLS: 110)"
     echo "  REST API:     127.0.0.1:8025 only (remote: ssh -L 8025:127.0.0.1:8025 <user>@$PUBLIC_IP)"
     echo ""
     echo "  Credentials:  $CONFIG_DIR/credentials.txt (root only)"
@@ -641,21 +706,22 @@ print_summary() {
     echo "    MX    $DOMAIN    10        $DOMAIN"
     echo "    TXT   $DOMAIN              \"v=spf1 ip4:$PUBLIC_IP -all\""
     echo ""
-    echo -e "  ${YELLOW}To enable HTTPS for the web admin:${NC}"
-    echo "    certbot --nginx -d $DOMAIN"
+    echo -e "  ${YELLOW}TLS:${NC} mail TLS starts with a self-signed certificate; Outlook and Gmail"
+    echo "  refuse it. Logins without TLS are refused."
+    echo -e "  ${YELLOW}Once DNS points here, get a real certificate (HTTPS and mail):${NC}"
+    echo "    certbot --nginx --redirect -d $DOMAIN --deploy-hook $KM_TLS_HOOK"
+    echo "  The deploy hook copies it to $DATA_DIR/tls/ and reloads KISS Mail, now"
+    echo "  and on every renewal."
     if [[ "$SECURE_COOKIE" != "true" ]]; then
-        echo "  then recreate the container with a Secure session cookie and an https URL:"
+        echo "  Then recreate the container once with a Secure session cookie and an https URL:"
         echo "    curl -fsSL $KM_REPO_URL/raw/main/deploy/scripts/upgrade.sh | sudo bash -s -- --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true --env KISS_MAIL_PUBLIC_URL=https://$DOMAIN"
-        echo "  (a certbot --deploy-hook that does this is suggested in $CONFIG_DIR/credentials.txt)"
+        echo "  (a one-off command: never put it in a certbot hook)"
     fi
     echo ""
     echo -e "  ${YELLOW}Changing the admin password later:${NC} use the web admin, or offline:"
     echo "    docker stop kiss-mail"
     echo "    docker run --rm -i -v $DATA_DIR:/data $IMAGE passwd admin --stdin"
     echo "    docker start kiss-mail"
-    echo ""
-    echo -e "  ${YELLOW}Note:${NC} SMTP/IMAP/POP3 are plaintext (no STARTTLS)."
-    echo "  Put a TLS-terminating proxy in front of them before using real passwords."
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
 }
@@ -682,6 +748,8 @@ main() {
     if [[ "$INSTALL_CERTBOT" == "true" ]]; then
         install_certbot
     fi
+    # Installed even with --no-certbot, for a certbot set up later.
+    install_tls_hook
     configure_firewall
     install_kiss_mail
 

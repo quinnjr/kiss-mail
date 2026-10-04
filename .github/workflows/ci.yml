@@ -41,9 +41,14 @@ jobs:
       - name: Shared provisioning block is in sync
         run: bash deploy/common/check-sync.sh
 
+      - name: Certbot deploy hook
+        run: bash deploy/common/test-tls-hook.sh "$RUNNER_TEMP/kiss-mail-hook.sh"
+
       - name: ShellCheck
         run: |
-          shellcheck deploy/scripts/*.sh deploy/common/check-sync.sh
+          shellcheck deploy/scripts/*.sh deploy/common/check-sync.sh deploy/common/test-tls-hook.sh
+          # The hook written by install_tls_hook (saved by the step above)
+          shellcheck "$RUNNER_TEMP/kiss-mail-hook.sh"
           # Render the Terraform template with dummy values and check it too
           # shellcheck disable=SC2016 # literal Terraform placeholders
           sed -e 's/\${provider_name}/ci/' -e 's/\${domain}/mail.example.com/' \

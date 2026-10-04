@@ -21,6 +21,23 @@ data:
   KISS_MAIL_POP3_PORT: {{ .Values.ports.pop3 | quote }}
   KISS_MAIL_WEB_PORT: {{ .Values.ports.web | quote }}
   KISS_MAIL_API_PORT: {{ .Values.ports.api | quote }}
+
+  # TLS for the mail protocols
+  KISS_MAIL_TLS: {{ include "kiss-mail.tlsMode" . | quote }}
+  KISS_MAIL_ALLOW_PLAINTEXT_AUTH: {{ .Values.tls.allowPlaintextAuth | toString | quote }}
+  {{- if include "kiss-mail.tlsEnabled" . }}
+  KISS_MAIL_SMTPS_PORT: {{ .Values.ports.smtps | quote }}
+  KISS_MAIL_IMAPS_PORT: {{ .Values.ports.imaps | quote }}
+  KISS_MAIL_POP3S_PORT: {{ .Values.ports.pop3s | quote }}
+  {{- end }}
+  {{- if .Values.tls.existingSecret }}
+  {{- if not (include "kiss-mail.tlsEnabled" .) }}
+  {{- fail "tls.existingSecret requires tls.mode=auto" }}
+  {{- end }}
+  # Certificate from the tls.existingSecret volume
+  KISS_MAIL_TLS_CERT: "/etc/kiss-mail/tls/tls.crt"
+  KISS_MAIL_TLS_KEY: "/etc/kiss-mail/tls/tls.key"
+  {{- end }}
   
   # Bind addresses
   KISS_MAIL_WEB_BIND: "0.0.0.0"

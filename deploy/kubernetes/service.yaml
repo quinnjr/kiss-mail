@@ -31,6 +31,18 @@ spec:
       port: 1100
       targetPort: pop3
       protocol: TCP
+    - name: smtps
+      port: 4465
+      targetPort: smtps
+      protocol: TCP
+    - name: imaps
+      port: 1993
+      targetPort: imaps
+      protocol: TCP
+    - name: pop3s
+      port: 1995
+      targetPort: pop3s
+      protocol: TCP
     - name: web
       port: 8080
       targetPort: web
@@ -77,6 +89,19 @@ spec:
     - name: pop3
       port: 110
       targetPort: pop3
+      protocol: TCP
+    # Implicit TLS
+    - name: smtps
+      port: 465
+      targetPort: smtps
+      protocol: TCP
+    - name: imaps
+      port: 993
+      targetPort: imaps
+      protocol: TCP
+    - name: pop3s
+      port: 995
+      targetPort: pop3s
       protocol: TCP
   # Optional: Restrict source IPs
   # loadBalancerSourceRanges:

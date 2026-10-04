@@ -15,6 +15,11 @@
 # Containers without KISS_MAIL_WEB_SECURE_COOKIE get
 # KISS_MAIL_WEB_SECURE_COOKIE=false (the old non-Secure cookie behaviour), and
 # containers without KISS_MAIL_TRUSTED_PROXIES get the Docker bridge range.
+# Containers without any KISS_MAIL_TLS* or KISS_MAIL_ALLOW_PLAINTEXT_AUTH
+# setting (created before native TLS) get KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true,
+# so existing plaintext clients keep working. Containers with the standard
+# 25/143/110 port bindings and no TLS bindings also get 465/993/995 (a host
+# port already in use is skipped with a warning).
 #
 # Containers managed by Docker Compose are refused: use
 #   docker compose pull && docker compose up -d
@@ -68,7 +73,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -h|--help)
-            sed -n '3,27p' "$0" 2>/dev/null || true
+            sed -n '3,32p' "$0" 2>/dev/null || true
             exit 0
             ;;
         *)
@@ -177,6 +182,7 @@ SMTP_PORT_NEW=""
 SMTP_PORT_ALIAS=""
 HAS_SECURE_COOKIE=false
 HAS_TRUSTED_PROXIES=false
+HAS_TLS_SETTING=false
 for entry in "${CONTAINER_ENV[@]}" "${ENV_OVERRIDES[@]}"; do
     [[ -z "$entry" ]] && continue
     # Container values that an --env override replaces are dropped here; the
@@ -190,6 +196,7 @@ for entry in "${CONTAINER_ENV[@]}" "${ENV_OVERRIDES[@]}"; do
         SMTP_PORT=*) SMTP_PORT_ALIAS="${entry#*=}" ;;
         KISS_MAIL_WEB_SECURE_COOKIE=*) HAS_SECURE_COOKIE=true ;;
         KISS_MAIL_TRUSTED_PROXIES=*) HAS_TRUSTED_PROXIES=true ;;
+        KISS_MAIL_TLS*=*|KISS_MAIL_ALLOW_PLAINTEXT_AUTH=*) HAS_TLS_SETTING=true ;;
     esac
     is_image_default "$entry" && ! is_overridden "$entry" && continue
     RUN_ARGS+=(-e "$entry")
@@ -208,6 +215,15 @@ if [[ "$HAS_SECURE_COOKIE" != "true" ]]; then
     RUN_ARGS+=(-e KISS_MAIL_WEB_SECURE_COOKIE=false)
     warn "KISS_MAIL_WEB_SECURE_COOKIE was not set; keeping a non-Secure session cookie (KISS_MAIL_WEB_SECURE_COOKIE=false)."
     warn "Once the web admin is served over HTTPS, re-run with: --no-pull --env KISS_MAIL_WEB_SECURE_COOKIE=true"
+fi
+
+# Containers created before native TLS accepted plaintext logins. Current
+# versions refuse them without TLS, which would lock out every existing mail
+# client, so keep the old behaviour explicitly.
+if [[ "$HAS_TLS_SETTING" != "true" ]]; then
+    RUN_ARGS+=(-e KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true)
+    warn "No KISS_MAIL_TLS* or KISS_MAIL_ALLOW_PLAINTEXT_AUTH setting found; keeping plaintext logins allowed (KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true)."
+    warn "Once your mail clients use TLS (993/465/995 or STARTTLS), re-run with: --no-pull --env KISS_MAIL_ALLOW_PLAINTEXT_AUTH=false"
 fi
 
 # Requests proxied from the host (Nginx -> 127.0.0.1:8080) reach the container
@@ -235,6 +251,8 @@ if [[ "$HAS_TRUSTED_PROXIES" != "true" ]]; then
 fi
 
 # Port bindings, e.g. "127.0.0.1|8080|8080/tcp"
+HAS_PLAIN_BINDINGS=" "
+HAS_TLS_BINDINGS=false
 while IFS='|' read -r host_ip host_port container_port; do
     [[ -z "$container_port" ]] && continue
     if [[ -n "$host_ip" ]]; then
@@ -242,7 +260,40 @@ while IFS='|' read -r host_ip host_port container_port; do
     else
         RUN_ARGS+=(-p "${host_port}:${container_port}")
     fi
+    case "$host_port" in
+        25|143|110) HAS_PLAIN_BINDINGS+="$host_port " ;;
+        465|993|995) HAS_TLS_BINDINGS=true ;;
+    esac
+    case "${container_port%/*}" in
+        4465|1993|1995) HAS_TLS_BINDINGS=true ;;
+    esac
 done < <(docker inspect "$NAME" --format '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+
+# Installs with the standard bindings (25/143/110, as written by install.sh
+# and the cloud bootstraps) get the implicit TLS ports too. The check runs
+# while the old container is up; it never binds these ports, so a listener
+# found here belongs to something else and that port is skipped.
+port_in_use() {
+    command -v ss >/dev/null 2>&1 || return 1
+    [[ -n "$(ss -ltnH "sport = :$1" 2>/dev/null)" ]]
+}
+if [[ "$HAS_TLS_BINDINGS" != "true" && "$HAS_PLAIN_BINDINGS" == *" 25 "* \
+    && "$HAS_PLAIN_BINDINGS" == *" 143 "* && "$HAS_PLAIN_BINDINGS" == *" 110 "* ]]; then
+    command -v ss >/dev/null 2>&1 || warn "ss not found; publishing 465/993/995 without checking that they are free"
+    added_tls_ports=""
+    for mapping in 465:4465 993:1993 995:1995; do
+        p="${mapping%%:*}"
+        if port_in_use "$p"; then
+            warn "Host port $p is already in use; not publishing it (map it yourself later: -p <port>:${mapping#*:})"
+            continue
+        fi
+        RUN_ARGS+=(-p "$mapping")
+        added_tls_ports+=" $p"
+    done
+    if [[ -n "$added_tls_ports" ]]; then
+        log "Publishing the implicit TLS ports:$added_tls_ports. Open them in your cloud firewall too (for Terraform installs: terraform apply)."
+    fi
+fi
 
 # Volumes / bind mounts
 while IFS='|' read -r _type source dest rw; do

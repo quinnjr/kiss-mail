@@ -41,6 +41,10 @@ ports:
   smtp: 2525
   imap: 1143
   pop3: 1100
+  # Implicit TLS listeners (only when tls.mode is auto)
+  smtps: 4465
+  imaps: 1993
+  pop3s: 1995
   web: 8080
   api: 8025
 
@@ -128,7 +132,32 @@ externalService:
     smtpAlt: 587
     imap: 143
     pop3: 110
+    # Implicit TLS (only when tls.mode is auto)
+    smtps: 465
+    imaps: 993
+    pop3s: 995
   loadBalancerSourceRanges: []
+
+# ----------------------------------------------------------------------------
+# TLS for the mail protocols (IMAPS/SMTPS/POP3S and STARTTLS)
+# ----------------------------------------------------------------------------
+tls:
+  # KISS_MAIL_TLS. "auto": use the certificate from existingSecret, else
+  # /data/tls/cert.pem + key.pem, else a self-signed one generated in
+  # /data/tls (mail clients warn about it; Outlook and Gmail refuse it).
+  # "off": no TLS listeners or STARTTLS, and plaintext logins are allowed.
+  mode: auto
+  # Name of a kubernetes.io/tls Secret (e.g. issued by cert-manager), mounted
+  # read-only at /etc/kiss-mail/tls as a whole directory (so renewals reach
+  # the pod).
+  # KISS_MAIL_TLS_CERT/KEY point into it; the server reloads the files within
+  # 60 seconds of a change. Readable by the pod through fsGroup 1000
+  # (podSecurityContext) and defaultMode 0440.
+  existingSecret: ""
+  # KISS_MAIL_ALLOW_PLAINTEXT_AUTH: allow logins on connections without TLS.
+  # Off by default; enable it only while old clients still connect in the
+  # clear (their passwords cross the network unencrypted).
+  allowPlaintextAuth: false
 
 # ----------------------------------------------------------------------------
 # Ingress configuration (for web admin and API)

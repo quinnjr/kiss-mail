@@ -21,6 +21,15 @@ Domain: {{ .Values.domain }}
    SMTP: {{ .Values.ports.smtp }}
    IMAP: {{ .Values.ports.imap }}
    POP3: {{ .Values.ports.pop3 }}
+{{- if include "kiss-mail.tlsEnabled" . }}
+   SMTPS: {{ .Values.ports.smtps }}  IMAPS: {{ .Values.ports.imaps }}  POP3S: {{ .Values.ports.pop3s }}  (implicit TLS)
+{{- end }}
+{{- if .Values.externalService.enabled }}
+   External: SMTP {{ .Values.externalService.ports.smtp }}/{{ .Values.externalService.ports.smtpAlt }}, IMAP {{ .Values.externalService.ports.imap }}, POP3 {{ .Values.externalService.ports.pop3 }}
+{{- if include "kiss-mail.tlsEnabled" . }}
+             SMTPS {{ .Values.externalService.ports.smtps }}, IMAPS {{ .Values.externalService.ports.imaps }}, POP3S {{ .Values.externalService.ports.pop3s }}
+{{- end }}
+{{- end }}
 {{- if .Values.webAdmin.enabled }}
    Web Admin: {{ .Values.ports.web }}
 {{- end }}
@@ -76,5 +85,35 @@ Domain: {{ .Values.domain }}
 
    # Check stats
    kubectl exec -it deploy/{{ include "kiss-mail.fullname" . }} -n {{ .Release.Namespace }} -- kiss-mail stats
+
+7. TLS ({{ include "kiss-mail.tlsMode" . }}):
+{{- if not (include "kiss-mail.tlsEnabled" .) }}
+
+   tls.mode=off: no TLS listeners or STARTTLS, and plaintext logins are
+   allowed. Passwords cross the network in the clear.
+{{- else if .Values.tls.existingSecret }}
+
+   Certificate: Secret {{ .Values.tls.existingSecret }}, mounted at
+   /etc/kiss-mail/tls. Renewed certificates are picked up within 60 seconds.
+{{- else }}
+
+   No tls.existingSecret: the server uses /data/tls/cert.pem + key.pem if
+   present, otherwise a self-signed certificate in /data/tls. Mail clients
+   warn about it, and Outlook and Gmail refuse it. For a real certificate,
+   create a kubernetes.io/tls Secret (e.g. a cert-manager Certificate) and
+   set tls.existingSecret.
+{{- end }}
+
+   BREAKING (native TLS release) checklist:
+   - Logins without TLS are now refused by default
+     (tls.allowPlaintextAuth={{ .Values.tls.allowPlaintextAuth }}). Switch mail clients to
+     IMAPS/SMTPS/POP3S or STARTTLS, or set tls.allowPlaintextAuth=true
+     while you migrate them.
+   - Expose the TLS ports: externalService.ports.smtps/imaps/pop3s
+     (465/993/995) on the LoadBalancer, and allow them in any firewall or
+     NetworkPolicy of your own (the chart's networkPolicy already does).
+   - An expired certificate in tls.existingSecret stops the server from
+     starting; keep the Secret renewed (cert-manager does this).
+   - tls.mode=off restores the old behaviour (no TLS, plaintext logins).
 
 For more information, visit: https://github.com/quinnjr/kiss-mail
