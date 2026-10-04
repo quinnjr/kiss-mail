@@ -107,7 +107,7 @@ impl<V: Clone> SessionStore<V> {
 
 /// 32 random bytes, hex-encoded.
 pub(crate) fn generate_session_token() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 32];
     rand::rng().fill(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
