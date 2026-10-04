@@ -97,6 +97,12 @@ fn init_cli_logging() {
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     init_server_logging();
+    // First, before anything slow (config parsing, certificate loading or
+    // self-signed generation): a HUP must never terminate the process. The
+    // handler is apart from shutdown_signal() and reloads the TLS bound to
+    // `tls_slot` below, or logs "nothing to reload" while it is empty.
+    let tls_slot = tls::TlsSlot::default();
+    let _sighup = tls::spawn_sighup_handler(Arc::clone(&tls_slot));
 
     // KISS_MAIL_DATA_DIR, then KISS_MAIL_DATA, then ./mail_data
     let data_dir = data_dir();
@@ -118,10 +124,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
     let tls = tls::Tls::from_env(&data_dir, &domain).await?;
-    // Installed whatever the TLS mode and apart from shutdown_signal(), so a
-    // HUP reloads certificates instead of terminating the process.
-    tls::spawn_sighup_handler(tls.clone());
     if let Some(tls) = &tls {
+        // Bind the SIGHUP handler to it; the slot is set only here, once.
+        let _ = tls_slot.set(Arc::clone(tls));
         tls.spawn_reloader();
     }
     // The single source of TLS availability for all three servers.

@@ -9,7 +9,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsAcceptor;
@@ -648,10 +648,17 @@ impl Tls {
     }
 }
 
+/// Late-bound TLS for the SIGHUP handler. The handler is installed before
+/// the certificate is loaded; startup sets the slot (at most once) when TLS
+/// is on, and leaves it empty when `KISS_MAIL_TLS=off`.
+pub type TlsSlot = Arc<OnceLock<Arc<Tls>>>;
+
 /// Install the SIGHUP listener (Unix). Each HUP triggers an immediate reload
-/// of `tls`, or logs "SIGHUP: nothing to reload" without one. This is separate
-/// from the shutdown signals, so a HUP never stops the server.
-pub fn spawn_sighup_handler(tls: Option<Arc<Tls>>) {
+/// of the TLS in `slot`, or logs "SIGHUP: nothing to reload" while the slot is
+/// empty. This is separate from the shutdown signals, so a HUP never stops
+/// the server. Returns the listener task (`None` if it could not be
+/// installed, or on non-Unix platforms).
+pub fn spawn_sighup_handler(slot: TlsSlot) -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -659,12 +666,12 @@ pub fn spawn_sighup_handler(tls: Option<Arc<Tls>>) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("cannot install the SIGHUP handler: {e}");
-                return;
+                return None;
             }
         };
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             while hup.recv().await.is_some() {
-                match &tls {
+                match slot.get() {
                     Some(tls) => {
                         let outcome = tls.reload_now().await;
                         if outcome == ReloadOutcome::NothingToReload {
@@ -676,10 +683,13 @@ pub fn spawn_sighup_handler(tls: Option<Arc<Tls>>) {
                     None => tracing::info!("SIGHUP: nothing to reload"),
                 }
             }
-        });
+        }))
     }
     #[cfg(not(unix))]
-    drop(tls);
+    {
+        drop(slot);
+        None
+    }
 }
 
 /// Test helpers shared by the protocol modules: a self-signed [`Tls`] and a
@@ -1465,7 +1475,10 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
         let dir = tempfile::tempdir().unwrap();
         let (c1, k1) = valid_pair();
         let tls = tls_with_fixed(dir.path(), &c1, &k1).await;
-        spawn_sighup_handler(Some(Arc::clone(&tls)));
+        // Installed with an empty slot and bound afterwards, as at startup.
+        let slot = TlsSlot::default();
+        spawn_sighup_handler(Arc::clone(&slot)).expect("handler installed");
+        assert!(slot.set(Arc::clone(&tls)).is_ok());
         let before = tls.status().not_after;
         let (c2, k2) = make_cert("localhost", (2020, 1, 1), (2199, 1, 1));
         write_fixed(dir.path(), &c2, &k2);
@@ -1481,5 +1494,18 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
         }
         let (client, _) = handshake(&tls, &cert_der(&c2)).await.unwrap();
         assert_eq!(peer_cert(&client), cert_der(&c2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sighup_with_empty_slot_is_harmless() {
+        let handle = spawn_sighup_handler(TlsSlot::default()).expect("handler installed");
+        // SAFETY: raise() is async-signal-safe; the handler is installed above.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The process is still here, and the listener neither panicked nor
+        // stopped: it logged "nothing to reload" and keeps waiting.
+        assert!(!handle.is_finished());
+        handle.abort();
     }
 }
