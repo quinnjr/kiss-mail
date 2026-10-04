@@ -467,6 +467,9 @@ where
         write_all_timeout(writer, greeting.as_bytes(), wt).await?;
     }
 
+    // Set after a refused credential literal: a client that sends the literal
+    // anyway has it parsed as the next command, which must not reach the log.
+    let mut after_refusal = false;
     loop {
         // Credentials may not be sent: LOGIN/AUTHENTICATE literals are refused
         // before the `+` continuation (RFC 3501 section 7.5).
@@ -484,6 +487,7 @@ where
             Ok(r) => match r? {
                 None => break,
                 Some(Err(msg)) => {
+                    after_refusal = msg.contains(PRIVACY_REQUIRED_REPLY);
                     write_all_timeout(writer, msg.as_bytes(), wt).await?;
                     continue;
                 }
@@ -498,7 +502,10 @@ where
                 continue;
             }
         };
-        if cmd == "AUTHENTICATE" {
+        let redact = std::mem::take(&mut after_refusal);
+        if redact {
+            tracing::debug!("IMAP <- (line withheld after a refused credential literal)");
+        } else if cmd == "AUTHENTICATE" {
             tracing::debug!("IMAP <- {} AUTHENTICATE ...", tag);
         } else if cmd == "LOGIN" {
             tracing::debug!("IMAP <- {} LOGIN ...", tag);

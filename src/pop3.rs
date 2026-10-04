@@ -729,7 +729,10 @@ async fn process_pop3_command(line: &str, session: &mut Pop3Session, storage: &S
             }
             response.push_str("UIDL\r\n");
             response.push_str("TOP\r\n");
-            if session.policy.tls_available && !session.tls {
+            if session.policy.tls_available
+                && !session.tls
+                && session.state == Pop3State::Authorization
+            {
                 response.push_str("STLS\r\n");
             }
             // RFC 2449 / RFC 3206 extended response codes ([AUTH], [SYS/TEMP]).
@@ -1218,6 +1221,23 @@ mod tests {
         c.send("QUIT\r\n").await;
         c.line().await;
         assert_clean_tls_eof(&mut c).await;
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn capa_after_login_omits_stls() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, PLAINTEXT_OK).await;
+        c.send("CAPA\r\n").await;
+        assert!(c.multiline().await.contains("\r\nSTLS\r\n"));
+        c.send("USER bob\r\nPASS pass word 123\r\n").await;
+        assert_eq!(c.line().await, "+OK User accepted\r\n");
+        assert_eq!(c.line().await, "+OK Logged in\r\n");
+        c.send("CAPA\r\n").await;
+        let capa = c.multiline().await;
+        assert!(!capa.contains("STLS"), "{}", capa);
+        drop(c);
         h.await.unwrap().unwrap();
     }
 
