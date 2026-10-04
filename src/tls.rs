@@ -1276,7 +1276,11 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
         assert!(!st.self_signed);
         assert_eq!(
             st.source,
-            dir.path().join("tls/cert.pem").display().to_string()
+            dir.path()
+                .join("tls")
+                .join("cert.pem")
+                .display()
+                .to_string()
         );
         assert_eq!(tls.reload_now().await, ReloadOutcome::Unchanged);
     }
@@ -1378,7 +1382,11 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
         assert!(!st.self_signed);
         assert_eq!(
             st.source,
-            dir.path().join("tls/cert.pem").display().to_string()
+            dir.path()
+                .join("tls")
+                .join("cert.pem")
+                .display()
+                .to_string()
         );
         let (client, _) = handshake(&tls, &cert_der(&c)).await.unwrap();
         assert_eq!(peer_cert(&client), cert_der(&c));

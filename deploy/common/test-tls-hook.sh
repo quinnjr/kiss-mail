@@ -9,6 +9,8 @@
 # Usage: test-tls-hook.sh [copy-of-hook]  (also saves the rendered hook there,
 # e.g. for shellcheck)
 # ============================================================================
+# Subshells override DOMAIN/DATA_DIR on purpose; the outer values stay.
+# shellcheck disable=SC2030,SC2031
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -31,7 +33,7 @@ mkdir -p "$DATA_DIR"
 
 # --- render the hook ---------------------------------------------------------
 # log/warn/error are called from the sourced block.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 if ! (
     log() { :; }
     warn() { echo "warn: $1" >&2; }
@@ -150,7 +152,7 @@ MIXED="$WORK/mixed"
 mkdir -p "$MIXED/data" "$MIXED/letsencrypt/renewal-hooks/deploy"
 MIXED_HOOK="$MIXED/letsencrypt/renewal-hooks/deploy/kiss-mail.sh"
 # log/warn/error are called from the sourced block.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 if (
     log() { :; }
     warn() { :; }
