@@ -262,6 +262,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tunnel or a reverse proxy for remote access.
 
 ### Fixed
+- Build after the Dependabot major bumps: ported to the `rand` 0.10 traits (`RngExt` and `Rng`). X25519 keys are now generated with `x25519-dalek` 3 `StaticSecret::random()` from the OS RNG. The redundant direct `password-hash` dependency was removed: Argon2 hashing uses `argon2`'s re-export.
 - Server no longer exits right after startup; the Docker image's
   `ENTRYPOINT`/`CMD` start the server correctly.
 - Encryption at rest was configured but never applied; encryption failures

@@ -36,7 +36,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
 };
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -261,7 +261,7 @@ impl CryptoManager {
 
     /// Create a fresh key pair wrapped with `password` (not stored).
     async fn new_keypair(password: &str) -> Result<UserKeyPair, CryptoError> {
-        let private_key = StaticSecret::random_from_rng(OsRng);
+        let private_key = StaticSecret::random();
         let public_key = PublicKey::from(&private_key);
         let (encrypted_private_key, salt, nonce) = wrap_private_key(&private_key, password).await?;
 
@@ -526,7 +526,7 @@ impl CryptoManager {
         let recipient_pk = PublicKey::from(recipient_pk_array);
 
         // Generate ephemeral key pair for key exchange
-        let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
+        let ephemeral_secret = StaticSecret::random();
         let ephemeral_public = PublicKey::from(&ephemeral_secret);
 
         // Perform X25519 key exchange to derive shared secret

@@ -1419,7 +1419,7 @@ pub struct SsoStatus {
 
 /// Generate a random string of specified length
 fn generate_random_string(length: usize) -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
 
     let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -1446,7 +1446,7 @@ fn generate_pkce_challenge(verifier: &str) -> String {
 
 /// Generate a random app password
 fn generate_app_password(length: usize) -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
 
     // Use a character set that's easy to type and unambiguous
@@ -1477,7 +1477,7 @@ fn hash_app_password(password: &str) -> Result<String, String> {
     use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 
     // Use password_hash's own RNG to avoid version conflicts
-    let salt = SaltString::generate(&mut password_hash::rand_core::OsRng);
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
     let argon2 = Argon2::default();
 
     argon2
