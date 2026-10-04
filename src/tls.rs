@@ -355,6 +355,7 @@ pub struct Tls {
     resolver: Arc<ReloadingResolver>,
     acceptor: TlsAcceptor,
     data_dir: PathBuf,
+    domain: String,
     active: Mutex<Active>,
     /// Serializes reloads (timer and SIGHUP).
     reload_lock: tokio::sync::Mutex<()>,
@@ -392,6 +393,31 @@ fn leaf_fingerprint(key: &CertifiedKey) -> String {
 
 fn rfc3339(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+}
+
+/// The expiry WARN text. A self-signed certificate renews itself, so it never
+/// points at certbot.
+fn expiry_message(st: &TlsStatus, now: SystemTime) -> String {
+    let expires = if now >= st.not_after {
+        format!("expired on {}", rfc3339(st.not_after))
+    } else {
+        let days = st
+            .not_after
+            .duration_since(now)
+            .unwrap_or_default()
+            .as_secs()
+            / 86_400;
+        format!("expires in {days} day(s), on {}", rfc3339(st.not_after))
+    };
+    let advice = if st.self_signed {
+        "it will be regenerated automatically"
+    } else {
+        "renew it (e.g. certbot renew)"
+    };
+    format!(
+        "TLS certificate {} ({}) {expires}; {advice}",
+        st.source, st.subject
+    )
 }
 
 impl Tls {
@@ -460,6 +486,7 @@ impl Tls {
             resolver,
             acceptor: TlsAcceptor::from(Arc::new(config)),
             data_dir: data_dir.to_path_buf(),
+            domain: domain.to_string(),
             active: Mutex::new(Active {
                 source,
                 file_fp,
@@ -531,7 +558,7 @@ impl Tls {
             // Self-signed upgrades as soon as a real pair is installed.
             CertSource::SelfSigned => match select_source(|_| None, &self.data_dir) {
                 Ok(CertSource::FixedLocation { cert, key }) => (cert, key, true),
-                Ok(_) => return ReloadOutcome::NothingToReload,
+                Ok(_) => return self.renew_self_signed(now).await,
                 Err(e) => return ReloadOutcome::Failed(e),
             },
         };
@@ -561,6 +588,34 @@ impl Tls {
         ReloadOutcome::Reloaded
     }
 
+    /// A running server must not serve its self-signed certificate past
+    /// expiry: within the renewal margin, regenerate it and swap it in.
+    async fn renew_self_signed(&self, now: SystemTime) -> ReloadOutcome {
+        let not_after = lock(&self.active).not_after;
+        let margin = Duration::from_secs(SELF_SIGNED_RENEW_DAYS * 86_400);
+        if not_after > now + margin {
+            return ReloadOutcome::NothingToReload;
+        }
+        let (loaded, _) =
+            match ensure_self_signed(&self.data_dir.join("tls"), &self.domain, now).await {
+                Ok(r) => r,
+                Err(e) => return ReloadOutcome::Failed(e),
+            };
+        self.resolver.set(Arc::clone(&loaded.key));
+        {
+            let mut a = lock(&self.active);
+            a.subject = loaded.subject;
+            a.not_after = loaded.not_after;
+        }
+        *lock(&self.last_expiry_warn) = None;
+        tracing::warn!(
+            "Regenerated the self-signed TLS certificate before it expires; its fingerprint \
+             changed. SHA-256 fingerprint: {}",
+            leaf_fingerprint(&loaded.key)
+        );
+        ReloadOutcome::Reloaded
+    }
+
     /// Log a WARN when the serving cert expires within 14 days, at most once
     /// per 24 h. Returns whether it warned.
     fn maybe_warn_expiry(&self, now: SystemTime) -> bool {
@@ -582,27 +637,7 @@ impl Tls {
         }
         *last = Some(now);
         drop(last);
-        if now >= st.not_after {
-            tracing::warn!(
-                "TLS certificate {} ({}) expired on {}; renew it (e.g. certbot renew)",
-                st.source,
-                st.subject,
-                rfc3339(st.not_after)
-            );
-        } else {
-            let days = st
-                .not_after
-                .duration_since(now)
-                .unwrap_or_default()
-                .as_secs()
-                / 86_400;
-            tracing::warn!(
-                "TLS certificate {} ({}) expires in {days} day(s), on {}; renew it (e.g. certbot renew)",
-                st.source,
-                st.subject,
-                rfc3339(st.not_after)
-            );
-        }
+        tracing::warn!("{}", expiry_message(&st, now));
         true
     }
 
@@ -1126,7 +1161,7 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
         assert!(r);
     }
 
-    // ---- Task 3: Tls handle ----
+    // ---- Tls handle ----
 
     use rustls::pki_types::ServerName;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -1450,6 +1485,62 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
         client.shutdown().await.unwrap();
         drop(client);
         echo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn running_self_signed_regenerates_near_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = now();
+        let tls = Tls::from_parts(TlsMode::Auto, no_env, dir.path(), "localhost", t0)
+            .await
+            .unwrap()
+            .unwrap();
+        let old_pem = fs::read(dir.path().join("tls/self-signed-cert.pem")).unwrap();
+        let old_not_after = tls.status().not_after;
+        // Well before the margin: nothing happens.
+        assert_eq!(
+            tls.reload_at(t0 + 100 * DAY).await,
+            ReloadOutcome::NothingToReload
+        );
+        // 20 days before expiry: regenerated and swapped in.
+        let later = old_not_after - 20 * DAY;
+        assert_eq!(tls.reload_at(later).await, ReloadOutcome::Reloaded);
+        let new_pem = fs::read(dir.path().join("tls/self-signed-cert.pem")).unwrap();
+        assert_ne!(old_pem, new_pem);
+        assert!(tls.status().not_after > old_not_after);
+        assert!(tls.status().self_signed);
+        // The resolver serves the new certificate (the one now on disk).
+        let on_disk = CertificateDer::from_pem_slice(&new_pem).unwrap();
+        assert_eq!(tls.resolver.current().cert[0].as_ref(), on_disk.as_ref());
+        // And now it is fresh again.
+        assert_eq!(
+            tls.reload_at(later + DAY).await,
+            ReloadOutcome::NothingToReload
+        );
+    }
+
+    #[test]
+    fn expiry_message_depends_on_source() {
+        let t = now();
+        let st = |self_signed| TlsStatus {
+            source: if self_signed {
+                "self-signed"
+            } else {
+                "/c/cert.pem"
+            }
+            .into(),
+            subject: "mail.example.com".into(),
+            not_after: t + 5 * DAY,
+            self_signed,
+        };
+        let m = expiry_message(&st(true), t);
+        assert!(m.contains("regenerated automatically"), "{m}");
+        assert!(!m.contains("certbot"), "{m}");
+        let m = expiry_message(&st(false), t);
+        assert!(m.contains("certbot renew"), "{m}");
+        assert!(m.contains("expires in 5 day(s)"), "{m}");
+        let m = expiry_message(&st(true), t + 6 * DAY);
+        assert!(m.contains("expired on") && !m.contains("certbot"), "{m}");
     }
 
     #[tokio::test]
