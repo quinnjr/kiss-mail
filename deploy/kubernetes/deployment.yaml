@@ -45,6 +45,16 @@ spec:
             - name: pop3
               containerPort: 1100
               protocol: TCP
+            # Implicit TLS
+            - name: smtps
+              containerPort: 4465
+              protocol: TCP
+            - name: imaps
+              containerPort: 1993
+              protocol: TCP
+            - name: pop3s
+              containerPort: 1995
+              protocol: TCP
             - name: web
               containerPort: 8080
               protocol: TCP
@@ -72,6 +82,14 @@ spec:
               mountPath: /data
             - name: tmp
               mountPath: /tmp
+            # Optional: certificate from a kubernetes.io/tls Secret (e.g.
+            # issued by cert-manager). Mount the whole Secret as a directory -
+            # never single files, which would hide renewals - and set KISS_MAIL_TLS_CERT
+            # and KISS_MAIL_TLS_KEY in configmap.yaml. Without it, the server
+            # uses /data/tls/cert.pem + key.pem or a self-signed certificate.
+            # - name: tls
+            #   mountPath: /etc/kiss-mail/tls
+            #   readOnly: true
           
           resources:
             requests:
@@ -110,6 +128,12 @@ spec:
             claimName: kiss-mail-data
         - name: tmp
           emptyDir: {}
+        # Optional: see the tls volumeMount above. defaultMode 0440 plus
+        # fsGroup 1000 lets uid 1000 read the key.
+        # - name: tls
+        #   secret:
+        #     secretName: kiss-mail-tls   # e.g. a cert-manager Certificate's secretName
+        #     defaultMode: 0440
       
       # Optional: Node selector
       # nodeSelector:

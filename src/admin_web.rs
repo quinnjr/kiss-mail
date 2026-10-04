@@ -1193,7 +1193,7 @@ pub async fn login_submit(
     let ip = peer_ip(&req);
     match data
         .user_manager
-        .authenticate(&form.username, &form.password, &ip, "admin-web")
+        .authenticate(&form.username, &form.password, &ip, "admin-web", false)
         .await
     {
         Ok(user) => {
@@ -1401,7 +1401,13 @@ pub async fn account_password_submit(
     let ip = peer_ip(&req);
     match data
         .user_manager
-        .change_password_from(&ip, username, &form.current_password, &form.new_password)
+        .change_password_from(
+            &ip,
+            username,
+            &form.current_password,
+            &form.new_password,
+            false,
+        )
         .await
     {
         Ok(()) => {

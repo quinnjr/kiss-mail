@@ -30,6 +30,21 @@ data:
   KISS_MAIL_POP3_PORT: "1100"
   KISS_MAIL_WEB_PORT: "8080"
   KISS_MAIL_API_PORT: "8025"
+  # Implicit TLS listeners
+  KISS_MAIL_SMTPS_PORT: "4465"
+  KISS_MAIL_IMAPS_PORT: "1993"
+  KISS_MAIL_POP3S_PORT: "1995"
+
+  # TLS for the mail protocols. "auto" (default): KISS_MAIL_TLS_CERT/KEY,
+  # else /data/tls/cert.pem + key.pem, else a self-signed certificate (mail
+  # clients warn; Outlook and Gmail refuse it). "off": no TLS at all.
+  KISS_MAIL_TLS: "auto"
+  # With the tls Secret mounted in deployment.yaml:
+  # KISS_MAIL_TLS_CERT: "/etc/kiss-mail/tls/tls.crt"
+  # KISS_MAIL_TLS_KEY: "/etc/kiss-mail/tls/tls.key"
+  # Logins without TLS are refused. Set "true" only while old clients still
+  # connect in the clear:
+  KISS_MAIL_ALLOW_PLAINTEXT_AUTH: "false"
   
   # Bind addresses
   KISS_MAIL_WEB_BIND: "0.0.0.0"

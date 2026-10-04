@@ -135,6 +135,33 @@ resource "vultr_firewall_rule" "pop3" {
   port              = "110"
 }
 
+resource "vultr_firewall_rule" "smtps" {
+  firewall_group_id = vultr_firewall_group.kiss_mail.id
+  protocol          = "tcp"
+  ip_type           = "v4"
+  subnet            = "0.0.0.0"
+  subnet_size       = 0
+  port              = "465"
+}
+
+resource "vultr_firewall_rule" "imaps" {
+  firewall_group_id = vultr_firewall_group.kiss_mail.id
+  protocol          = "tcp"
+  ip_type           = "v4"
+  subnet            = "0.0.0.0"
+  subnet_size       = 0
+  port              = "993"
+}
+
+resource "vultr_firewall_rule" "pop3s" {
+  firewall_group_id = vultr_firewall_group.kiss_mail.id
+  protocol          = "tcp"
+  ip_type           = "v4"
+  subnet            = "0.0.0.0"
+  subnet_size       = 0
+  port              = "995"
+}
+
 resource "vultr_firewall_rule" "http" {
   firewall_group_id = vultr_firewall_group.kiss_mail.id
   protocol          = "tcp"

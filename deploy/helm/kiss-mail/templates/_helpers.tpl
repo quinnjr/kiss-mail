@@ -103,6 +103,25 @@ variables.
 {{- end }}
 
 {{/*
+KISS_MAIL_TLS from tls.mode: "auto" or "off" (the boolean aliases true/on/yes
+and false/no are accepted too, including unquoted YAML booleans).
+*/}}
+{{- define "kiss-mail.tlsMode" -}}
+{{- $m := lower (toString .Values.tls.mode) -}}
+{{- if has $m (list "auto" "true" "on" "yes" "1") -}}auto
+{{- else if has $m (list "off" "false" "no" "0") -}}off
+{{- else -}}{{ fail (printf "tls.mode must be auto or off (got %q)" (toString .Values.tls.mode)) }}
+{{- end -}}
+{{- end }}
+
+{{/*
+"true" when the implicit TLS listeners (smtps/imaps/pop3s) are on.
+*/}}
+{{- define "kiss-mail.tlsEnabled" -}}
+{{- if eq (include "kiss-mail.tlsMode" .) "auto" -}}true{{- end -}}
+{{- end }}
+
+{{/*
 KISS_MAIL_WEB_SECURE_COOKIE: webAdmin.secureCookie when set, otherwise "true"
 only when the Ingress terminates TLS.
 */}}

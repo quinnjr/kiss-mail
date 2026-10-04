@@ -6,6 +6,36 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// How a protocol session ended: the connection is done, or the client
+/// negotiated STARTTLS/STLS and the caller must upgrade the stream `S`.
+pub(crate) enum SessionEnd<S> {
+    Closed,
+    StartTls(S),
+}
+
+/// Whether plaintext authentication is acceptable on a connection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TlsPolicy {
+    /// A TLS configuration is loaded, so STARTTLS/implicit TLS can be offered.
+    pub tls_available: bool,
+    /// `KISS_MAIL_ALLOW_PLAINTEXT_AUTH`: allow auth before TLS anyway.
+    pub allow_plaintext: bool,
+}
+
+impl TlsPolicy {
+    pub fn from_env(tls_available: bool) -> Self {
+        Self {
+            tls_available,
+            allow_plaintext: crate::config::env_bool("KISS_MAIL_ALLOW_PLAINTEXT_AUTH", false),
+        }
+    }
+
+    /// May credentials be exchanged on this connection?
+    pub fn secure(&self, on_tls: bool) -> bool {
+        on_tls || self.allow_plaintext || !self.tls_available
+    }
+}
+
 /// How long a single response write may take before the session is dropped
 /// (a client that stops reading must not pin a task forever).
 pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -260,6 +290,26 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
+    #[test]
+    fn tls_policy_secure_matrix() {
+        let p = TlsPolicy {
+            tls_available: true,
+            allow_plaintext: false,
+        };
+        assert!(!p.secure(false));
+        assert!(p.secure(true));
+        let p = TlsPolicy {
+            tls_available: true,
+            allow_plaintext: true,
+        };
+        assert!(p.secure(false));
+        let p = TlsPolicy {
+            tls_available: false,
+            allow_plaintext: false,
+        };
+        assert!(p.secure(false));
+    }
+
     async fn first_message_content(storage: &Storage) -> String {
         let meta = storage.message_meta("bob").await.unwrap();
         let ids = vec![meta[0].id.clone()];
@@ -272,7 +322,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = crate::storage::test_storage_encrypted(dir.path()).await;
         let outcome = storage
-            .login("bob", "password123", "127.0.0.1", "TEST")
+            .login("bob", "password123", "127.0.0.1", "TEST", false)
             .await
             .unwrap();
         let generation = outcome.key_generation.expect("keys unlocked");
@@ -292,7 +342,7 @@ mod tests {
 
         // `release` locks immediately; an empty lease is a no-op.
         let outcome = storage
-            .login("bob", "password123", "127.0.0.1", "TEST")
+            .login("bob", "password123", "127.0.0.1", "TEST", false)
             .await
             .unwrap();
         let mut lease = KeyLease::new(Arc::clone(&storage), "TEST");

@@ -25,6 +25,20 @@ spec:
       port: {{ .Values.ports.pop3 }}
       targetPort: pop3
       protocol: TCP
+    {{- if include "kiss-mail.tlsEnabled" . }}
+    - name: smtps
+      port: {{ .Values.ports.smtps }}
+      targetPort: smtps
+      protocol: TCP
+    - name: imaps
+      port: {{ .Values.ports.imaps }}
+      targetPort: imaps
+      protocol: TCP
+    - name: pop3s
+      port: {{ .Values.ports.pop3s }}
+      targetPort: pop3s
+      protocol: TCP
+    {{- end }}
     {{- if .Values.webAdmin.enabled }}
     - name: web
       port: {{ .Values.ports.web }}
@@ -71,6 +85,20 @@ spec:
       port: {{ .Values.externalService.ports.pop3 }}
       targetPort: pop3
       protocol: TCP
+    {{- if include "kiss-mail.tlsEnabled" . }}
+    - name: smtps
+      port: {{ .Values.externalService.ports.smtps }}
+      targetPort: smtps
+      protocol: TCP
+    - name: imaps
+      port: {{ .Values.externalService.ports.imaps }}
+      targetPort: imaps
+      protocol: TCP
+    - name: pop3s
+      port: {{ .Values.externalService.ports.pop3s }}
+      targetPort: pop3s
+      protocol: TCP
+    {{- end }}
   {{- with .Values.externalService.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:
     {{- toYaml . | nindent 4 }}

@@ -117,14 +117,18 @@ pub(crate) fn resolve_ports(
     ))
 }
 
-/// Standard ports when running as root, high ports otherwise.
-pub(crate) fn default_ports() -> (u16, u16, u16) {
+fn running_as_root() -> bool {
     // SAFETY: getuid() has no preconditions and cannot fail.
     #[cfg(unix)]
     let is_root = unsafe { libc::getuid() } == 0;
     #[cfg(not(unix))]
     let is_root = false;
-    if is_root {
+    is_root
+}
+
+/// Standard ports when running as root, high ports otherwise.
+pub(crate) fn default_ports() -> (u16, u16, u16) {
+    if running_as_root() {
         (25, 143, 110)
     } else {
         (2525, 1143, 1100)
@@ -134,6 +138,47 @@ pub(crate) fn default_ports() -> (u16, u16, u16) {
 /// Ports from the environment, falling back to `default_ports()`.
 pub(crate) fn configured_ports() -> Result<(u16, u16, u16), String> {
     resolve_ports(process_env, default_ports())
+}
+
+/// TLS listener ports (SMTPS, IMAPS, POP3S): 465/993/995 as root, otherwise
+/// 4465/1993/1995.
+pub(crate) fn default_tls_ports() -> (u16, u16, u16) {
+    if running_as_root() {
+        (465, 993, 995)
+    } else {
+        (4465, 1993, 1995)
+    }
+}
+
+/// TLS ports from an env lookup (`KISS_MAIL_SMTPS_PORT`, `KISS_MAIL_IMAPS_PORT`,
+/// `KISS_MAIL_POP3S_PORT`). A TLS port equal to any plain port is an error.
+pub(crate) fn resolve_tls_ports(
+    lookup: impl Fn(&str) -> Option<String>,
+    plain: (u16, u16, u16),
+) -> Result<(u16, u16, u16), String> {
+    let defaults = default_tls_ports();
+    let tls = (
+        resolve_port(&lookup, &["KISS_MAIL_SMTPS_PORT"], defaults.0)?,
+        resolve_port(&lookup, &["KISS_MAIL_IMAPS_PORT"], defaults.1)?,
+        resolve_port(&lookup, &["KISS_MAIL_POP3S_PORT"], defaults.2)?,
+    );
+    let tls_named = [("SMTPS", tls.0), ("IMAPS", tls.1), ("POP3S", tls.2)];
+    let plain_named = [("SMTP", plain.0), ("IMAP", plain.1), ("POP3", plain.2)];
+    for (tls_name, tls_port) in tls_named {
+        for (plain_name, plain_port) in plain_named {
+            if tls_port == plain_port {
+                return Err(format!(
+                    "{tls_name} port conflicts with {plain_name} port {plain_port}"
+                ));
+            }
+        }
+    }
+    Ok(tls)
+}
+
+/// TLS ports from the environment, falling back to `default_tls_ports()`.
+pub(crate) fn configured_tls_ports(plain: (u16, u16, u16)) -> Result<(u16, u16, u16), String> {
+    resolve_tls_ports(process_env, plain)
 }
 
 /// Mail domain: `KISS_MAIL_DOMAIN`, then the hostname, then `localhost`.
@@ -321,6 +366,46 @@ mod tests {
         }
         assert_eq!(parse_bool("maybe"), None);
         assert_eq!(parse_bool(""), None);
+    }
+
+    #[test]
+    fn tls_ports_defaults_and_errors() {
+        let plain = (2525, 1143, 1100);
+        // Not root in CI and dev; as root the defaults differ by design.
+        #[cfg(unix)]
+        if unsafe { libc::getuid() } != 0 {
+            assert_eq!(
+                resolve_tls_ports(env_of(&[]), plain),
+                Ok((4465, 1993, 1995))
+            );
+            assert_eq!(default_tls_ports(), (4465, 1993, 1995));
+        }
+        let err = resolve_tls_ports(env_of(&[("KISS_MAIL_IMAPS_PORT", "abc")]), plain).unwrap_err();
+        assert!(err.contains("KISS_MAIL_IMAPS_PORT"), "{err}");
+        let err =
+            resolve_tls_ports(env_of(&[("KISS_MAIL_IMAPS_PORT", "1143")]), plain).unwrap_err();
+        assert!(
+            err.contains("IMAPS port conflicts with IMAP port 1143"),
+            "{err}"
+        );
+        let err =
+            resolve_tls_ports(env_of(&[("KISS_MAIL_SMTPS_PORT", "2525")]), plain).unwrap_err();
+        assert!(
+            err.contains("SMTPS port conflicts with SMTP port 2525"),
+            "{err}"
+        );
+        let err =
+            resolve_tls_ports(env_of(&[("KISS_MAIL_POP3S_PORT", "1100")]), plain).unwrap_err();
+        assert!(
+            err.contains("POP3S port conflicts with POP3 port 1100"),
+            "{err}"
+        );
+        assert_eq!(
+            resolve_tls_ports(env_of(&[("KISS_MAIL_SMTPS_PORT", "5000")]), plain)
+                .unwrap()
+                .0,
+            5000
+        );
     }
 
     #[test]

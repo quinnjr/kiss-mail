@@ -6,16 +6,22 @@
 use crate::antispam::AntiSpam;
 use crate::antivirus::{AntiVirus, ClamavStatus};
 use crate::groups::GroupManager;
-use crate::proto::{decode_auth_plain, read_line_limited, write_all_timeout};
+use crate::proto::{
+    SessionEnd, TlsPolicy, accepted, decode_auth_plain, read_line_limited, write_all_timeout,
+};
 use crate::storage::{Email, MAX_EXPANDED_RECIPIENTS, Storage};
+use crate::tls::Tls;
 use crate::users::{QuotaError, canonical_username, local_part};
 use base64::Engine;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const SMTP_BANNER: &str = "220 kiss-mail ESMTP ready";
 const SMTP_OK: &str = "250 OK";
@@ -25,6 +31,9 @@ const SMTP_SYNTAX_ERROR: &str = "500 Syntax error, command unrecognized";
 const SMTP_BAD_SEQUENCE: &str = "503 Bad sequence of commands";
 const SMTP_TOO_MANY_RECIPIENTS: &str = "452 4.5.3 Too many recipients";
 const SMTP_MESSAGE_TOO_BIG: &str = "552 5.3.4 Message size exceeds fixed maximum message size";
+const SMTP_STARTTLS_READY: &str = "220 2.0.0 Ready to start TLS";
+const SMTP_ENCRYPTION_REQUIRED: &str =
+    "538 5.7.11 Encryption required for requested authentication mechanism";
 
 /// Maximum accepted message size (advertised via the SIZE extension).
 pub const MAX_MESSAGE_SIZE: usize = 10_485_760;
@@ -71,6 +80,21 @@ struct SmtpSession {
     auth_username: Option<String>,
     auth_state: AuthState,
     peer_ip: String,
+    /// The session runs over TLS (implicit, or after STARTTLS).
+    tls: bool,
+    /// Implicit-TLS submission listener: MAIL requires a prior AUTH.
+    submission: bool,
+}
+
+/// How a session starts (see `handle_smtp_connection`).
+#[derive(Debug, Clone, Copy)]
+struct SessionOpts {
+    /// The stream is TLS-protected.
+    tls: bool,
+    /// Send the 220 greeting (not after STARTTLS: RFC 3207 section 4.2).
+    greet: bool,
+    /// Submission listener: MAIL before AUTH gets 530.
+    submission: bool,
 }
 
 impl SmtpSession {
@@ -96,6 +120,9 @@ struct SmtpContext {
     data_total_timeout: Duration,
     write_timeout: Duration,
     max_message_size: usize,
+    /// TLS for STARTTLS and the implicit-TLS listener (`None`: TLS off).
+    tls: Option<Arc<Tls>>,
+    policy: TlsPolicy,
 }
 
 impl SmtpContext {
@@ -105,6 +132,8 @@ impl SmtpContext {
         antispam: Arc<AntiSpam>,
         antivirus: Arc<AntiVirus>,
         hostname: String,
+        tls: Option<Arc<Tls>>,
+        policy: TlsPolicy,
     ) -> Self {
         Self {
             storage,
@@ -112,6 +141,8 @@ impl SmtpContext {
             antispam,
             antivirus,
             hostname,
+            tls,
+            policy,
             data_slots: Semaphore::new(MAX_CONCURRENT_DATA),
             command_timeout: COMMAND_TIMEOUT,
             data_line_timeout: DATA_LINE_TIMEOUT,
@@ -133,53 +164,189 @@ impl SmtpServer {
         antispam: Arc<AntiSpam>,
         antivirus: Arc<AntiVirus>,
         hostname: String,
+        tls: Option<Arc<Tls>>,
+        policy: TlsPolicy,
     ) -> Self {
+        // The STARTTLS offer and the TLS-required policy must never disagree.
+        debug_assert_eq!(
+            tls.is_some(),
+            policy.tls_available,
+            "TLS presence and TlsPolicy disagree"
+        );
         Self {
             ctx: Arc::new(SmtpContext::new(
-                storage, groups, antispam, antivirus, hostname,
+                storage, groups, antispam, antivirus, hostname, tls, policy,
             )),
         }
     }
 
-    pub async fn run(&self, addr: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!("SMTP server listening on {}", addr);
+    /// Serve the plain listener on `plain_addr` and, when `tls_addr` is set,
+    /// the implicit-TLS submission listener. Both share one connection limit
+    /// and one context (so `data_slots` is shared too).
+    pub async fn run(
+        &self,
+        plain_addr: &str,
+        tls_addr: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let plain = TcpListener::bind(plain_addr)
+            .await
+            .map_err(|e| format!("SMTP: cannot bind {}: {}", plain_addr, e))?;
+        tracing::info!("SMTP server listening on {}", plain_addr);
+        let implicit = match tls_addr {
+            None => None,
+            Some(addr) => {
+                if self.ctx.tls.is_none() {
+                    return Err("SMTPS: TLS is not configured".into());
+                }
+                let listener = TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| format!("SMTPS: cannot bind {}: {}", addr, e))?;
+                tracing::info!("SMTPS (implicit TLS) server listening on {}", addr);
+                Some(listener)
+            }
+        };
         let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
-        loop {
-            // Wait for a free slot before accepting, so excess clients queue
-            // in the kernel backlog instead of consuming tasks.
-            let permit = Arc::clone(&connections).acquire_owned().await?;
-            let (socket, peer_addr) = match listener.accept().await {
-                Ok(conn) => conn,
+        let plain_loop = accept_loop(
+            plain,
+            "SMTP",
+            false,
+            Arc::clone(&self.ctx),
+            Arc::clone(&connections),
+        );
+        let implicit_loop = async {
+            match implicit {
+                Some(listener) => {
+                    accept_loop(
+                        listener,
+                        "SMTPS",
+                        true,
+                        Arc::clone(&self.ctx),
+                        Arc::clone(&connections),
+                    )
+                    .await
+                }
+                None => std::future::pending().await,
+            }
+        };
+        tokio::try_join!(plain_loop, implicit_loop)?;
+        Ok(())
+    }
+}
+
+/// Accept connections on `listener` until the connection semaphore closes.
+async fn accept_loop(
+    listener: TcpListener,
+    name: &'static str,
+    implicit: bool,
+    ctx: Arc<SmtpContext>,
+    connections: Arc<Semaphore>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        // Wait for a free slot before accepting, so excess clients queue in
+        // the kernel backlog instead of consuming tasks.
+        let permit = Arc::clone(&connections)
+            .acquire_owned()
+            .await
+            .map_err(|e| format!("{}: {}", name, e))?;
+        let Some((socket, peer_addr)) = accepted(name, listener.accept().await).await else {
+            continue;
+        };
+        tracing::info!("{} connection from {}", name, peer_addr);
+        tokio::spawn(handle_connection(
+            socket,
+            peer_addr,
+            Arc::clone(&ctx),
+            implicit,
+            permit,
+        ));
+    }
+}
+
+/// Serve one accepted connection while holding its connection-slot
+/// `permit`. The session runs in its own task so a panic is logged here (and
+/// the slot released) instead of being lost.
+async fn handle_connection<S>(
+    stream: S,
+    peer_addr: SocketAddr,
+    ctx: Arc<SmtpContext>,
+    implicit: bool,
+    permit: OwnedSemaphorePermit,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let _permit = permit;
+    let peer_ip = peer_addr.ip().to_string();
+    let inner = tokio::spawn(serve_connection(stream, peer_ip, ctx, implicit));
+    match inner.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("SMTP connection error ({}): {}", peer_addr, e),
+        Err(e) if e.is_panic() => {
+            tracing::error!("SMTP connection task for {} panicked: {}", peer_addr, e)
+        }
+        Err(e) => tracing::error!("SMTP connection task for {} failed: {}", peer_addr, e),
+    }
+}
+
+/// The session restart sequence (spec section 3.2). On the implicit-TLS
+/// listener the handshake comes first and the session is a submission
+/// session; on the plain listener an accepted STARTTLS restarts the session
+/// over TLS with fresh state and no greeting. A failed or timed-out
+/// handshake just closes the connection (no reply is possible).
+async fn serve_connection<S>(
+    stream: S,
+    peer_ip: String,
+    ctx: Arc<SmtpContext>,
+    implicit: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if implicit {
+        let Some(tls) = ctx.tls.clone() else {
+            return Err("SMTPS connection without a TLS configuration".into());
+        };
+        let stream = match tls.accept(stream).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::debug!("SMTPS handshake with {} failed: {}", peer_ip, e);
+                return Ok(());
+            }
+        };
+        let opts = SessionOpts {
+            tls: true,
+            greet: true,
+            submission: true,
+        };
+        handle_smtp_connection(stream, peer_ip, ctx, opts).await?;
+        return Ok(());
+    }
+
+    let opts = SessionOpts {
+        tls: false,
+        greet: true,
+        submission: false,
+    };
+    match handle_smtp_connection(stream, peer_ip.clone(), Arc::clone(&ctx), opts).await? {
+        SessionEnd::Closed => Ok(()),
+        SessionEnd::StartTls(raw) => {
+            let Some(tls) = ctx.tls.clone() else {
+                return Err("STARTTLS accepted without a TLS configuration".into());
+            };
+            let stream = match tls.accept(raw).await {
+                Ok(stream) => stream,
                 Err(e) => {
-                    tracing::warn!("SMTP accept failed: {}", e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
+                    tracing::debug!("SMTP STARTTLS handshake with {} failed: {}", peer_ip, e);
+                    return Ok(());
                 }
             };
-            tracing::info!("SMTP connection from {}", peer_addr);
-
-            let ctx = Arc::clone(&self.ctx);
-            let peer_ip = peer_addr.ip().to_string();
-
-            tokio::spawn(async move {
-                let _permit = permit;
-                let (reader, writer) = socket.into_split();
-                let inner = tokio::spawn(async move {
-                    handle_smtp_connection(BufReader::new(reader), writer, ctx, peer_ip).await
-                });
-                match inner.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::error!("SMTP connection error ({}): {}", peer_addr, e),
-                    Err(e) if e.is_panic() => {
-                        tracing::error!("SMTP connection task for {} panicked: {}", peer_addr, e)
-                    }
-                    Err(e) => {
-                        tracing::error!("SMTP connection task for {} failed: {}", peer_addr, e)
-                    }
-                }
-            });
+            let opts = SessionOpts {
+                tls: true,
+                greet: false,
+                submission: false,
+            };
+            handle_smtp_connection(stream, peer_ip, ctx, opts).await?;
+            Ok(())
         }
     }
 }
@@ -199,23 +366,34 @@ async fn send<W: AsyncWrite + Unpin>(
     .await
 }
 
-async fn handle_smtp_connection<R, W>(
-    mut reader: R,
-    mut writer: W,
-    ctx: Arc<SmtpContext>,
+/// Run one SMTP session over `stream`.
+///
+/// Returns `SessionEnd::StartTls` with the raw stream once STARTTLS has been
+/// accepted (the caller performs the handshake and starts a fresh session).
+/// Client bytes already buffered at that point are discarded with the
+/// `BufReader`, so commands pipelined after STARTTLS never run under TLS.
+async fn handle_smtp_connection<S>(
+    stream: S,
     peer_ip: String,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    ctx: Arc<SmtpContext>,
+    opts: SessionOpts,
+) -> Result<SessionEnd<S>, Box<dyn std::error::Error + Send + Sync>>
 where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
     let mut session = SmtpSession {
         peer_ip,
+        tls: opts.tls,
+        submission: opts.submission,
         ..Default::default()
     };
     let timeout_reply = format!("421 4.4.2 {} Timeout", ctx.hostname);
 
-    send(&mut writer, SMTP_BANNER, &ctx).await?;
+    if opts.greet {
+        send(&mut writer, SMTP_BANNER, &ctx).await?;
+    }
 
     loop {
         let read = tokio::time::timeout(
@@ -302,12 +480,20 @@ where
         tracing::debug!("SMTP -> {}", response);
         send(&mut writer, &response, &ctx).await?;
 
+        if response == SMTP_STARTTLS_READY {
+            // Dropping the BufReader discards any pipelined client bytes.
+            return Ok(SessionEnd::StartTls(reader.into_inner().unsplit(writer)));
+        }
         if response.starts_with("221") {
             break;
         }
     }
 
-    Ok(())
+    if opts.tls {
+        // Send close_notify (bounded, errors ignored: the session is over).
+        let _ = tokio::time::timeout(ctx.write_timeout, writer.shutdown()).await;
+    }
+    Ok(SessionEnd::Closed)
 }
 
 /// Process one received line (a command, or AUTH continuation data).
@@ -571,10 +757,12 @@ fn strip_controls(s: &str) -> String {
 /// Build an RFC 5321 `Received:` trace header (without trailing CRLF).
 fn received_header(session: &SmtpSession, hostname: &str, recipients: &[String]) -> String {
     let helo = strip_controls(session.helo_domain.as_deref().unwrap_or("unknown"));
-    let with = if session.authenticated {
-        "ESMTPA"
-    } else {
-        "ESMTP"
+    // RFC 3848 transmission types.
+    let with = match (session.tls, session.authenticated) {
+        (false, false) => "ESMTP",
+        (false, true) => "ESMTPA",
+        (true, false) => "ESMTPS",
+        (true, true) => "ESMTPSA",
     };
     let for_clause = match recipients {
         [single] => format!("\r\n\tfor <{}>", strip_controls(single)),
@@ -675,13 +863,48 @@ async fn process_smtp_command(line: &str, session: &mut SmtpSession, ctx: &SmtpC
             if cmd == "HELO" {
                 format!("250 {} Hello {}", hostname, domain)
             } else {
-                format!(
-                    "250-{} Hello {}\r\n250-SIZE {}\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-AUTH PLAIN LOGIN\r\n250 OK",
+                let mut ehlo = format!(
+                    "250-{} Hello {}\r\n250-SIZE {}\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n",
                     hostname, domain, ctx.max_message_size
-                )
+                );
+                if ctx.tls.is_some() && !session.tls && !session.authenticated {
+                    ehlo.push_str("250-STARTTLS\r\n");
+                }
+                if ctx.policy.secure(session.tls) {
+                    ehlo.push_str("250-AUTH PLAIN LOGIN\r\n");
+                }
+                ehlo.push_str("250 OK");
+                ehlo
             }
         }
+        "STARTTLS" => {
+            // Not advertised without TLS: an unknown command, as before.
+            if ctx.tls.is_none() {
+                return SMTP_SYNTAX_ERROR.to_string();
+            }
+            if parts.get(1).is_some_and(|arg| !arg.trim().is_empty()) {
+                return "501 5.5.4 Syntax error".to_string();
+            }
+            if session.tls {
+                return "554 5.5.1 TLS already active".to_string();
+            }
+            if session.helo_domain.is_none() {
+                return "503 5.5.1 Send EHLO first".to_string();
+            }
+            if session.authenticated {
+                return "503 5.5.1 STARTTLS not permitted after AUTH".to_string();
+            }
+            // The caller restarts the session over TLS with fresh state,
+            // discarding any transaction in progress (RFC 3207 section 4.2).
+            SMTP_STARTTLS_READY.to_string()
+        }
         "AUTH" => {
+            // Privacy check first (RFC 4954 section 6): before any 334
+            // continuation, before decoding an initial response, and without
+            // touching the password check, throttle or login history.
+            if !ctx.policy.secure(session.tls) {
+                return SMTP_ENCRYPTION_REQUIRED.to_string();
+            }
             if session.authenticated {
                 return SMTP_BAD_SEQUENCE.to_string();
             }
@@ -725,6 +948,9 @@ async fn process_smtp_command(line: &str, session: &mut SmtpSession, ctx: &SmtpC
             }
             if session.mail_from.is_some() {
                 return "503 Nested MAIL command".to_string();
+            }
+            if session.submission && !session.authenticated {
+                return "530 5.7.0 Authentication required".to_string();
             }
 
             if upper.starts_with("MAIL FROM:") {
@@ -915,7 +1141,7 @@ async fn finish_auth(
     storage: &Storage,
 ) -> String {
     match storage
-        .authenticate_full(username, password, &session.peer_ip, "SMTP")
+        .authenticate_full(username, password, &session.peer_ip, "SMTP", session.tls)
         .await
     {
         Ok(account) => {
@@ -1069,7 +1295,7 @@ mod tests {
     use crate::users::UserManager;
     use std::path::Path;
     use tempfile::tempdir;
-    use tokio::io::{AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
+    use tokio::io::{AsyncRead, AsyncWriteExt, DuplexStream};
 
     const DOMAIN: &str = "example.com";
     const PW: &str = "password123";
@@ -1117,7 +1343,34 @@ mod tests {
             Arc::new(AntiSpam::new(dir.to_path_buf())),
             Arc::new(antivirus),
             "mail.example.com".to_string(),
+            None,
+            TLS_OFF,
         )
+    }
+
+    /// TLS not configured: no STARTTLS, AUTH allowed in plaintext.
+    const TLS_OFF: TlsPolicy = TlsPolicy {
+        tls_available: false,
+        allow_plaintext: false,
+    };
+    /// TLS configured, plaintext AUTH refused (the default).
+    const TLS_REQUIRED: TlsPolicy = TlsPolicy {
+        tls_available: true,
+        allow_plaintext: false,
+    };
+    /// Plain session opts as used on port 25/587.
+    const PLAIN: SessionOpts = SessionOpts {
+        tls: false,
+        greet: true,
+        submission: false,
+    };
+
+    /// Like `test_ctx`, with a self-signed `Tls` (in `dir/tls`) and `policy`.
+    async fn tls_ctx(dir: &Path, policy: TlsPolicy) -> SmtpContext {
+        let mut ctx = test_ctx(dir).await;
+        ctx.tls = Some(crate::tls::test_support::self_signed(dir).await);
+        ctx.policy = policy;
+        ctx
     }
 
     async fn test_ctx(dir: &Path) -> SmtpContext {
@@ -1232,12 +1485,11 @@ mod tests {
         ctx.command_timeout = Duration::from_millis(50);
         let ctx = Arc::new(ctx);
         let (client, server) = tokio::io::duplex(4096);
-        let (server_r, server_w) = tokio::io::split(server);
         let handle = tokio::spawn(handle_smtp_connection(
-            BufReader::new(server_r),
-            server_w,
-            ctx,
+            server,
             "127.0.0.1".to_string(),
+            ctx,
+            PLAIN,
         ));
         let mut client = BufReader::new(client);
         let mut line = String::new();
@@ -1246,7 +1498,7 @@ mod tests {
         line.clear();
         client.read_line(&mut line).await.unwrap();
         assert_eq!(line, "421 4.4.2 mail.example.com Timeout\r\n");
-        handle.await.unwrap().unwrap();
+        assert!(matches!(handle.await.unwrap().unwrap(), SessionEnd::Closed));
     }
 
     #[test]
@@ -1758,24 +2010,60 @@ mod tests {
     // ---- Full sessions over an in-memory duplex stream ----
 
     type Client = BufReader<DuplexStream>;
-    type SessionTask =
-        tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
+    type TlsClient = BufReader<tokio_rustls::client::TlsStream<DuplexStream>>;
+    type SessionTask = tokio::task::JoinHandle<
+        Result<SessionEnd<DuplexStream>, Box<dyn std::error::Error + Send + Sync>>,
+    >;
+    type ConnTask = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 
-    fn start_session(ctx: Arc<SmtpContext>) -> (Client, SessionTask) {
+    /// One session (`handle_smtp_connection`) over an in-memory stream.
+    fn start_session(ctx: Arc<SmtpContext>, opts: SessionOpts) -> (Client, SessionTask) {
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let (server_r, server_w): (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>) =
-            tokio::io::split(server);
         let handle = tokio::spawn(handle_smtp_connection(
-            BufReader::new(server_r),
-            server_w,
-            ctx,
+            server,
             "127.0.0.1".to_string(),
+            ctx,
+            opts,
         ));
         (BufReader::new(client), handle)
     }
 
+    /// A whole connection (the §3.2 sequence, `serve_connection`) over an
+    /// in-memory stream, as on the plain or the implicit-TLS listener.
+    fn start_conn(ctx: Arc<SmtpContext>, implicit: bool) -> (Client, ConnTask) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(serve_connection(
+            server,
+            "127.0.0.1".to_string(),
+            ctx,
+            implicit,
+        ));
+        (BufReader::new(client), handle)
+    }
+
+    /// Run the client side of the TLS handshake on `c`'s stream.
+    async fn upgrade(dir: &Path, c: Client) -> TlsClient {
+        assert!(c.buffer().is_empty(), "unread server bytes before TLS");
+        BufReader::new(
+            crate::tls::test_support::connect(dir, c.into_inner())
+                .await
+                .expect("client handshake"),
+        )
+    }
+
+    /// After QUIT or a timeout on TLS the server sent close_notify: the
+    /// client sees a clean EOF (rustls reports `UnexpectedEof` otherwise).
+    async fn assert_clean_tls_eof(c: &mut TlsClient) {
+        let mut rest = String::new();
+        assert_eq!(c.read_line(&mut rest).await.unwrap(), 0, "{:?}", rest);
+    }
+
+    fn auth_plain_line(user: &str) -> String {
+        format!("AUTH PLAIN {}", b64(&format!("\0{}\0{}", user, PW)))
+    }
+
     /// Read one (possibly multi-line) reply.
-    async fn reply(client: &mut Client) -> String {
+    async fn reply<S: AsyncRead + AsyncWrite + Unpin>(client: &mut BufReader<S>) -> String {
         let mut out = String::new();
         loop {
             let mut line = String::new();
@@ -1788,7 +2076,10 @@ mod tests {
         }
     }
 
-    async fn send_line(client: &mut Client, line: &str) -> String {
+    async fn send_line<S: AsyncRead + AsyncWrite + Unpin>(
+        client: &mut BufReader<S>,
+        line: &str,
+    ) -> String {
         client
             .write_all(format!("{}\r\n", line).as_bytes())
             .await
@@ -1800,7 +2091,7 @@ mod tests {
     async fn smtp_session_over_duplex_delivers_and_resets() {
         let dir = tempdir().unwrap();
         let ctx = Arc::new(test_ctx(dir.path()).await);
-        let (mut c, handle) = start_session(Arc::clone(&ctx));
+        let (mut c, handle) = start_session(Arc::clone(&ctx), PLAIN);
         assert!(reply(&mut c).await.starts_with("220"));
         let ehlo = send_line(&mut c, "EHLO client.example.org").await;
         assert!(ehlo.contains("250-ENHANCEDSTATUSCODES\r\n"), "{}", ehlo);
@@ -1828,7 +2119,7 @@ mod tests {
                 .starts_with("503")
         );
         assert!(send_line(&mut c, "QUIT").await.starts_with("221"));
-        handle.await.unwrap().unwrap();
+        assert!(matches!(handle.await.unwrap().unwrap(), SessionEnd::Closed));
         // All processing slots were released.
         assert_eq!(ctx.data_slots.available_permits(), MAX_CONCURRENT_DATA);
     }
@@ -1839,7 +2130,7 @@ mod tests {
         let mut ctx = test_ctx(dir.path()).await;
         ctx.max_message_size = 200;
         let ctx = Arc::new(ctx);
-        let (mut c, handle) = start_session(Arc::clone(&ctx));
+        let (mut c, handle) = start_session(Arc::clone(&ctx), PLAIN);
         reply(&mut c).await;
         let ehlo = send_line(&mut c, "EHLO client.example.org").await;
         assert!(ehlo.contains("250-SIZE 200\r\n"), "{}", ehlo);
@@ -1855,7 +2146,7 @@ mod tests {
         assert_eq!(send_line(&mut c, "NOOP").await, "250 OK\r\n");
         assert!(send_line(&mut c, "DATA").await.starts_with("503"));
         assert!(send_line(&mut c, "QUIT").await.starts_with("221"));
-        handle.await.unwrap().unwrap();
+        assert!(matches!(handle.await.unwrap().unwrap(), SessionEnd::Closed));
     }
 
     #[tokio::test]
@@ -1895,7 +2186,10 @@ mod tests {
         let saved = std::fs::read_to_string(dir.path().join("mailboxes.json")).unwrap();
         assert!(!saved.contains("TOP-SECRET-SMTP-BODY"));
 
-        let outcome = storage.login("bob", PW, "127.0.0.1", "IMAP").await.unwrap();
+        let outcome = storage
+            .login("bob", PW, "127.0.0.1", "IMAP", false)
+            .await
+            .unwrap();
         assert!(outcome.key_generation.is_some());
         let content = storage.email_content("bob", &email).await;
         assert!(content.contains("TOP-SECRET-SMTP-BODY"));
@@ -2061,5 +2355,431 @@ mod tests {
         );
         let reply = process_message(&message(), &s, &ctx).await;
         assert!(reply.starts_with("550 5.1.1"), "{}", reply);
+    }
+
+    // ---- TLS: STARTTLS, TLS-required AUTH, implicit-TLS submission ----
+
+    const ENCRYPTION_REQUIRED: &str =
+        "538 5.7.11 Encryption required for requested authentication mechanism";
+
+    #[tokio::test]
+    async fn ehlo_plain_lists_starttls_not_auth() {
+        let dir = tempdir().unwrap();
+        let ctx = tls_ctx(dir.path(), TLS_REQUIRED).await;
+        let mut s = session();
+        let ehlo = cmd("EHLO client.example.org", &mut s, &ctx).await;
+        assert!(ehlo.contains("\r\n250-STARTTLS\r\n"), "{}", ehlo);
+        assert!(!ehlo.contains("AUTH"), "{}", ehlo);
+        assert!(ehlo.contains("250-ENHANCEDSTATUSCODES\r\n"), "{}", ehlo);
+        assert!(ehlo.ends_with("\r\n250 OK"), "{}", ehlo);
+    }
+
+    #[tokio::test]
+    async fn auth_plain_ir_before_tls_is_538_without_throttle_or_history() {
+        let dir = tempdir().unwrap();
+        let ctx = tls_ctx(dir.path(), TLS_REQUIRED).await;
+        let users = ctx.storage.user_manager();
+        let before = users.get_user("bob").await.unwrap();
+        let mut s = session();
+        cmd("EHLO client.example.org", &mut s, &ctx).await;
+
+        // Valid credentials, an undecodable initial response, and the
+        // continuation forms: all refused before any 334 or decoding.
+        for line in [
+            auth_plain_line("bob"),
+            "AUTH PLAIN !!not-base64!!".to_string(),
+            "AUTH PLAIN".to_string(),
+            "AUTH LOGIN".to_string(),
+            format!("AUTH LOGIN {}", b64("bob")),
+            "AUTH CRAM-MD5".to_string(),
+        ] {
+            assert_eq!(
+                cmd(&line, &mut s, &ctx).await,
+                ENCRYPTION_REQUIRED,
+                "{line}"
+            );
+            assert_eq!(s.auth_state, AuthState::None, "{line}");
+            assert!(!s.authenticated);
+        }
+        // The next line is a command again, not SASL data.
+        assert_eq!(cmd("NOOP", &mut s, &ctx).await, SMTP_OK);
+
+        let after = users.get_user("bob").await.unwrap();
+        assert_eq!(after.login_history.len(), before.login_history.len());
+        assert!(after.login_history.is_empty());
+        assert_eq!(after.failed_login_attempts, before.failed_login_attempts);
+        assert_eq!(users.throttle_sizes(), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn starttls_before_ehlo_is_503() {
+        let dir = tempdir().unwrap();
+        let ctx = tls_ctx(dir.path(), TLS_REQUIRED).await;
+        let mut s = session();
+        assert_eq!(
+            cmd("STARTTLS", &mut s, &ctx).await,
+            "503 5.5.1 Send EHLO first"
+        );
+    }
+
+    #[tokio::test]
+    async fn starttls_with_argument_is_501() {
+        let dir = tempdir().unwrap();
+        let ctx = tls_ctx(dir.path(), TLS_REQUIRED).await;
+        let mut s = session();
+        cmd("EHLO client.example.org", &mut s, &ctx).await;
+        assert_eq!(
+            cmd("STARTTLS now", &mut s, &ctx).await,
+            "501 5.5.4 Syntax error"
+        );
+    }
+
+    #[tokio::test]
+    async fn starttls_upgrade_resets_state() {
+        let dir = tempdir().unwrap();
+        let ctx = Arc::new(tls_ctx(dir.path(), TLS_REQUIRED).await);
+        let (mut c, handle) = start_conn(Arc::clone(&ctx), false);
+        assert!(reply(&mut c).await.starts_with("220 "));
+        send_line(&mut c, "EHLO client.example.org").await;
+        // A transaction in progress is discarded by STARTTLS.
+        assert_eq!(
+            send_line(&mut c, "MAIL FROM:<alice@sender.example.org>").await,
+            "250 OK\r\n"
+        );
+        assert_eq!(
+            send_line(&mut c, "STARTTLS").await,
+            "220 2.0.0 Ready to start TLS\r\n"
+        );
+        let mut c = upgrade(dir.path(), c).await;
+
+        // No greeting after the handshake (the first reply read is MAIL's),
+        // and no HELO name is carried over.
+        assert!(
+            send_line(&mut c, "MAIL FROM:<alice@sender.example.org>")
+                .await
+                .starts_with("503"),
+        );
+        let ehlo = send_line(&mut c, "EHLO client.example.org").await;
+        assert!(ehlo.contains("250-AUTH PLAIN LOGIN\r\n"), "{}", ehlo);
+        assert!(!ehlo.contains("STARTTLS"), "{}", ehlo);
+        // The pre-TLS transaction is gone.
+        assert!(
+            send_line(&mut c, "RCPT TO:<bob@example.com>")
+                .await
+                .starts_with("503")
+        );
+        assert_eq!(
+            send_line(&mut c, &auth_plain_line("bob")).await,
+            "235 2.7.0 Authentication successful\r\n"
+        );
+        let bob = ctx.storage.user_manager().get_user("bob").await.unwrap();
+        let rec = bob.login_history.last().unwrap();
+        assert!(rec.success);
+        assert!(rec.tls);
+        assert_eq!(rec.protocol, "SMTP");
+
+        assert!(send_line(&mut c, "QUIT").await.starts_with("221"));
+        assert_clean_tls_eof(&mut c).await;
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn second_starttls_is_554() {
+        let dir = tempdir().unwrap();
+        let ctx = Arc::new(tls_ctx(dir.path(), TLS_REQUIRED).await);
+        let (mut c, handle) = start_conn(Arc::clone(&ctx), false);
+        reply(&mut c).await;
+        send_line(&mut c, "EHLO client.example.org").await;
+        assert!(send_line(&mut c, "STARTTLS").await.starts_with("220 2.0.0"));
+        let mut c = upgrade(dir.path(), c).await;
+        // Before EHLO, and after EHLO + AUTH: TLS is already active.
+        assert_eq!(
+            send_line(&mut c, "STARTTLS").await,
+            "554 5.5.1 TLS already active\r\n"
+        );
+        send_line(&mut c, "EHLO client.example.org").await;
+        assert!(
+            send_line(&mut c, &auth_plain_line("bob"))
+                .await
+                .starts_with("235")
+        );
+        assert_eq!(
+            send_line(&mut c, "STARTTLS").await,
+            "554 5.5.1 TLS already active\r\n"
+        );
+        assert!(send_line(&mut c, "QUIT").await.starts_with("221"));
+        assert_clean_tls_eof(&mut c).await;
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn starttls_after_auth_is_503() {
+        let dir = tempdir().unwrap();
+        let policy = TlsPolicy {
+            tls_available: true,
+            allow_plaintext: true,
+        };
+        let ctx = tls_ctx(dir.path(), policy).await;
+        let mut s = session();
+        let ehlo = cmd("EHLO client.example.org", &mut s, &ctx).await;
+        assert!(ehlo.contains("250-STARTTLS\r\n"), "{}", ehlo);
+        assert!(ehlo.contains("250-AUTH PLAIN LOGIN\r\n"), "{}", ehlo);
+        authenticate(&mut s, &ctx, "bob").await;
+        let ehlo = cmd("EHLO client.example.org", &mut s, &ctx).await;
+        assert!(!ehlo.contains("STARTTLS"), "{}", ehlo);
+        assert_eq!(
+            cmd("STARTTLS", &mut s, &ctx).await,
+            "503 5.5.1 STARTTLS not permitted after AUTH"
+        );
+        // The plaintext login is recorded as such.
+        let bob = ctx.storage.user_manager().get_user("bob").await.unwrap();
+        assert!(!bob.login_history.last().unwrap().tls);
+    }
+
+    #[tokio::test]
+    async fn tls_off_starttls_is_500_and_auth_advertised() {
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path()).await;
+        let mut s = session();
+        let ehlo = cmd("EHLO client.example.org", &mut s, &ctx).await;
+        assert!(ehlo.contains("250-AUTH PLAIN LOGIN\r\n"), "{}", ehlo);
+        assert!(!ehlo.contains("STARTTLS"), "{}", ehlo);
+        assert_eq!(cmd("STARTTLS", &mut s, &ctx).await, SMTP_SYNTAX_ERROR);
+        assert_eq!(cmd("STARTTLS x", &mut s, &ctx).await, SMTP_SYNTAX_ERROR);
+        assert_eq!(SMTP_SYNTAX_ERROR, "500 Syntax error, command unrecognized");
+        authenticate(&mut s, &ctx, "bob").await;
+    }
+
+    /// EHLO, MAIL, RCPT, DATA and a message to bob; returns the final reply.
+    async fn deliver_unauthenticated<S: AsyncRead + AsyncWrite + Unpin>(
+        c: &mut BufReader<S>,
+    ) -> String {
+        assert!(
+            send_line(c, "EHLO client.example.org")
+                .await
+                .starts_with("250-")
+        );
+        assert_eq!(
+            send_line(c, "MAIL FROM:<alice@sender.example.org>").await,
+            "250 OK\r\n"
+        );
+        assert_eq!(
+            send_line(c, "RCPT TO:<bob@example.com>").await,
+            "250 OK\r\n"
+        );
+        assert!(send_line(c, "DATA").await.starts_with("354"));
+        c.write_all(message().as_bytes()).await.unwrap();
+        send_line(c, ".").await
+    }
+
+    async fn last_raw(ctx: &SmtpContext, user: &str) -> String {
+        let mailbox = ctx.storage.get_mailbox(user).await.unwrap();
+        mailbox.emails.last().unwrap().raw.clone()
+    }
+
+    #[tokio::test]
+    async fn plain_port25_delivery_without_tls_still_works() {
+        let dir = tempdir().unwrap();
+        let ctx = Arc::new(tls_ctx(dir.path(), TLS_REQUIRED).await);
+        let (mut c, handle) = start_conn(Arc::clone(&ctx), false);
+        assert!(reply(&mut c).await.starts_with("220 "));
+        assert_eq!(
+            deliver_unauthenticated(&mut c).await,
+            "250 Message accepted\r\n"
+        );
+        assert_eq!(mailbox_len(&ctx, "bob").await, 1);
+        assert!(last_raw(&ctx, "bob").await.contains(" with ESMTP id "));
+        assert!(send_line(&mut c, "QUIT").await.starts_with("221"));
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn received_header_says_esmtps_on_tls() {
+        let dir = tempdir().unwrap();
+        let ctx = Arc::new(tls_ctx(dir.path(), TLS_REQUIRED).await);
+        let (mut c, handle) = start_conn(Arc::clone(&ctx), false);
+        reply(&mut c).await;
+        send_line(&mut c, "EHLO client.example.org").await;
+        assert!(send_line(&mut c, "STARTTLS").await.starts_with("220 2.0.0"));
+        let mut c = upgrade(dir.path(), c).await;
+        assert_eq!(
+            deliver_unauthenticated(&mut c).await,
+            "250 Message accepted\r\n"
+        );
+        assert!(last_raw(&ctx, "bob").await.contains(" with ESMTPS id "));
+        assert!(send_line(&mut c, "QUIT").await.starts_with("221"));
+        handle.await.unwrap().unwrap();
+
+        // All four combinations.
+        let mut s = session_with("a@b", &[]);
+        for (tls, auth, with) in [
+            (false, false, " with ESMTP id "),
+            (false, true, " with ESMTPA id "),
+            (true, false, " with ESMTPS id "),
+            (true, true, " with ESMTPSA id "),
+        ] {
+            s.tls = tls;
+            s.authenticated = auth;
+            let h = received_header(&s, "mail.example.com", &[]);
+            assert!(h.contains(with), "{}", h);
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_listener_mail_before_auth_is_530() {
+        let dir = tempdir().unwrap();
+        let ctx = Arc::new(tls_ctx(dir.path(), TLS_REQUIRED).await);
+        let (c, handle) = start_conn(Arc::clone(&ctx), true);
+        // Implicit TLS: the handshake comes first, then the greeting.
+        let mut c = upgrade(dir.path(), c).await;
+        assert!(reply(&mut c).await.starts_with("220 "));
+        let ehlo = send_line(&mut c, "EHLO client.example.org").await;
+        assert!(ehlo.contains("250-AUTH PLAIN LOGIN\r\n"), "{}", ehlo);
+        assert!(!ehlo.contains("STARTTLS"), "{}", ehlo);
+        assert_eq!(
+            send_line(&mut c, "MAIL FROM:<alice@sender.example.org>").await,
+            "530 5.7.0 Authentication required\r\n"
+        );
+        assert_eq!(
+            send_line(&mut c, "STARTTLS").await,
+            "554 5.5.1 TLS already active\r\n"
+        );
+        assert!(
+            send_line(&mut c, &auth_plain_line("bob"))
+                .await
+                .starts_with("235")
+        );
+        assert_eq!(
+            send_line(&mut c, "MAIL FROM:<bob@example.com>").await,
+            "250 OK\r\n"
+        );
+        assert!(send_line(&mut c, "QUIT").await.starts_with("221"));
+        assert_clean_tls_eof(&mut c).await;
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn starttls_pipelined_commands_are_discarded() {
+        let dir = tempdir().unwrap();
+        let ctx = Arc::new(tls_ctx(dir.path(), TLS_REQUIRED).await);
+        let (mut c, handle) = start_conn(Arc::clone(&ctx), false);
+        reply(&mut c).await;
+        send_line(&mut c, "EHLO client.example.org").await;
+        // One write: the MAIL line sits in the server's read buffer when
+        // STARTTLS is accepted.
+        c.write_all(b"STARTTLS\r\nMAIL FROM:<x@evil>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(reply(&mut c).await, "220 2.0.0 Ready to start TLS\r\n");
+        // The handshake succeeds (the plaintext bytes never reach rustls)...
+        let mut c = upgrade(dir.path(), c).await;
+        // ...and no transaction exists under TLS.
+        assert!(
+            send_line(&mut c, "RCPT TO:<bob@example.com>")
+                .await
+                .starts_with("503")
+        );
+        send_line(&mut c, "EHLO client.example.org").await;
+        assert!(
+            send_line(&mut c, "RCPT TO:<bob@example.com>")
+                .await
+                .starts_with("503")
+        );
+        assert!(send_line(&mut c, "QUIT").await.starts_with("221"));
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_command_timeout_sends_421_and_close_notify() {
+        let dir = tempdir().unwrap();
+        let mut ctx = tls_ctx(dir.path(), TLS_REQUIRED).await;
+        ctx.command_timeout = Duration::from_millis(200);
+        let ctx = Arc::new(ctx);
+        let (c, handle) = start_conn(Arc::clone(&ctx), true);
+        let mut c = upgrade(dir.path(), c).await;
+        assert!(reply(&mut c).await.starts_with("220 "));
+        assert_eq!(
+            reply(&mut c).await,
+            "421 4.4.2 mail.example.com Timeout\r\n"
+        );
+        assert_clean_tls_eof(&mut c).await;
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn implicit_listener_without_tls_is_an_error() {
+        let dir = tempdir().unwrap();
+        let ctx = Arc::new(test_ctx(dir.path()).await);
+        let (_c, handle) = start_conn(ctx, true);
+        assert!(handle.await.unwrap().is_err());
+    }
+
+    fn test_peer() -> std::net::SocketAddr {
+        "127.0.0.1:40000".parse().unwrap()
+    }
+
+    /// Review Focus #1: plaintext sent to the implicit-TLS listener fails the
+    /// handshake at once (no 15 s wait), gets no SMTP reply, and frees the
+    /// connection slot.
+    #[tokio::test]
+    async fn plaintext_on_implicit_listener_closes_fast_and_frees_slot() {
+        let dir = tempdir().unwrap();
+        let ctx = Arc::new(tls_ctx(dir.path(), TLS_REQUIRED).await);
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let permit = Arc::clone(&connections).acquire_owned().await.unwrap();
+        assert_eq!(connections.available_permits(), MAX_CONNECTIONS - 1);
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(b"EHLO x\r\n").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_connection(server, test_peer(), ctx, true, permit),
+        )
+        .await
+        .expect("handle_connection returns within 1 s");
+        assert_eq!(connections.available_permits(), MAX_CONNECTIONS);
+
+        // Whatever rustls sent (at most an alert), there is no SMTP reply.
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        assert!(!got.starts_with(b"2") && !got.starts_with(b"5"), "{got:?}");
+        assert!(!String::from_utf8_lossy(&got).contains("ESMTP"), "{got:?}");
+    }
+
+    /// Review Focus #2: STARTTLS accepted, then the client hangs up or sends
+    /// garbage instead of a ClientHello: no panic, the slot is freed.
+    #[tokio::test]
+    async fn starttls_then_hangup_or_garbage_frees_slot() {
+        let dir = tempdir().unwrap();
+        let ctx = Arc::new(tls_ctx(dir.path(), TLS_REQUIRED).await);
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        for garbage in [
+            None,
+            Some(&b"\x16\x03\x01garbage\r\n"[..]),
+            Some(b"QUIT\r\n"),
+        ] {
+            let permit = Arc::clone(&connections).acquire_owned().await.unwrap();
+            let (client, server) = tokio::io::duplex(4096);
+            let task = tokio::spawn(handle_connection(
+                server,
+                test_peer(),
+                Arc::clone(&ctx),
+                false,
+                permit,
+            ));
+            let mut c = BufReader::new(client);
+            assert!(reply(&mut c).await.starts_with("220 "));
+            send_line(&mut c, "EHLO client.example.org").await;
+            assert!(send_line(&mut c, "STARTTLS").await.starts_with("220 2.0.0"));
+            if let Some(bytes) = garbage {
+                c.write_all(bytes).await.unwrap();
+            }
+            drop(c);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("handle_connection returns promptly")
+                .expect("no panic");
+            assert_eq!(connections.available_permits(), MAX_CONNECTIONS);
+        }
     }
 }

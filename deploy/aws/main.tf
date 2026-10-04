@@ -209,6 +209,33 @@ resource "aws_security_group" "kiss_mail" {
     description = "POP3"
   }
 
+  # SMTPS (submission, implicit TLS)
+  ingress {
+    from_port   = 465
+    to_port     = 465
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "SMTPS"
+  }
+
+  # IMAPS (IMAP over TLS)
+  ingress {
+    from_port   = 993
+    to_port     = 993
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "IMAPS"
+  }
+
+  # POP3S (POP3 over TLS)
+  ingress {
+    from_port   = 995
+    to_port     = 995
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "POP3S"
+  }
+
   # Web Admin (HTTP)
   ingress {
     from_port   = 80

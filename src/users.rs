@@ -266,6 +266,9 @@ pub struct LoginRecord {
     pub protocol: String, // SMTP, IMAP, POP3
     pub success: bool,
     pub failure_reason: Option<String>,
+    /// Whether the connection was TLS-protected (absent in older records).
+    #[serde(default)]
+    pub tls: bool,
 }
 
 /// Complete user account
@@ -374,6 +377,7 @@ impl UserAccount {
         &mut self,
         ip: &str,
         protocol: &str,
+        tls: bool,
         success: bool,
         failure_reason: Option<&str>,
     ) {
@@ -383,6 +387,7 @@ impl UserAccount {
             protocol: protocol.to_string(),
             success,
             failure_reason: failure_reason.map(String::from),
+            tls,
         };
 
         self.login_history.push(record);
@@ -1626,6 +1631,13 @@ impl UserManager {
         Ok(())
     }
 
+    /// Test-only: entry counts of the login throttle's (pair, source, user)
+    /// buckets.
+    #[cfg(test)]
+    pub(crate) fn throttle_sizes(&self) -> (usize, usize, usize) {
+        self.throttle.sizes()
+    }
+
     /// Reserve a login-throttle slot for an authentication path that does
     /// not go through [`UserManager::authenticate`] (LDAP binds, app
     /// passwords). Finish it with `success()` / `failure()`; dropping it
@@ -1676,10 +1688,11 @@ impl UserManager {
         password: &str,
         ip: &str,
         protocol: &str,
+        tls: bool,
     ) -> Result<UserAccount, UserError> {
         let username = login_username(username)?;
         let (_, slot) = self
-            .verify_credentials(&username, password, ip, protocol)
+            .verify_credentials(&username, password, ip, protocol, tls)
             .await?;
 
         // Success: short write lock for bookkeeping.
@@ -1691,7 +1704,7 @@ impl UserManager {
             if user.password_change_required {
                 None
             } else {
-                user.record_login(ip, protocol, true, None);
+                user.record_login(ip, protocol, tls, true, None);
                 Some(user.clone())
             }
         };
@@ -1741,6 +1754,7 @@ impl UserManager {
         password: &str,
         ip: &str,
         protocol: &str,
+        tls: bool,
     ) -> Result<(String, ThrottleSlot<'_>), UserError> {
         let password_hash = self
             .users
@@ -1768,7 +1782,7 @@ impl UserManager {
 
         let Some(password_hash) = password_hash.filter(|_| valid) else {
             slot.failure();
-            self.record_failed_login(username, ip, protocol, "Invalid password")
+            self.record_failed_login(username, ip, protocol, tls, "Invalid password")
                 .await;
             return Err(bad_credentials());
         };
@@ -1784,7 +1798,7 @@ impl UserManager {
             // Deleted concurrently: the slot is cancelled on drop.
             None => Err(bad_credentials()),
             Some(Err(e)) => {
-                self.record_failed_login(username, ip, protocol, &e.to_string())
+                self.record_failed_login(username, ip, protocol, tls, &e.to_string())
                     .await;
                 Err(e)
             }
@@ -1794,9 +1808,16 @@ impl UserManager {
 
     /// Record a failed login in the account history (in memory only; no-op
     /// for unknown users).
-    async fn record_failed_login(&self, username: &str, ip: &str, protocol: &str, reason: &str) {
+    async fn record_failed_login(
+        &self,
+        username: &str,
+        ip: &str,
+        protocol: &str,
+        tls: bool,
+        reason: &str,
+    ) {
         if let Some(user) = self.users.write().await.get_mut(username) {
-            user.record_login(ip, protocol, false, Some(reason));
+            user.record_login(ip, protocol, tls, false, Some(reason));
         }
     }
 
@@ -1898,7 +1919,7 @@ impl UserManager {
         old_password: &str,
         new_password: &str,
     ) -> Result<(), UserError> {
-        self.change_password_from("local", username, old_password, new_password)
+        self.change_password_from("local", username, old_password, new_password, false)
             .await
     }
 
@@ -1925,13 +1946,14 @@ impl UserManager {
         username: &str,
         old_password: &str,
         new_password: &str,
+        tls: bool,
     ) -> Result<(), UserError> {
         let username = login_username(username)?;
 
         check_password_policy(new_password)?;
 
         let (current_hash, slot) = self
-            .verify_credentials(&username, old_password, ip, "password-change")
+            .verify_credentials(&username, old_password, ip, "password-change", tls)
             .await?;
         slot.success();
 
@@ -2359,7 +2381,7 @@ mod tests {
 
         // Failed logins are counted but never lock the persisted account.
         for _ in 0..10 {
-            account.record_login("127.0.0.1", "IMAP", false, Some("bad password"));
+            account.record_login("127.0.0.1", "IMAP", false, false, Some("bad password"));
         }
 
         assert_eq!(account.failed_login_attempts, 10);
@@ -2561,19 +2583,19 @@ mod tests {
 
         for _ in 0..LOCKOUT_THRESHOLD {
             let r = manager
-                .authenticate("dave", "wrongpass", "10.0.0.1", "IMAP")
+                .authenticate("dave", "wrongpass", "10.0.0.1", "IMAP", false)
                 .await;
             assert!(matches!(r, Err(UserError::InvalidPassword(_))));
         }
         // Locked out from this IP, even with the right password...
         let r = manager
-            .authenticate("dave", "password123", "10.0.0.1", "IMAP")
+            .authenticate("dave", "password123", "10.0.0.1", "IMAP", false)
             .await;
         assert!(matches!(r, Err(UserError::AccountLocked(_))));
         // ...but not from another IP, and the account itself is not locked.
         assert!(
             manager
-                .authenticate("dave", "password123", "10.0.0.2", "IMAP")
+                .authenticate("dave", "password123", "10.0.0.2", "IMAP", false)
                 .await
                 .is_ok()
         );
@@ -2617,6 +2639,22 @@ mod tests {
     }
 
     #[test]
+    fn record_login_stores_tls_and_old_records_default_false() {
+        let mut account = UserAccount::new(
+            "tlsuser".to_string(),
+            "password123",
+            "example.com".to_string(),
+        )
+        .unwrap();
+        account.record_login("1.2.3.4", "IMAP", true, true, None);
+        assert!(account.login_history.last().unwrap().tls);
+
+        let old = r#"{"timestamp":"2024-01-01T00:00:00Z","ip_address":"1.2.3.4","protocol":"IMAP","success":true,"failure_reason":null}"#;
+        let rec: LoginRecord = serde_json::from_str(old).unwrap();
+        assert!(!rec.tls);
+    }
+
+    #[test]
     fn throttle_rejects_long_usernames() {
         let dir = tempfile::tempdir().unwrap();
         let manager = UserManager::new("test.com".to_string(), dir.path().to_path_buf());
@@ -2636,7 +2674,9 @@ mod tests {
         let manager = UserManager::new("test.com".to_string(), dir.path().to_path_buf());
         let long = "b".repeat(10_000);
         assert!(matches!(
-            manager.authenticate(&long, "x", "10.0.0.1", "IMAP").await,
+            manager
+                .authenticate(&long, "x", "10.0.0.1", "IMAP", false)
+                .await,
             Err(UserError::InvalidUsername)
         ));
         assert_eq!(manager.throttle.sizes(), (0, 0, 0));
@@ -2780,7 +2820,7 @@ mod tests {
             let manager = Arc::clone(&manager);
             tasks.push(tokio::spawn(async move {
                 manager
-                    .authenticate("erin", "wrongpass", "10.0.0.9", "IMAP")
+                    .authenticate("erin", "wrongpass", "10.0.0.9", "IMAP", false)
                     .await
             }));
         }
@@ -2796,7 +2836,7 @@ mod tests {
         );
         assert!(matches!(
             manager
-                .authenticate("erin", "password123", "10.0.0.9", "IMAP")
+                .authenticate("erin", "password123", "10.0.0.9", "IMAP", false)
                 .await,
             Err(UserError::AccountLocked(_))
         ));
@@ -2823,7 +2863,7 @@ mod tests {
         for _ in 0..LOCKOUT_THRESHOLD - 1 {
             assert!(matches!(
                 manager
-                    .authenticate("hank", "wrongpass", "10.0.0.1", "IMAP")
+                    .authenticate("hank", "wrongpass", "10.0.0.1", "IMAP", false)
                     .await,
                 Err(UserError::InvalidPassword(_))
             ));
@@ -2833,14 +2873,14 @@ mod tests {
         for _ in 0..LOCKOUT_THRESHOLD + 1 {
             assert!(matches!(
                 manager
-                    .authenticate("hank", "password123", "10.0.0.1", "IMAP")
+                    .authenticate("hank", "password123", "10.0.0.1", "IMAP", false)
                     .await,
                 Err(UserError::PasswordChangeRequired)
             ));
         }
         for _ in 0..LOCKOUT_THRESHOLD - 1 {
             let r = manager
-                .authenticate("hank", "wrongpass", "10.0.0.1", "IMAP")
+                .authenticate("hank", "wrongpass", "10.0.0.1", "IMAP", false)
                 .await;
             assert!(matches!(r, Err(UserError::InvalidPassword(_))), "{:?}", r);
         }
@@ -2875,7 +2915,7 @@ mod tests {
         );
         assert!(matches!(
             manager
-                .authenticate("ivy", "password456", "127.0.0.1", "IMAP")
+                .authenticate("ivy", "password456", "127.0.0.1", "IMAP", false)
                 .await,
             Err(UserError::PasswordChangeRequired)
         ));
@@ -2894,7 +2934,7 @@ mod tests {
         );
         assert!(
             manager
-                .authenticate("ivy", "password789", "127.0.0.1", "IMAP")
+                .authenticate("ivy", "password789", "127.0.0.1", "IMAP", false)
                 .await
                 .is_ok()
         );
@@ -2917,13 +2957,13 @@ mod tests {
         // Policy is enforced (before the current password is checked).
         assert!(matches!(
             manager
-                .change_password_from("10.0.0.5", "jane", "password123", "short")
+                .change_password_from("10.0.0.5", "jane", "password123", "short", false)
                 .await,
             Err(UserError::WeakPassword(_))
         ));
 
         manager
-            .change_password_from("10.0.0.5", "Jane", "password123", "newpassword1")
+            .change_password_from("10.0.0.5", "Jane", "password123", "newpassword1", false)
             .await
             .unwrap();
         let user = manager.get_user("jane").await.unwrap();
@@ -2932,7 +2972,7 @@ mod tests {
 
         // Login works with the new password and old mail still decrypts.
         manager
-            .authenticate("jane", "newpassword1", "10.0.0.5", "IMAP")
+            .authenticate("jane", "newpassword1", "10.0.0.5", "IMAP", false)
             .await
             .unwrap();
         crypto.unlock_keys("jane", "newpassword1").await.unwrap();
@@ -2965,7 +3005,7 @@ mod tests {
         for _ in 0..LOCKOUT_THRESHOLD {
             assert!(matches!(
                 manager
-                    .change_password_from("10.0.0.7", "kate", "wrongpass", "newpassword1")
+                    .change_password_from("10.0.0.7", "kate", "wrongpass", "newpassword1", false)
                     .await,
                 Err(UserError::InvalidPassword(_))
             ));
@@ -2973,31 +3013,31 @@ mod tests {
         // Locked out for that IP, for both password changes and logins.
         assert!(matches!(
             manager
-                .change_password_from("10.0.0.7", "kate", "password123", "newpassword1")
+                .change_password_from("10.0.0.7", "kate", "password123", "newpassword1", false)
                 .await,
             Err(UserError::AccountLocked(_))
         ));
         assert!(matches!(
             manager
-                .authenticate("kate", "password123", "10.0.0.7", "IMAP")
+                .authenticate("kate", "password123", "10.0.0.7", "IMAP", false)
                 .await,
             Err(UserError::AccountLocked(_))
         ));
         // Unknown users are generic failures, never a different error.
         assert!(matches!(
             manager
-                .change_password_from("10.0.0.8", "ghost", "whatever1", "newpassword1")
+                .change_password_from("10.0.0.8", "ghost", "whatever1", "newpassword1", false)
                 .await,
             Err(UserError::InvalidPassword(_))
         ));
 
         // From another IP the change succeeds and clears every lockout.
         manager
-            .change_password_from("10.0.0.9", "kate", "password123", "newpassword1")
+            .change_password_from("10.0.0.9", "kate", "password123", "newpassword1", false)
             .await
             .unwrap();
         manager
-            .authenticate("kate", "newpassword1", "10.0.0.7", "IMAP")
+            .authenticate("kate", "newpassword1", "10.0.0.7", "IMAP", false)
             .await
             .unwrap();
     }
@@ -3010,7 +3050,7 @@ mod tests {
             // Different unknown names share the `<unknown>` bucket per ip.
             assert!(matches!(
                 manager
-                    .authenticate(&format!("ghost{i}"), "x", "10.0.0.1", "IMAP")
+                    .authenticate(&format!("ghost{i}"), "x", "10.0.0.1", "IMAP", false)
                     .await,
                 Err(UserError::InvalidPassword(_))
             ));
@@ -3018,7 +3058,9 @@ mod tests {
         // No per-username entries for unknown names.
         assert_eq!(manager.throttle.sizes().2, 0);
         assert!(matches!(
-            manager.authenticate("ghost", "x", "10.0.0.1", "IMAP").await,
+            manager
+                .authenticate("ghost", "x", "10.0.0.1", "IMAP", false)
+                .await,
             Err(UserError::AccountLocked(_))
         ));
     }
@@ -3121,7 +3163,7 @@ mod tests {
         assert!(manager.get_user("frank ").await.is_some());
         assert!(
             manager
-                .authenticate(" Frank", "password123", "127.0.0.1", "IMAP")
+                .authenticate(" Frank", "password123", "127.0.0.1", "IMAP", false)
                 .await
                 .is_ok()
         );
@@ -3163,7 +3205,7 @@ mod tests {
         manager.attach_crypto(Arc::clone(&crypto)).await;
         assert!(!crypto.has_keys("carol").await);
         manager
-            .authenticate("carol", "password123", "127.0.0.1", "IMAP")
+            .authenticate("carol", "password123", "127.0.0.1", "IMAP", false)
             .await
             .unwrap();
         assert!(crypto.has_keys("carol").await);
@@ -3212,7 +3254,7 @@ mod tests {
         let mut account =
             UserAccount::new("g".to_string(), "password123", "example.com".to_string()).unwrap();
         for _ in 0..150 {
-            account.record_login("127.0.0.1", "IMAP", true, None);
+            account.record_login("127.0.0.1", "IMAP", false, true, None);
         }
         assert_eq!(account.login_history.len(), 100);
     }
@@ -3324,12 +3366,12 @@ mod tests {
         };
         let before = count();
         let suspended = manager
-            .authenticate("nina", "guess1234", "10.1.0.1", "IMAP")
+            .authenticate("nina", "guess1234", "10.1.0.1", "IMAP", false)
             .await
             .unwrap_err();
         assert_eq!(count(), before + 1, "Argon2 ran for the suspended user");
         let unknown = manager
-            .authenticate("nobody", "guess1234", "10.1.0.2", "IMAP")
+            .authenticate("nobody", "guess1234", "10.1.0.2", "IMAP", false)
             .await
             .unwrap_err();
         assert_eq!(count(), before + 2, "Argon2 ran for the unknown user");
@@ -3342,16 +3384,16 @@ mod tests {
         // Password changes too, and with the correct password the status
         // failure still maps to BadCredentials.
         let a = manager
-            .change_password_from("10.1.0.3", "nina", "guess1234", "newpassword1")
+            .change_password_from("10.1.0.3", "nina", "guess1234", "newpassword1", false)
             .await
             .unwrap_err();
         let b = manager
-            .change_password_from("10.1.0.4", "nobody", "guess1234", "newpassword1")
+            .change_password_from("10.1.0.4", "nobody", "guess1234", "newpassword1", false)
             .await
             .unwrap_err();
         assert_eq!(a.to_string(), b.to_string());
         let c = manager
-            .change_password_from("10.1.0.5", "nina", "password123", "newpassword1")
+            .change_password_from("10.1.0.5", "nina", "password123", "newpassword1", false)
             .await
             .unwrap_err();
         assert_eq!(
@@ -3361,7 +3403,7 @@ mod tests {
         // The status is revealed only after a correct password.
         assert!(matches!(
             manager
-                .authenticate("nina", "password123", "10.1.0.6", "IMAP")
+                .authenticate("nina", "password123", "10.1.0.6", "IMAP", false)
                 .await,
             Err(UserError::PermissionDenied(_))
         ));
@@ -3480,7 +3522,7 @@ mod tests {
             .await
             .unwrap();
         let r = manager
-            .change_password_from("10.2.0.1", "ldapuser", "password123", "newpassword1")
+            .change_password_from("10.2.0.1", "ldapuser", "password123", "newpassword1", false)
             .await;
         assert!(matches!(r, Err(UserError::ExternallyManaged)));
         assert!(

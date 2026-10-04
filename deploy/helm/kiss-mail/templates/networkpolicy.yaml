@@ -21,6 +21,14 @@ spec:
           protocol: TCP
         - port: {{ .Values.ports.pop3 }}
           protocol: TCP
+        {{- if include "kiss-mail.tlsEnabled" . }}
+        - port: {{ .Values.ports.smtps }}
+          protocol: TCP
+        - port: {{ .Values.ports.imaps }}
+          protocol: TCP
+        - port: {{ .Values.ports.pop3s }}
+          protocol: TCP
+        {{- end }}
         {{- if .Values.webAdmin.enabled }}
         - port: {{ .Values.ports.web }}
           protocol: TCP

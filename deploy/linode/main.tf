@@ -115,6 +115,33 @@ resource "linode_firewall" "kiss_mail" {
   }
 
   inbound {
+    label    = "allow-smtps"
+    action   = "ACCEPT"
+    protocol = "TCP"
+    ports    = "465"
+    ipv4     = ["0.0.0.0/0"]
+    ipv6     = ["::/0"]
+  }
+
+  inbound {
+    label    = "allow-imaps"
+    action   = "ACCEPT"
+    protocol = "TCP"
+    ports    = "993"
+    ipv4     = ["0.0.0.0/0"]
+    ipv6     = ["::/0"]
+  }
+
+  inbound {
+    label    = "allow-pop3s"
+    action   = "ACCEPT"
+    protocol = "TCP"
+    ports    = "995"
+    ipv4     = ["0.0.0.0/0"]
+    ipv6     = ["::/0"]
+  }
+
+  inbound {
     label    = "allow-http"
     action   = "ACCEPT"
     protocol = "TCP"

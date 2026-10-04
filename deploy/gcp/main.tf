@@ -90,7 +90,7 @@ resource "google_compute_firewall" "kiss_mail" {
 
   allow {
     protocol = "tcp"
-    ports    = ["22", "25", "80", "110", "143", "443", "587"]
+    ports    = ["22", "25", "80", "110", "143", "443", "465", "587", "993", "995"]
   }
 
   allow {
@@ -129,7 +129,8 @@ resource "google_compute_instance" "kiss_mail" {
   boot_disk {
     initialize_params {
       # Ubuntu + Docker (installed by the startup script). The container
-      # publishes 25/587/143/110 -> 2525/1143/1100 and Nginx proxies the web
+      # publishes 25/587/143/110 -> 2525/1143/1100 and 465/993/995 ->
+      # 4465/1993/1995 (implicit TLS), and Nginx proxies the web
       # admin/API on port 80, matching the firewall rule above.
       image = "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
       size  = var.disk_size

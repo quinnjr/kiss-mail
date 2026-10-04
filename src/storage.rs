@@ -627,8 +627,9 @@ impl Storage {
         password: &str,
         ip: &str,
         protocol: &str,
+        tls: bool,
     ) -> Result<UserAccount, AuthError> {
-        self.authenticate(username, password, ip, protocol)
+        self.authenticate(username, password, ip, protocol, tls)
             .await
             .map(|(account, _)| account)
     }
@@ -647,8 +648,11 @@ impl Storage {
         password: &str,
         ip: &str,
         protocol: &str,
+        tls: bool,
     ) -> Result<LoginOutcome, AuthError> {
-        let (account, method) = self.authenticate(username, password, ip, protocol).await?;
+        let (account, method) = self
+            .authenticate(username, password, ip, protocol, tls)
+            .await?;
         let canonical = canonical_username(&account.username);
         let local_account = self.user_manager.user_exists(&canonical).await;
 
@@ -752,6 +756,7 @@ impl Storage {
         password: &str,
         ip: &str,
         protocol: &str,
+        tls: bool,
     ) -> Result<(UserAccount, AuthMethod), AuthError> {
         let username = canonical_username(username);
         let username = username.as_str();
@@ -775,7 +780,7 @@ impl Storage {
 
         // Local authentication (throttled inside `UserManager::authenticate`).
         self.user_manager
-            .authenticate(username, password, ip, protocol)
+            .authenticate(username, password, ip, protocol, tls)
             .await
             .map(|u| (u, AuthMethod::Local))
             .map_err(AuthError::from)
@@ -1589,20 +1594,20 @@ mod tests {
         );
 
         let err = storage
-            .authenticate_full("bob", PW, "127.0.0.1", "SMTP")
+            .authenticate_full("bob", PW, "127.0.0.1", "SMTP", false)
             .await
             .unwrap_err();
         assert!(err.is_password_change_required());
         assert_eq!(err, AuthError::PasswordChangeRequired);
         let err = storage
-            .login("bob", PW, "127.0.0.1", "IMAP")
+            .login("bob", PW, "127.0.0.1", "IMAP", false)
             .await
             .unwrap_err();
         assert!(err.is_password_change_required());
 
         // Wrong password: an ordinary failure.
         let err = storage
-            .login("bob", "wrongpass", "127.0.0.1", "IMAP")
+            .login("bob", "wrongpass", "127.0.0.1", "IMAP", false)
             .await
             .unwrap_err();
         assert!(!err.is_password_change_required());
@@ -1610,10 +1615,65 @@ mod tests {
         // App passwords are not affected by the local-password flag.
         assert!(
             storage
-                .login("bob", &app_pw, "127.0.0.1", "IMAP")
+                .login("bob", &app_pw, "127.0.0.1", "IMAP", false)
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn tls_flag_recorded_and_protocol_still_matches_app_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let users = Arc::new(UserManager::new(
+            "example.com".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        users.create_user("bob", PW, None).await.unwrap();
+        let sso = Arc::new(SsoManager::new(
+            crate::sso::SsoConfig::default(),
+            dir.path().to_path_buf(),
+        ));
+        let app_pw = sso
+            .generate_app_password("bob", "test", None)
+            .await
+            .unwrap();
+        sso.set_allowed_protocols_for_test("bob", &["IMAP"]).await;
+        let storage = Storage::with_encryption(
+            dir.path().to_path_buf(),
+            Arc::clone(&users),
+            Arc::new(LdapClient::new(crate::ldap::LdapConfig::default())),
+            sso,
+            Arc::new(CryptoManager::with_enabled(dir.path().to_path_buf(), false)),
+        );
+
+        // The protocol string stays "IMAP", so the allow-list matches with
+        // or without TLS.
+        assert!(
+            storage
+                .login("bob", &app_pw, "127.0.0.1", "IMAP", true)
+                .await
+                .is_ok()
+        );
+        assert!(
+            storage
+                .authenticate_full("bob", &app_pw, "127.0.0.1", "SMTP", true)
+                .await
+                .is_err()
+        );
+
+        // The tls flag reaches the login record (local password path).
+        storage
+            .login("bob", PW, "127.0.0.1", "IMAP", true)
+            .await
+            .unwrap();
+        let bob = users.get_user("bob").await.unwrap();
+        assert!(bob.login_history.last().unwrap().tls);
+        storage
+            .login("bob", PW, "127.0.0.1", "IMAP", false)
+            .await
+            .unwrap();
+        let bob = users.get_user("bob").await.unwrap();
+        assert!(!bob.login_history.last().unwrap().tls);
     }
 
     #[tokio::test]
@@ -1640,12 +1700,12 @@ mod tests {
         );
 
         let err = storage
-            .login("ghost", &app_pw, "127.0.0.1", "IMAP")
+            .login("ghost", &app_pw, "127.0.0.1", "IMAP", false)
             .await
             .unwrap_err();
         assert!(matches!(err, AuthError::Failed(_)), "{:?}", err);
         let err = storage
-            .authenticate_full("Ghost", &app_pw, "127.0.0.1", "SMTP")
+            .authenticate_full("Ghost", &app_pw, "127.0.0.1", "SMTP", false)
             .await
             .unwrap_err();
         assert!(matches!(err, AuthError::Failed(_)), "{:?}", err);
@@ -2036,7 +2096,10 @@ mod tests {
         assert!(!locked.contains("body 2"));
         assert_eq!(storage.display_size(&email, &locked), locked.len());
 
-        let outcome = storage.login("Bob", PW, "127.0.0.1", "IMAP").await.unwrap();
+        let outcome = storage
+            .login("Bob", PW, "127.0.0.1", "IMAP", false)
+            .await
+            .unwrap();
         assert!(outcome.key_generation.is_some());
         assert_eq!(outcome.username, "bob");
         let content = storage.email_content("bob", &email).await;
@@ -2051,7 +2114,10 @@ mod tests {
         let storage = test_storage_encrypted(dir.path()).await;
         let email = storage.get_mailbox("bob").await.unwrap().emails[0].clone();
 
-        let outcome = storage.login("bob", PW, "127.0.0.1", "IMAP").await.unwrap();
+        let outcome = storage
+            .login("bob", PW, "127.0.0.1", "IMAP", false)
+            .await
+            .unwrap();
         assert!(outcome.key_generation.is_some());
         // A second session that did not unlock keys ends.
         storage.logout("bob", None).await;

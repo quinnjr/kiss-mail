@@ -144,6 +144,27 @@ resource "digitalocean_firewall" "kiss_mail" {
     source_addresses = ["0.0.0.0/0", "::/0"]
   }
 
+  # SMTPS (submission, implicit TLS)
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "465"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  # IMAPS (IMAP over TLS)
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "993"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  # POP3S (POP3 over TLS)
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "995"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
   # All outbound
   outbound_rule {
     protocol              = "tcp"

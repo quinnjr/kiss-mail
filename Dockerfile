@@ -92,7 +92,8 @@ ENV KISS_MAIL_API_PORT=8025
 ENV KISS_MAIL_API_BIND=0.0.0.0
 ENV RUST_LOG=kiss_mail=info
 
-EXPOSE 2525 1143 1100 8080 8025
+# 4465/1993/1995: implicit TLS (SMTPS submission, IMAPS, POP3S)
+EXPOSE 2525 1143 1100 4465 1993 1995 8080 8025
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD nc -z localhost 2525 || exit 1

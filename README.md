@@ -49,9 +49,11 @@ docker start kiss-mail
 To change it while the server runs, use the web admin, or
 `PUT /api/users/admin` through an SSH tunnel to the REST API.
 
-> **No TLS:** SMTP, IMAP and POP3 are plaintext (no STARTTLS) and the web
-> admin is plain HTTP. Put a TLS-terminating proxy in front of them before
-> exposing the server to the internet.
+> **TLS:** SMTP, IMAP and POP3 support implicit TLS (465/993/995) and
+> STARTTLS out of the box, using a self-signed certificate until you provide a
+> real one (see [TLS](#tls-and-starttls)). Logins over plaintext connections
+> are refused by default. The web admin is plain HTTP: put HTTPS in front of it
+> (the VM installers set up Nginx and Certbot for that) before exposing it.
 
 ### One-Line Deploy (Any VPS)
 
@@ -94,20 +96,71 @@ kiss-mail stats
 
 ## Connect Your Email Client
 
-| Setting  | Value                |
-|----------|----------------------|
-| Server   | localhost            |
-| SMTP     | 2525 (or 25 as root) |
-| IMAP     | 1143 (or 143 as root)|
-| POP3     | 1100 (or 110 as root)|
-| Username | your_username        |
-| Password | your_password        |
-| Security | None (plaintext - see below) |
+Prefer implicit TLS (SSL/TLS) where your client offers it.
 
-KISS Mail does not implement TLS or STARTTLS. Passwords are sent in the clear,
-so for anything beyond local testing put a TLS-terminating proxy (for example
-stunnel, HAProxy or nginx `stream`) in front of the mail ports and point your
-client at the proxy with SSL/TLS enabled.
+| Setting  | Implicit TLS (recommended)        | STARTTLS                    |
+|----------|-----------------------------------|-----------------------------|
+| Server   | localhost                         | localhost                   |
+| IMAP     | 1993 (993 as root), SSL/TLS       | 1143 (143 as root)          |
+| SMTP     | 4465 (465 as root), SSL/TLS       | 2525 (25 as root); submission 587 where published |
+| POP3     | 1995 (995 as root), SSL/TLS       | 1100 (110 as root), `STLS`  |
+| Username | your_username                     | your_username               |
+| Password | your_password                     | your_password               |
+
+In the Docker image the TLS ports are 4465/1993/1995 inside the container;
+the published host ports are 465/993/995 in the VM installers, while
+`docker-compose.yml` publishes 4465/1993/1995 (map them to 465/993/995 in
+production). Port 465 is submission only: `MAIL`
+requires `AUTH`.
+
+- Plaintext logins are **refused by default**: SMTP answers `538 5.7.11`, IMAP
+  `NO [PRIVACYREQUIRED]` (and advertises `LOGINDISABLED`), POP3 `-ERR [AUTH]`.
+  Use implicit TLS or issue `STARTTLS` / `STLS` first. To keep plaintext
+  logins working for old clients, set `KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true`.
+- STARTTLS can be stripped by an attacker who controls the network path, so
+  clients should be set to require TLS (or use the implicit TLS ports). For
+  server-to-server delivery on port 25 that stripping is accepted (MTA-STS and
+  DANE are not implemented).
+- Out of the box the server uses a self-signed certificate. Clients warn about
+  it, and Outlook and Gmail refuse it; install a real certificate (below).
+- TLS 1.2 and 1.3 only: very old clients that only support CBC or RSA key
+  exchange cannot connect.
+
+### TLS and STARTTLS
+
+Listeners: implicit TLS on SMTPS, IMAPS and POP3S, plus SMTP `STARTTLS`
+(25/587), IMAP `STARTTLS` (143) and POP3 `STLS` (110).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KISS_MAIL_TLS` | auto | `auto` or `off`. Also accepts true/on/yes/1 (auto) and false/off/no/0 (off). `off` disables every TLS listener and STARTTLS **and allows plaintext logins**; the server logs a startup warning and prints a banner line |
+| `KISS_MAIL_TLS_CERT` / `KISS_MAIL_TLS_KEY` | (unset) | PEM certificate chain and private key; set both or neither |
+| `KISS_MAIL_SMTPS_PORT` | 4465 (465 as root) | Implicit TLS SMTP (submission, AUTH required) |
+| `KISS_MAIL_IMAPS_PORT` | 1993 (993 as root) | Implicit TLS IMAP |
+| `KISS_MAIL_POP3S_PORT` | 1995 (995 as root) | Implicit TLS POP3 |
+| `KISS_MAIL_ALLOW_PLAINTEXT_AUTH` | false | Allow logins on connections without TLS |
+
+A TLS port equal to a plain port aborts startup.
+
+Certificate source, first match wins:
+
+1. `KISS_MAIL_TLS_CERT` + `KISS_MAIL_TLS_KEY`
+2. `$KISS_MAIL_DATA_DIR/tls/cert.pem` + `key.pem`
+3. a self-signed certificate (397 days, regenerated within 30 days of expiry,
+   names = `KISS_MAIL_DOMAIN` and `localhost`, same fingerprint across
+   restarts while the data directory is kept)
+
+The server checks the certificate files every 60 seconds (by content hash)
+and reloads on `SIGHUP` immediately (`docker kill --signal=HUP kiss-mail`).
+Only new connections see the new certificate. It switches from self-signed to
+the files in `$DATA_DIR/tls/` as soon as they appear.
+
+An expired, unparseable or mismatched configured certificate **aborts
+startup**, and the message names the file. Renew it (`certbot renew`), then
+start the server again. An expiry within 14 days is logged as a warning.
+
+See [DEPLOY.md](DEPLOY.md#ssltls) for Certbot on VMs, cert-manager on
+Kubernetes, firewalls and upgrading existing installs.
 
 ## Environment Variables
 
@@ -118,6 +171,7 @@ client at the proxy with SSL/TLS enabled.
 | `KISS_MAIL_SMTP_PORT` (deprecated alias `SMTP_PORT`) | 2525 (25 as root) | SMTP port |
 | `KISS_MAIL_IMAP_PORT` (deprecated alias `IMAP_PORT`) | 1143 (143 as root) | IMAP port |
 | `KISS_MAIL_POP3_PORT` (deprecated alias `POP3_PORT`) | 1100 (110 as root) | POP3 port |
+| `KISS_MAIL_TLS`, `KISS_MAIL_TLS_CERT`, `KISS_MAIL_TLS_KEY`, `KISS_MAIL_SMTPS_PORT`, `KISS_MAIL_IMAPS_PORT`, `KISS_MAIL_POP3S_PORT`, `KISS_MAIL_ALLOW_PLAINTEXT_AUTH` | see [TLS and STARTTLS](#tls-and-starttls) | Native TLS settings |
 | `RUST_LOG` | `kiss_mail=info` (server), `kiss_mail=warn` (CLI) | Log filter in `tracing` syntax, e.g. `kiss_mail=debug`. Plain `info` also enables the logs of every dependency |
 | `CLAMAV_REQUIRED` | false | When true, SMTP answers 451 (try again later) if ClamAV could not scan a message, instead of accepting it with the built-in scanner only. Only an exact `stream: OK` reply counts as clean; anything else is a scanner failure |
 | `KISS_MAIL_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128` | Comma-separated CIDRs of reverse proxies. When the TCP peer is trusted, the client IP comes from `X-Real-IP`, otherwise from the rightmost untrusted `X-Forwarded-For` entry. Used for lockout and `allowed_ips`. Behind Nginx on the Docker host add the bridge range (e.g. `172.16.0.0/12`); behind a Kubernetes Ingress, the ingress controller pod CIDR |
@@ -268,6 +322,11 @@ docker compose logs -f
 docker compose down
 ```
 
+The compose file publishes the TLS ports 4465/1993/1995 (publish them as
+465/993/995 on a production host). Plaintext logins are refused by default:
+mount a certificate and uncomment `KISS_MAIL_TLS_CERT`/`KISS_MAIL_TLS_KEY`, or
+uncomment `KISS_MAIL_ALLOW_PLAINTEXT_AUTH: "true"` for old clients.
+
 ### Container Environment Variables
 
 Defaults below are the values set in the image.
@@ -277,6 +336,10 @@ Defaults below are the values set in the image.
 | `KISS_MAIL_DOMAIN` | localhost | Mail domain |
 | `KISS_MAIL_DATA_DIR` (deprecated alias `KISS_MAIL_DATA`) | /data | Data directory (must be a writable volume) |
 | `KISS_MAIL_SMTP_PORT` / `_IMAP_PORT` / `_POP3_PORT` | 2525 / 1143 / 1100 | Ports inside the container (deprecated aliases `SMTP_PORT`, `IMAP_PORT`, `POP3_PORT`) |
+| `KISS_MAIL_SMTPS_PORT` / `_IMAPS_PORT` / `_POP3S_PORT` | 4465 / 1993 / 1995 | Implicit TLS ports inside the container |
+| `KISS_MAIL_TLS` | auto | `auto` or `off` (see [TLS and STARTTLS](#tls-and-starttls)) |
+| `KISS_MAIL_TLS_CERT` / `KISS_MAIL_TLS_KEY` | (unset) | Certificate and key; otherwise `/data/tls/cert.pem` + `key.pem`, otherwise self-signed |
+| `KISS_MAIL_ALLOW_PLAINTEXT_AUTH` | false | Allow logins without TLS |
 | `KISS_MAIL_WEB_PORT` | 8080 | Web admin port |
 | `KISS_MAIL_WEB_BIND` | 0.0.0.0 | Web admin bind address (binary default 127.0.0.1) |
 | `KISS_MAIL_WEB_SECURE_COOKIE` | true (because the bind is not loopback) | Secure session cookie; set `false` only while serving the web admin over plain HTTP on a non-localhost address |
@@ -353,6 +416,13 @@ helm upgrade kiss-mail deploy/helm/kiss-mail --namespace kiss-mail
 # Uninstall
 helm uninstall kiss-mail --namespace kiss-mail
 ```
+
+TLS values: `tls.mode` (`auto` or `off`), `tls.existingSecret` (a
+`kubernetes.io/tls` Secret, for example from cert-manager; see
+[DEPLOY.md](DEPLOY.md#ssltls)) and `tls.allowPlaintextAuth`
+(`KISS_MAIL_ALLOW_PLAINTEXT_AUTH`, default false). The ConfigMap in
+`deploy/kubernetes/` has the matching `KISS_MAIL_TLS*` and
+`KISS_MAIL_ALLOW_PLAINTEXT_AUTH` entries.
 
 The chart keeps the REST API off by default (`api.enabled: false`). If you
 enable it, also set an API key and consider `networkPolicy.enabled=true` with
@@ -584,7 +654,7 @@ host); it is **not** end-to-end or zero-knowledge encryption.
 | **Per-message keys** | Ephemeral X25519 key per message |
 | **Authenticated encryption** | ChaCha20-Poly1305 |
 | **Not encrypted** | Headers, subject, sender and recipients stay in plaintext |
-| **Server sees passwords** | Passwords arrive at login (in the clear unless you add a TLS proxy), and the server holds a user's unlocked private key in memory while that user has an active session |
+| **Server sees passwords** | Passwords arrive at login (encrypted in transit when the client uses TLS; in the clear if you enable plaintext logins), and the server holds a user's unlocked private key in memory while that user has an active session |
 
 ### Configuration
 
@@ -1022,7 +1092,7 @@ kiss-mail group-add developers
 
 A server given without a scheme (`--server host:8025`) means `https://`, so
 use an explicit `http://` URL for the API's own listener, or an `https://`
-URL for a TLS proxy in front of it. Plain `http://` to a non-loopback host is
+URL when HTTPS is terminated in front of it. Plain `http://` to a non-loopback host is
 refused unless you pass `--insecure`, since the API key and passwords would
 cross the network unencrypted. Passwords the CLI prompts for are read without
 echo.

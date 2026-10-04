@@ -1103,6 +1103,15 @@ impl SsoManager {
         self.config.identity_from_claims(claims)
     }
 
+    /// Test helper: restrict every app password of `username` to `protocols`.
+    #[cfg(test)]
+    pub(crate) async fn set_allowed_protocols_for_test(&self, username: &str, protocols: &[&str]) {
+        let mut data = self.user_data.write().await;
+        for ap in &mut data.entry(username.to_string()).or_default().app_passwords {
+            ap.allowed_protocols = protocols.iter().map(|p| p.to_string()).collect();
+        }
+    }
+
     /// Generate an app password for a user
     pub async fn generate_app_password(
         &self,

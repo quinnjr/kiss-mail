@@ -44,6 +44,17 @@ spec:
             - name: pop3
               containerPort: {{ .Values.ports.pop3 }}
               protocol: TCP
+            {{- if include "kiss-mail.tlsEnabled" . }}
+            - name: smtps
+              containerPort: {{ .Values.ports.smtps }}
+              protocol: TCP
+            - name: imaps
+              containerPort: {{ .Values.ports.imaps }}
+              protocol: TCP
+            - name: pop3s
+              containerPort: {{ .Values.ports.pop3s }}
+              protocol: TCP
+            {{- end }}
             {{- if .Values.webAdmin.enabled }}
             - name: web
               containerPort: {{ .Values.ports.web }}
@@ -75,6 +86,13 @@ spec:
               mountPath: /data
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.tls.existingSecret }}
+            # The whole Secret is mounted as a directory, never file by file:
+            # single-file mounts never see a renewed certificate.
+            - name: tls
+              mountPath: /etc/kiss-mail/tls
+              readOnly: true
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -114,6 +132,13 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.tls.existingSecret }}
+        # Readable by uid 1000 through the pod fsGroup (1000).
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+            defaultMode: 0440
+        {{- end }}
         {{- if .Values.clamav.sidecar.enabled }}
         - name: clamav-data
           emptyDir: {}

@@ -5,16 +5,19 @@
 //! and they are removed when the session ends with QUIT (UPDATE state). An
 //! abnormal disconnect deletes nothing.
 
-use crate::proto::{KeyLease, WRITE_TIMEOUT, accepted, read_line_limited, write_all_timeout};
+use crate::proto::{
+    KeyLease, SessionEnd, TlsPolicy, WRITE_TIMEOUT, accepted, read_line_limited, write_all_timeout,
+};
 use crate::storage::{AuthError, Storage};
+use crate::tls::Tls;
 use crate::users::canonical_username;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const POP3_OK: &str = "+OK";
 const POP3_ERR: &str = "-ERR";
@@ -58,6 +61,11 @@ struct Pop3Session {
     /// Indices (0-based) marked for deletion.
     deleted: HashSet<usize>,
     peer_ip: String,
+    /// The stream is TLS-protected.
+    tls: bool,
+    policy: TlsPolicy,
+    /// STLS was accepted; the session loop must hand the stream back.
+    starttls: bool,
 }
 
 impl Pop3Session {
@@ -69,6 +77,12 @@ impl Pop3Session {
             messages: Vec::new(),
             deleted: HashSet::new(),
             peer_ip,
+            tls: false,
+            policy: TlsPolicy {
+                tls_available: false,
+                allow_plaintext: false,
+            },
+            starttls: false,
         }
     }
 
@@ -115,80 +129,252 @@ impl Pop3Session {
     }
 }
 
+/// Reply to USER/PASS while plaintext credentials are refused (RFC 3206
+/// `[AUTH]`). Sent at USER so the client never gets as far as sending PASS.
+const PLAINTEXT_AUTH_REPLY: &str =
+    "-ERR [AUTH] Plaintext authentication disabled; use STLS or port 995\r\n";
+
+/// How a session starts (see `serve_pop3_with`).
+#[derive(Debug, Clone, Copy)]
+struct Pop3Opts {
+    /// The stream is TLS-protected.
+    tls: bool,
+    /// Send the greeting (not after STLS: RFC 2595 restarts the session).
+    greet: bool,
+    policy: TlsPolicy,
+}
+
+/// How the command loop ended.
+enum LoopEnd {
+    Closed,
+    /// STLS was accepted and its +OK sent; the stream must be upgraded.
+    StartTls,
+}
+
 pub struct Pop3Server {
     storage: Arc<Storage>,
+    /// TLS for STLS and the implicit-TLS listener (`None`: TLS off).
+    tls: Option<Arc<Tls>>,
+    policy: TlsPolicy,
 }
 
 impl Pop3Server {
-    pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<Storage>, tls: Option<Arc<Tls>>, policy: TlsPolicy) -> Self {
+        // The STLS offer and the USER refusal must never disagree.
+        debug_assert_eq!(
+            tls.is_some(),
+            policy.tls_available,
+            "TLS presence and TlsPolicy disagree"
+        );
+        Self {
+            storage,
+            tls,
+            policy,
+        }
     }
 
-    pub async fn run(&self, addr: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!("POP3 server listening on {}", addr);
-        let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    /// Serve the plain listener on `plain_addr` and, when `tls_addr` is set,
+    /// the implicit-TLS (POP3S) listener. Both share one connection limit.
+    pub async fn run(
+        &self,
+        plain_addr: &str,
+        tls_addr: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let plain = TcpListener::bind(plain_addr)
+            .await
+            .map_err(|e| format!("POP3: cannot bind {}: {}", plain_addr, e))?;
+        tracing::info!("POP3 server listening on {}", plain_addr);
+        let implicit = match tls_addr {
+            None => None,
+            Some(addr) => {
+                if self.tls.is_none() {
+                    return Err("POP3S: TLS is not configured".into());
+                }
+                let listener = TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| format!("POP3S: cannot bind {}: {}", addr, e))?;
+                tracing::info!("POP3S (implicit TLS) server listening on {}", addr);
+                Some(listener)
+            }
+        };
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
+        let plain_loop = self.accept_loop(plain, "POP3", false, Arc::clone(&connections));
+        let implicit_loop = async {
+            match implicit {
+                Some(listener) => {
+                    self.accept_loop(listener, "POP3S", true, Arc::clone(&connections))
+                        .await
+                }
+                None => std::future::pending().await,
+            }
+        };
+        tokio::try_join!(plain_loop, implicit_loop)?;
+        Ok(())
+    }
+
+    /// Accept connections on `listener` until the connection semaphore closes.
+    async fn accept_loop(
+        &self,
+        listener: TcpListener,
+        name: &'static str,
+        implicit: bool,
+        connections: Arc<Semaphore>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
-            let permit = Arc::clone(&limit).acquire_owned().await?;
-            let Some((socket, peer_addr)) = accepted("POP3", listener.accept().await).await else {
+            let permit = Arc::clone(&connections)
+                .acquire_owned()
+                .await
+                .map_err(|e| format!("{}: {}", name, e))?;
+            let Some((socket, peer_addr)) = accepted(name, listener.accept().await).await else {
                 continue;
             };
-            tracing::info!("POP3 connection from {}", peer_addr);
-
-            let storage = Arc::clone(&self.storage);
-
-            tokio::spawn(async move {
-                let _permit = permit;
-                if let Err(e) = handle_pop3_connection(socket, peer_addr, storage).await {
-                    tracing::error!("POP3 connection error: {}", e);
-                }
-            });
+            tracing::info!("{} connection from {}", name, peer_addr);
+            tokio::spawn(handle_connection(
+                socket,
+                peer_addr,
+                Arc::clone(&self.storage),
+                self.tls.clone(),
+                self.policy,
+                implicit,
+                permit,
+            ));
         }
     }
 }
 
-async fn handle_pop3_connection(
-    socket: TcpStream,
-    peer: SocketAddr,
-    storage: Arc<Storage>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    serve_pop3(socket, peer, storage).await
-}
-
-/// Serve one POP3 connection over any byte stream.
-pub async fn serve_pop3<S>(
+/// Serve one accepted connection while holding its connection-slot
+/// `permit`. The session runs in its own task so a panic is logged here (and
+/// the slot released) instead of being lost.
+async fn handle_connection<S>(
     stream: S,
     peer: SocketAddr,
     storage: Arc<Storage>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    tls: Option<Arc<Tls>>,
+    policy: TlsPolicy,
+    implicit: bool,
+    permit: OwnedSemaphorePermit,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    serve_pop3_with(stream, peer, storage, READ_TIMEOUT, WRITE_TIMEOUT).await
+    let _permit = permit;
+    let inner = tokio::spawn(serve_connection(
+        stream, peer, storage, tls, policy, implicit,
+    ));
+    match inner.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("POP3 connection error ({}): {}", peer, e),
+        Err(e) if e.is_panic() => {
+            tracing::error!("POP3 connection task for {} panicked: {}", peer, e)
+        }
+        Err(e) => tracing::error!("POP3 connection task for {} failed: {}", peer, e),
+    }
 }
 
+/// The session restart sequence (spec section 3.2). On the implicit-TLS
+/// listener the handshake comes first; on the plain listener an accepted STLS
+/// restarts the session over TLS with fresh state and no greeting. A failed
+/// or timed-out handshake just closes the connection.
+async fn serve_connection<S>(
+    stream: S,
+    peer: SocketAddr,
+    storage: Arc<Storage>,
+    tls: Option<Arc<Tls>>,
+    policy: TlsPolicy,
+    implicit: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if implicit {
+        let Some(tls) = tls else {
+            return Err("POP3S connection without a TLS configuration".into());
+        };
+        let stream = match tls.accept(stream).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::debug!("POP3S handshake with {} failed: {}", peer, e);
+                return Ok(());
+            }
+        };
+        let opts = Pop3Opts {
+            tls: true,
+            greet: true,
+            policy,
+        };
+        serve_pop3_with(stream, peer, storage, READ_TIMEOUT, WRITE_TIMEOUT, opts).await?;
+        return Ok(());
+    }
+
+    let opts = Pop3Opts {
+        tls: false,
+        greet: true,
+        policy,
+    };
+    let end = serve_pop3_with(
+        stream,
+        peer,
+        Arc::clone(&storage),
+        READ_TIMEOUT,
+        WRITE_TIMEOUT,
+        opts,
+    )
+    .await?;
+    match end {
+        SessionEnd::Closed => Ok(()),
+        SessionEnd::StartTls(raw) => {
+            let Some(tls) = tls else {
+                return Err("STLS accepted without a TLS configuration".into());
+            };
+            let stream = match tls.accept(raw).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::debug!("POP3 STLS handshake with {} failed: {}", peer, e);
+                    return Ok(());
+                }
+            };
+            let opts = Pop3Opts {
+                tls: true,
+                greet: false,
+                policy,
+            };
+            serve_pop3_with(stream, peer, storage, READ_TIMEOUT, WRITE_TIMEOUT, opts).await?;
+            Ok(())
+        }
+    }
+}
+
+/// Run one POP3 session over `stream`.
+///
+/// Returns `SessionEnd::StartTls` with the raw stream once STLS has been
+/// accepted (the caller performs the handshake and starts a fresh session).
+/// Client bytes already buffered at that point are discarded with the
+/// `BufReader`, so commands pipelined after STLS never run under TLS.
 async fn serve_pop3_with<S>(
     stream: S,
     peer: SocketAddr,
     storage: Arc<Storage>,
     read_timeout: Duration,
     write_timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    opts: Pop3Opts,
+) -> Result<SessionEnd<S>, Box<dyn std::error::Error + Send + Sync>>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     // The session owns the key lease, so the keys are locked however this
     // future ends (normally below, or by Drop on panic / cancellation).
     let mut session = Pop3Session::new(peer.ip().to_string(), Arc::clone(&storage));
+    session.tls = opts.tls;
+    session.policy = opts.policy;
     let session = &mut session;
 
     let result = async {
-        // Send greeting
-        let greeting = format!("{} kiss-mail POP3 server ready\r\n", POP3_OK);
-        write_all_timeout(&mut writer, greeting.as_bytes(), write_timeout).await?;
+        if opts.greet {
+            let greeting = format!("{} kiss-mail POP3 server ready\r\n", POP3_OK);
+            write_all_timeout(&mut writer, greeting.as_bytes(), write_timeout).await?;
+        }
 
         loop {
             let read =
@@ -219,18 +405,30 @@ where
 
             write_all_timeout(&mut writer, response.as_bytes(), write_timeout).await?;
 
+            if session.starttls {
+                return Ok::<LoopEnd, Box<dyn std::error::Error + Send + Sync>>(LoopEnd::StartTls);
+            }
             if cmd == "QUIT" {
                 break;
             }
         }
-        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        Ok(LoopEnd::Closed)
     }
     .await;
 
     // Abnormal or normal end: drop decrypted keys. Pending DELEs are only
-    // applied by QUIT.
+    // applied by QUIT. (A no-op after STLS: it is only accepted before login.)
     session.finish().await;
-    result
+    match result? {
+        LoopEnd::StartTls => Ok(SessionEnd::StartTls(reader.into_inner().unsplit(writer))),
+        LoopEnd::Closed => {
+            if opts.tls {
+                // Send close_notify (bounded, errors ignored: the session is over).
+                let _ = tokio::time::timeout(write_timeout, writer.shutdown()).await;
+            }
+            Ok(SessionEnd::Closed)
+        }
+    }
 }
 
 fn command_name(line: &str) -> String {
@@ -316,6 +514,9 @@ async fn process_pop3_command(line: &str, session: &mut Pop3Session, storage: &S
             if session.state != Pop3State::Authorization {
                 return format!("{} Already authenticated\r\n", POP3_ERR);
             }
+            if !session.policy.secure(session.tls) {
+                return PLAINTEXT_AUTH_REPLY.to_string();
+            }
             if let Some(username) = parts.get(1) {
                 session.username = Some(canonical_username(username));
                 format!("{} User accepted\r\n", POP3_OK)
@@ -327,6 +528,11 @@ async fn process_pop3_command(line: &str, session: &mut Pop3Session, storage: &S
             if session.state != Pop3State::Authorization {
                 return format!("{} Already authenticated\r\n", POP3_ERR);
             }
+            // Defence in depth: USER is already refused, so a client that
+            // got here skipped it. No login attempt is made.
+            if !session.policy.secure(session.tls) {
+                return PLAINTEXT_AUTH_REPLY.to_string();
+            }
             // The password is the whole remainder of the line (may contain spaces).
             let password = line.get(5..).unwrap_or("");
             let Some(username) = session.username.clone() else {
@@ -336,7 +542,7 @@ async fn process_pop3_command(line: &str, session: &mut Pop3Session, storage: &S
                 return format!("{} Missing password\r\n", POP3_ERR);
             }
             match storage
-                .login(&username, password, &session.peer_ip, "POP3")
+                .login(&username, password, &session.peer_ip, "POP3", session.tls)
                 .await
             {
                 Ok(outcome) => {
@@ -496,11 +702,39 @@ async fn process_pop3_command(line: &str, session: &mut Pop3Session, storage: &S
             }
             format!("{} Bye\r\n", POP3_OK)
         }
+        "STLS" => {
+            let refusal = if parts.len() > 1 {
+                Some("STLS takes no arguments")
+            } else if session.state != Pop3State::Authorization {
+                Some("STLS only allowed in AUTHORIZATION state")
+            } else if session.tls {
+                Some("TLS already active")
+            } else if !session.policy.tls_available {
+                Some("TLS not available")
+            } else {
+                None
+            };
+            match refusal {
+                Some(reason) => format!("{} {}\r\n", POP3_ERR, reason),
+                None => {
+                    session.starttls = true;
+                    format!("{} Begin TLS negotiation\r\n", POP3_OK)
+                }
+            }
+        }
         "CAPA" => {
             let mut response = format!("{} Capability list follows\r\n", POP3_OK);
-            response.push_str("USER\r\n");
+            if session.policy.secure(session.tls) {
+                response.push_str("USER\r\n");
+            }
             response.push_str("UIDL\r\n");
             response.push_str("TOP\r\n");
+            if session.policy.tls_available
+                && !session.tls
+                && session.state == Pop3State::Authorization
+            {
+                response.push_str("STLS\r\n");
+            }
             // RFC 2449 / RFC 3206 extended response codes ([AUTH], [SYS/TEMP]).
             response.push_str("RESP-CODES\r\n");
             response.push_str("AUTH-RESP-CODE\r\n");
@@ -686,14 +920,24 @@ mod tests {
     // Stream-level tests (tokio::io::duplex)
     // ------------------------------------------------------------------
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
+    use tokio::io::{
+        AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf,
+    };
 
-    struct Client {
-        r: BufReader<ReadHalf<DuplexStream>>,
-        w: WriteHalf<DuplexStream>,
+    struct Client<S = DuplexStream> {
+        r: BufReader<ReadHalf<S>>,
+        w: WriteHalf<S>,
     }
 
-    impl Client {
+    impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
+        fn new(stream: S) -> Self {
+            let (r, w) = tokio::io::split(stream);
+            Client {
+                r: BufReader::new(r),
+                w,
+            }
+        }
+
         async fn send(&mut self, s: &str) {
             self.w.write_all(s.as_bytes()).await.unwrap();
         }
@@ -718,6 +962,26 @@ mod tests {
         }
     }
 
+    const TLS_OFF: TlsPolicy = TlsPolicy {
+        tls_available: false,
+        allow_plaintext: false,
+    };
+    const TLS_REQUIRED: TlsPolicy = TlsPolicy {
+        tls_available: true,
+        allow_plaintext: false,
+    };
+    const PLAINTEXT_OK: TlsPolicy = TlsPolicy {
+        tls_available: true,
+        allow_plaintext: true,
+    };
+    const PLAIN_TLS_OFF: Pop3Opts = Pop3Opts {
+        tls: false,
+        greet: true,
+        policy: TLS_OFF,
+    };
+    const AUTH_REFUSED: &str =
+        "-ERR [AUTH] Plaintext authentication disabled; use STLS or port 995\r\n";
+
     async fn connect(storage: &Arc<Storage>) -> (Client, tokio::task::JoinHandle<()>) {
         connect_with(storage, None).await
     }
@@ -730,10 +994,15 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:40001".parse().unwrap();
         let st = Arc::clone(storage);
         let handle = tokio::spawn(async move {
-            let _ = match read_timeout {
-                None => serve_pop3(server, peer, st).await,
-                Some(t) => serve_pop3_with(server, peer, st, t, WRITE_TIMEOUT).await,
-            };
+            let _ = serve_pop3_with(
+                server,
+                peer,
+                st,
+                read_timeout.unwrap_or(READ_TIMEOUT),
+                WRITE_TIMEOUT,
+                PLAIN_TLS_OFF,
+            )
+            .await;
         });
         let (r, w) = tokio::io::split(client);
         let mut c = Client {
@@ -826,7 +1095,15 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:40002".parse().unwrap();
         let st = Arc::clone(&storage);
         let handle = tokio::spawn(async move {
-            serve_pop3_with(server, peer, st, READ_TIMEOUT, Duration::from_millis(100)).await
+            serve_pop3_with(
+                server,
+                peer,
+                st,
+                READ_TIMEOUT,
+                Duration::from_millis(100),
+                PLAIN_TLS_OFF,
+            )
+            .await
         });
         let (_r, mut w) = tokio::io::split(client);
         w.write_all(b"CAPA\r\nCAPA\r\n").await.unwrap();
@@ -834,8 +1111,442 @@ mod tests {
             .await
             .expect("stalled session was not ended")
             .unwrap();
-        let err = result.expect_err("session should fail with a write timeout");
+        let Err(err) = result else {
+            panic!("session should fail with a write timeout");
+        };
         let io = err.downcast_ref::<std::io::Error>().expect("io error");
         assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    // ------------------------------------------------------------------
+    // TLS: STLS, [AUTH] refusal, implicit POP3S
+    // ------------------------------------------------------------------
+
+    type ConnTask = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
+    type ClientTls<S> = tokio_rustls::client::TlsStream<S>;
+
+    /// After QUIT on TLS the server sent close_notify: a clean EOF
+    /// (rustls reports `UnexpectedEof` otherwise).
+    async fn assert_clean_tls_eof(c: &mut Client<ClientTls<DuplexStream>>) {
+        let mut rest = String::new();
+        assert_eq!(c.r.read_line(&mut rest).await.unwrap(), 0, "{:?}", rest);
+    }
+
+    fn test_peer() -> SocketAddr {
+        "127.0.0.1:40000".parse().unwrap()
+    }
+
+    async fn self_signed(dir: &std::path::Path) -> Option<Arc<Tls>> {
+        Some(crate::tls::test_support::self_signed(dir).await)
+    }
+
+    /// A whole plain-listener connection (the spec 3.2 sequence); the
+    /// greeting is consumed.
+    async fn start_conn(
+        storage: &Arc<Storage>,
+        tls: Option<Arc<Tls>>,
+        policy: TlsPolicy,
+    ) -> (Client, ConnTask) {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let handle = tokio::spawn(serve_connection(
+            server,
+            test_peer(),
+            Arc::clone(storage),
+            tls,
+            policy,
+            false,
+        ));
+        let (r, w) = tokio::io::split(client);
+        let mut c = Client {
+            r: BufReader::new(r),
+            w,
+        };
+        assert!(c.line().await.starts_with("+OK"));
+        (c, handle)
+    }
+
+    /// Client side of the TLS handshake on `c`'s stream.
+    async fn upgrade(dir: &std::path::Path, c: Client) -> Client<ClientTls<DuplexStream>> {
+        assert!(c.r.buffer().is_empty(), "unread server bytes before TLS");
+        let raw = c.r.into_inner().unsplit(c.w);
+        Client::new(
+            crate::tls::test_support::connect(dir, raw)
+                .await
+                .expect("client handshake"),
+        )
+    }
+
+    #[tokio::test]
+    async fn capa_shows_stls_resp_codes_without_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED).await;
+        c.send("CAPA\r\n").await;
+        let capa = c.multiline().await;
+        assert!(capa.contains("\r\nSTLS\r\n"), "{}", capa);
+        assert!(capa.contains("\r\nRESP-CODES\r\n"), "{}", capa);
+        assert!(capa.contains("\r\nAUTH-RESP-CODE\r\n"), "{}", capa);
+        assert!(capa.contains("\r\nUIDL\r\n"), "{}", capa);
+        assert!(capa.contains("\r\nTOP\r\n"), "{}", capa);
+        assert!(!capa.contains("USER"), "{}", capa);
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn capa_per_policy_and_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        // TLS off: no STLS, USER listed.
+        let (mut c, _h) = start_conn(&storage, None, TLS_OFF).await;
+        c.send("CAPA\r\n").await;
+        let capa = c.multiline().await;
+        assert!(!capa.contains("STLS"), "{}", capa);
+        assert!(capa.contains("\r\nUSER\r\n"), "{}", capa);
+        // Plaintext allowed: STLS offered and USER listed.
+        let (mut c, _h) = start_conn(&storage, self_signed(dir.path()).await, PLAINTEXT_OK).await;
+        c.send("CAPA\r\n").await;
+        let capa = c.multiline().await;
+        assert!(capa.contains("\r\nSTLS\r\n"), "{}", capa);
+        assert!(capa.contains("\r\nUSER\r\n"), "{}", capa);
+        // After STLS: USER listed, STLS gone.
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED).await;
+        c.send("STLS\r\n").await;
+        assert_eq!(c.line().await, "+OK Begin TLS negotiation\r\n");
+        let mut c = upgrade(dir.path(), c).await;
+        c.send("CAPA\r\n").await;
+        let capa = c.multiline().await;
+        assert!(!capa.contains("STLS"), "{}", capa);
+        assert!(capa.contains("\r\nUSER\r\n"), "{}", capa);
+        c.send("QUIT\r\n").await;
+        c.line().await;
+        assert_clean_tls_eof(&mut c).await;
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn capa_after_login_omits_stls() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, PLAINTEXT_OK).await;
+        c.send("CAPA\r\n").await;
+        assert!(c.multiline().await.contains("\r\nSTLS\r\n"));
+        c.send("USER bob\r\nPASS pass word 123\r\n").await;
+        assert_eq!(c.line().await, "+OK User accepted\r\n");
+        assert_eq!(c.line().await, "+OK Logged in\r\n");
+        c.send("CAPA\r\n").await;
+        let capa = c.multiline().await;
+        assert!(!capa.contains("STLS"), "{}", capa);
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_before_tls_is_auth_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED).await;
+        c.send("USER bob\r\n").await;
+        let resp = c.line().await;
+        assert!(
+            resp.starts_with("-ERR [AUTH] Plaintext authentication disabled"),
+            "{}",
+            resp
+        );
+        assert_eq!(resp, AUTH_REFUSED);
+        // PASS is refused too (defence in depth), without a login attempt.
+        c.send("PASS pass word 123\r\n").await;
+        assert_eq!(c.line().await, AUTH_REFUSED);
+        c.send("STAT\r\n").await;
+        assert_eq!(c.line().await, "-ERR Not authenticated\r\n");
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn plaintext_allowed_policy_logs_in_without_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, PLAINTEXT_OK).await;
+        c.send("USER bob\r\nPASS pass word 123\r\n").await;
+        assert_eq!(c.line().await, "+OK User accepted\r\n");
+        assert_eq!(c.line().await, "+OK Logged in\r\n");
+        let bob = storage.user_manager().get_user("bob").await.unwrap();
+        assert!(!bob.login_history.last().unwrap().tls);
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stls_then_user_pass_retr_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::test_storage_encrypted(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED).await;
+        c.send("STLS\r\n").await;
+        assert_eq!(c.line().await, "+OK Begin TLS negotiation\r\n");
+        let mut c = upgrade(dir.path(), c).await;
+        // No greeting after the handshake: the first line is USER's reply.
+        c.send("USER bob\r\nPASS password123\r\n").await;
+        assert_eq!(c.line().await, "+OK User accepted\r\n");
+        assert_eq!(c.line().await, "+OK Logged in\r\n");
+        // TLS is already active.
+        c.send("STLS\r\n").await;
+        assert!(c.line().await.starts_with("-ERR"));
+        c.send("RETR 1\r\n").await;
+        let retr = c.multiline().await;
+        assert!(retr.contains("body 1"), "{}", retr);
+
+        let bob = storage.user_manager().get_user("bob").await.unwrap();
+        let rec = bob.login_history.last().unwrap();
+        assert!(rec.success);
+        assert!(rec.tls);
+        assert_eq!(rec.protocol, "POP3");
+
+        c.send("QUIT\r\n").await;
+        assert!(c.line().await.starts_with("+OK"));
+        assert_clean_tls_eof(&mut c).await;
+        h.await.unwrap().unwrap();
+        assert!(!first_message_content(&storage).await.contains("body 1"));
+    }
+
+    #[tokio::test]
+    async fn stls_with_argument_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED).await;
+        c.send("STLS now\r\n").await;
+        assert!(c.line().await.starts_with("-ERR"));
+        // Still plaintext and still refusing credentials.
+        c.send("USER bob\r\n").await;
+        assert_eq!(c.line().await, AUTH_REFUSED);
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stls_tls_off_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, None, TLS_OFF).await;
+        c.send("STLS\r\n").await;
+        assert!(c.line().await.starts_with("-ERR"));
+        c.send("NOOP\r\n").await;
+        assert_eq!(c.line().await, "+OK\r\n");
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    /// With plaintext auth allowed a client can log in before STLS; STLS is
+    /// then refused outside the AUTHORIZATION state.
+    #[tokio::test]
+    async fn stls_after_auth_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, PLAINTEXT_OK).await;
+        c.send("USER bob\r\nPASS pass word 123\r\n").await;
+        c.line().await;
+        assert_eq!(c.line().await, "+OK Logged in\r\n");
+        c.send("STLS\r\n").await;
+        assert!(c.line().await.starts_with("-ERR"));
+        // The session carries on in plaintext.
+        c.send("STAT\r\n").await;
+        assert!(c.line().await.starts_with("+OK 3 "));
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stls_after_user_before_pass_drops_username() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, PLAINTEXT_OK).await;
+        c.send("USER bob\r\n").await;
+        assert_eq!(c.line().await, "+OK User accepted\r\n");
+        c.send("STLS\r\n").await;
+        assert_eq!(c.line().await, "+OK Begin TLS negotiation\r\n");
+        let mut c = upgrade(dir.path(), c).await;
+        c.send("PASS pass word 123\r\n").await;
+        assert_eq!(c.line().await, "-ERR USER first\r\n");
+        let bob = storage.user_manager().get_user("bob").await.unwrap();
+        assert!(bob.login_history.is_empty(), "{:?}", bob.login_history);
+        c.send("QUIT\r\n").await;
+        c.line().await;
+        assert_clean_tls_eof(&mut c).await;
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn implicit_pop3s_session_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::test_storage_encrypted(dir.path()).await;
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let permit = Arc::clone(&connections).acquire_owned().await.unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(handle_connection(
+            server,
+            test_peer(),
+            Arc::clone(&storage),
+            self_signed(dir.path()).await,
+            TLS_REQUIRED,
+            true,
+            permit,
+        ));
+        let mut c = Client::new(
+            crate::tls::test_support::connect(dir.path(), client)
+                .await
+                .expect("client handshake"),
+        );
+        assert_eq!(c.line().await, "+OK kiss-mail POP3 server ready\r\n");
+        c.send("USER bob\r\nPASS password123\r\nRETR 1\r\n").await;
+        assert_eq!(c.line().await, "+OK User accepted\r\n");
+        assert_eq!(c.line().await, "+OK Logged in\r\n");
+        assert!(c.multiline().await.contains("body 1"));
+        let bob = storage.user_manager().get_user("bob").await.unwrap();
+        let rec = bob.login_history.last().unwrap();
+        assert!(rec.tls);
+        assert_eq!(rec.protocol, "POP3");
+        c.send("QUIT\r\n").await;
+        assert!(c.line().await.starts_with("+OK"));
+        assert_clean_tls_eof(&mut c).await;
+        task.await.unwrap();
+        assert_eq!(connections.available_permits(), MAX_CONNECTIONS);
+    }
+
+    #[tokio::test]
+    async fn stls_pipelined_commands_are_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED).await;
+        c.send("STLS\r\nUSER bob\r\nPASS pass word 123\r\n").await;
+        assert_eq!(c.line().await, "+OK Begin TLS negotiation\r\n");
+        let mut c = upgrade(dir.path(), c).await;
+        c.send("NOOP\r\n").await;
+        // The pipelined USER/PASS never got a reply: the first line under TLS
+        // is NOOP's.
+        assert_eq!(c.line().await, "+OK\r\n");
+        c.send("STAT\r\n").await;
+        assert_eq!(c.line().await, "-ERR Not authenticated\r\n");
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
+        c.send("QUIT\r\n").await;
+        c.line().await;
+        assert_clean_tls_eof(&mut c).await;
+        h.await.unwrap().unwrap();
+    }
+
+    /// Plaintext sent to the POP3S listener fails the handshake at once, gets
+    /// no POP3 reply, and frees the connection slot.
+    #[tokio::test]
+    async fn plaintext_on_implicit_listener_closes_fast_and_frees_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let permit = Arc::clone(&connections).acquire_owned().await.unwrap();
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(b"USER bob\r\n").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_connection(
+                server,
+                test_peer(),
+                storage,
+                self_signed(dir.path()).await,
+                TLS_REQUIRED,
+                true,
+                permit,
+            ),
+        )
+        .await
+        .expect("handle_connection returns within 1 s");
+        assert_eq!(connections.available_permits(), MAX_CONNECTIONS);
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        assert!(!String::from_utf8_lossy(&got).contains("+OK"), "{got:?}");
+    }
+
+    /// STLS accepted, then the client hangs up or sends garbage instead of a
+    /// ClientHello: no panic, the slot is freed.
+    #[tokio::test]
+    async fn stls_then_hangup_or_garbage_frees_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let tls = self_signed(dir.path()).await;
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        for garbage in [
+            None,
+            Some(&b"\x16\x03\x01garbage\r\n"[..]),
+            Some(b"NOOP\r\n"),
+        ] {
+            let permit = Arc::clone(&connections).acquire_owned().await.unwrap();
+            let (client, server) = tokio::io::duplex(4096);
+            let task = tokio::spawn(handle_connection(
+                server,
+                test_peer(),
+                Arc::clone(&storage),
+                tls.clone(),
+                TLS_REQUIRED,
+                false,
+                permit,
+            ));
+            let (r, w) = tokio::io::split(client);
+            let mut c = Client {
+                r: BufReader::new(r),
+                w,
+            };
+            c.line().await;
+            c.send("STLS\r\n").await;
+            assert_eq!(c.line().await, "+OK Begin TLS negotiation\r\n");
+            if let Some(bytes) = garbage {
+                c.w.write_all(bytes).await.unwrap();
+            }
+            drop(c);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("handle_connection returns promptly")
+                .expect("no panic");
+            assert_eq!(connections.available_permits(), MAX_CONNECTIONS);
+        }
+    }
+
+    #[tokio::test]
+    async fn pop3s_listener_without_tls_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let server = Pop3Server::new(storage, None, TLS_OFF);
+        let err = server
+            .run("127.0.0.1:0", Some("127.0.0.1:0"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("POP3S: "), "{err}");
+    }
+
+    #[tokio::test]
+    async fn session_returns_starttls_with_raw_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = setup(dir.path()).await;
+        let opts = Pop3Opts {
+            tls: false,
+            greet: false,
+            policy: TLS_REQUIRED,
+        };
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(serve_pop3_with(
+            server,
+            test_peer(),
+            storage,
+            READ_TIMEOUT,
+            WRITE_TIMEOUT,
+            opts,
+        ));
+        let (r, w) = tokio::io::split(client);
+        let mut c = Client {
+            r: BufReader::new(r),
+            w,
+        };
+        // greet = false: the first line is STLS's reply.
+        c.send("STLS\r\n").await;
+        assert_eq!(c.line().await, "+OK Begin TLS negotiation\r\n");
+        let end = task.await.unwrap().unwrap();
+        assert!(matches!(end, SessionEnd::StartTls(_)));
     }
 }

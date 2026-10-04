@@ -31,6 +31,15 @@ services:
       - "1143:1143"
       # POP3
       - "1100:1100"
+      # Implicit TLS: SMTPS (submission), IMAPS, POP3S. On a production host,
+      # publish the standard ports instead:
+      #   - "465:4465"
+      #   - "993:1993"
+      #   - "995:1995"
+      # (and 25:2525, 587:2525, 143:1143, 110:1100 for the plain/STARTTLS ones)
+      - "4465:4465"
+      - "1993:1993"
+      - "1995:1995"
       # Web Admin and REST API are published on the loopback interface only.
       # Put a TLS reverse proxy in front of the web admin for remote access, or
       # use an SSH tunnel (ssh -L 8080:127.0.0.1:8080 -L 8025:127.0.0.1:8025 host).
@@ -60,6 +69,22 @@ services:
       # bridge, so add that range when you put one in front:
       # KISS_MAIL_TRUSTED_PROXIES: "127.0.0.1/32,::1/128,172.16.0.0/12"
       
+      # TLS (IMAPS/SMTPS/POP3S and STARTTLS). Default "auto": use the
+      # certificate below, else /data/tls/cert.pem + key.pem, else a
+      # self-signed one in /data/tls (mail clients warn about it; Outlook and
+      # Gmail refuse it). Certificate files are reloaded within 60 seconds of
+      # a change, or at once on SIGHUP (docker compose kill -s HUP kiss-mail).
+      # KISS_MAIL_TLS: auto   # "off" disables TLS (and allows plaintext logins)
+      # KISS_MAIL_TLS_CERT: /certs/fullchain.pem
+      # KISS_MAIL_TLS_KEY: /certs/privkey.pem
+      # (mount them, e.g. "- ./certs:/certs:ro" under volumes; the files must
+      # be readable by uid 1000)
+
+      # Logins without TLS are refused by default. Set to true only while old
+      # clients still connect without TLS (passwords then cross the network in
+      # the clear):
+      # KISS_MAIL_ALLOW_PLAINTEXT_AUTH: "true"
+
       # Port configuration (inside the container; SMTP_PORT/IMAP_PORT/POP3_PORT
       # are deprecated aliases, log a warning and are removed in 0.3.0)
       KISS_MAIL_SMTP_PORT: 2525

@@ -5,20 +5,26 @@
 
 use crate::mime::{header, header_param, header_param_names, parse_headers, split_headers_body};
 use crate::proto::{
-    KeyLease, WRITE_TIMEOUT, accepted, decode_auth_plain, read_line_limited, write_all_timeout,
-    write_all_until,
+    KeyLease, SessionEnd, TlsPolicy, WRITE_TIMEOUT, accepted, decode_auth_plain, read_line_limited,
+    write_all_timeout, write_all_until,
 };
 use crate::storage::{AuthError, Email, EmailFlags, MessageMeta, Storage};
+use crate::tls::Tls;
 use chrono::NaiveDate;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
+use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const CAPABILITIES: &str = "IMAP4rev1 AUTH=PLAIN SASL-IR IDLE UNSELECT";
+/// Tagged reply to LOGIN/AUTHENTICATE while plaintext credentials are refused
+/// (RFC 5530 PRIVACYREQUIRED).
+const PRIVACY_REQUIRED_REPLY: &str = "NO [PRIVACYREQUIRED] TLS required; use STARTTLS or port 993";
+const STARTTLS_READY_REPLY: &str = "OK Begin TLS negotiation now";
 /// Maximum size of a command line (including synchronising literals).
 const MAX_COMMAND: usize = 64 * 1024;
 /// How often IDLE checks for new mail.
@@ -87,6 +93,34 @@ impl Default for Timeouts {
     }
 }
 
+/// How a session starts (see `serve_imap_with`).
+#[derive(Debug, Clone, Copy)]
+struct ImapOpts {
+    /// The stream is TLS-protected.
+    tls: bool,
+    /// Send the greeting (not after STARTTLS: RFC 3501 section 6.2.1).
+    greet: bool,
+    policy: TlsPolicy,
+}
+
+/// The capability list for a session state (spec section 4.2): `STARTTLS`
+/// only before login on a plaintext connection with TLS available, and
+/// `LOGINDISABLED` instead of `AUTH=PLAIN` while credentials are refused.
+/// After login neither `STARTTLS` nor `LOGINDISABLED` is listed.
+fn capabilities(on_tls: bool, authenticated: bool, policy: TlsPolicy) -> String {
+    let mut caps = vec!["IMAP4rev1"];
+    if !authenticated && !on_tls && policy.tls_available {
+        caps.push("STARTTLS");
+    }
+    if authenticated || policy.secure(on_tls) {
+        caps.push("AUTH=PLAIN");
+    } else {
+        caps.push("LOGINDISABLED");
+    }
+    caps.extend(["SASL-IR", "IDLE", "UNSELECT"]);
+    caps.join(" ")
+}
+
 #[derive(Debug)]
 struct ImapSession {
     state: ImapState,
@@ -96,9 +130,14 @@ struct ImapSession {
     selected: Option<Selected>,
     peer_ip: String,
     timeouts: Timeouts,
+    /// The session runs over TLS.
+    tls: bool,
+    policy: TlsPolicy,
 }
 
 impl ImapSession {
+    /// A plaintext session with TLS off (plaintext logins allowed);
+    /// `serve_imap_with` sets `tls` and `policy` from its options.
     fn new(peer_ip: String, storage: Arc<Storage>) -> Self {
         Self {
             state: ImapState::NotAuthenticated,
@@ -107,7 +146,25 @@ impl ImapSession {
             selected: None,
             peer_ip,
             timeouts: Timeouts::default(),
+            tls: false,
+            policy: TlsPolicy {
+                tls_available: false,
+                allow_plaintext: false,
+            },
         }
+    }
+
+    /// May credentials be exchanged on this connection?
+    fn secure(&self) -> bool {
+        self.policy.secure(self.tls)
+    }
+
+    fn capabilities(&self) -> String {
+        capabilities(
+            self.tls,
+            self.state != ImapState::NotAuthenticated,
+            self.policy,
+        )
     }
 
     fn user(&self) -> &str {
@@ -139,65 +196,206 @@ impl ImapSession {
 
 pub struct ImapServer {
     storage: Arc<Storage>,
+    /// TLS for STARTTLS and the implicit-TLS listener (`None`: TLS off).
+    tls: Option<Arc<Tls>>,
+    policy: TlsPolicy,
 }
 
 impl ImapServer {
-    pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<Storage>, tls: Option<Arc<Tls>>, policy: TlsPolicy) -> Self {
+        // The STARTTLS offer and the LOGINDISABLED policy must never disagree.
+        debug_assert_eq!(
+            tls.is_some(),
+            policy.tls_available,
+            "TLS presence and TlsPolicy disagree"
+        );
+        Self {
+            storage,
+            tls,
+            policy,
+        }
     }
 
-    pub async fn run(&self, addr: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!("IMAP server listening on {}", addr);
-        let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    /// Serve the plain listener on `plain_addr` and, when `tls_addr` is set,
+    /// the implicit-TLS (IMAPS) listener. Both share one connection limit.
+    pub async fn run(
+        &self,
+        plain_addr: &str,
+        tls_addr: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let plain = TcpListener::bind(plain_addr)
+            .await
+            .map_err(|e| format!("IMAP: cannot bind {}: {}", plain_addr, e))?;
+        tracing::info!("IMAP server listening on {}", plain_addr);
+        let implicit = match tls_addr {
+            None => None,
+            Some(addr) => {
+                if self.tls.is_none() {
+                    return Err("IMAPS: TLS is not configured".into());
+                }
+                let listener = TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| format!("IMAPS: cannot bind {}: {}", addr, e))?;
+                tracing::info!("IMAPS (implicit TLS) server listening on {}", addr);
+                Some(listener)
+            }
+        };
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
+        let plain_loop = self.accept_loop(plain, "IMAP", false, Arc::clone(&connections));
+        let implicit_loop = async {
+            match implicit {
+                Some(listener) => {
+                    self.accept_loop(listener, "IMAPS", true, Arc::clone(&connections))
+                        .await
+                }
+                None => std::future::pending().await,
+            }
+        };
+        tokio::try_join!(plain_loop, implicit_loop)?;
+        Ok(())
+    }
+
+    /// Accept connections on `listener` until the connection semaphore closes.
+    async fn accept_loop(
+        &self,
+        listener: TcpListener,
+        name: &'static str,
+        implicit: bool,
+        connections: Arc<Semaphore>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
-            let permit = Arc::clone(&limit).acquire_owned().await?;
-            let Some((socket, peer_addr)) = accepted("IMAP", listener.accept().await).await else {
+            // Wait for a free slot before accepting, so excess clients queue
+            // in the kernel backlog instead of consuming tasks.
+            let permit = Arc::clone(&connections)
+                .acquire_owned()
+                .await
+                .map_err(|e| format!("{}: {}", name, e))?;
+            let Some((socket, peer_addr)) = accepted(name, listener.accept().await).await else {
                 continue;
             };
-            tracing::info!("IMAP connection from {}", peer_addr);
-
-            let storage = Arc::clone(&self.storage);
-
-            tokio::spawn(async move {
-                let _permit = permit;
-                if let Err(e) = handle_imap_connection(socket, peer_addr, storage).await {
-                    tracing::error!("IMAP connection error: {}", e);
-                }
-            });
+            tracing::info!("{} connection from {}", name, peer_addr);
+            tokio::spawn(handle_connection(
+                socket,
+                peer_addr,
+                Arc::clone(&self.storage),
+                self.tls.clone(),
+                self.policy,
+                implicit,
+                permit,
+            ));
         }
     }
 }
 
-async fn handle_imap_connection(
-    socket: TcpStream,
-    peer: SocketAddr,
-    storage: Arc<Storage>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    serve_imap(socket, peer, storage).await
-}
-
-/// Serve one IMAP connection over any byte stream.
-pub async fn serve_imap<S>(
+/// Serve one accepted connection while holding its connection-slot
+/// `permit`. The session runs in its own task so a panic is logged here (and
+/// the slot released) instead of being lost.
+async fn handle_connection<S>(
     stream: S,
     peer: SocketAddr,
     storage: Arc<Storage>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    tls: Option<Arc<Tls>>,
+    policy: TlsPolicy,
+    implicit: bool,
+    permit: OwnedSemaphorePermit,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    serve_imap_with(stream, peer, storage, Timeouts::default()).await
+    let _permit = permit;
+    let inner = tokio::spawn(serve_connection(
+        stream, peer, storage, tls, policy, implicit,
+    ));
+    match inner.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("IMAP connection error ({}): {}", peer, e),
+        Err(e) if e.is_panic() => {
+            tracing::error!("IMAP connection task for {} panicked: {}", peer, e)
+        }
+        Err(e) => tracing::error!("IMAP connection task for {} failed: {}", peer, e),
+    }
 }
 
+/// The session restart sequence (spec section 3.2). On the implicit-TLS
+/// listener the handshake comes first; on the plain listener an accepted
+/// STARTTLS restarts the session over TLS with fresh state and no greeting.
+/// A failed or timed-out handshake just closes the connection.
+async fn serve_connection<S>(
+    stream: S,
+    peer: SocketAddr,
+    storage: Arc<Storage>,
+    tls: Option<Arc<Tls>>,
+    policy: TlsPolicy,
+    implicit: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let timeouts = Timeouts::default();
+    if implicit {
+        let Some(tls) = tls else {
+            return Err("IMAPS connection without a TLS configuration".into());
+        };
+        let stream = match tls.accept(stream).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::debug!("IMAPS handshake with {} failed: {}", peer, e);
+                return Ok(());
+            }
+        };
+        let opts = ImapOpts {
+            tls: true,
+            greet: true,
+            policy,
+        };
+        serve_imap_with(stream, peer, storage, timeouts, opts).await?;
+        return Ok(());
+    }
+
+    let opts = ImapOpts {
+        tls: false,
+        greet: true,
+        policy,
+    };
+    match serve_imap_with(stream, peer, Arc::clone(&storage), timeouts, opts).await? {
+        SessionEnd::Closed => Ok(()),
+        SessionEnd::StartTls(raw) => {
+            let Some(tls) = tls else {
+                return Err("STARTTLS accepted without a TLS configuration".into());
+            };
+            let stream = match tls.accept(raw).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::debug!("IMAP STARTTLS handshake with {} failed: {}", peer, e);
+                    return Ok(());
+                }
+            };
+            let opts = ImapOpts {
+                tls: true,
+                greet: false,
+                policy,
+            };
+            serve_imap_with(stream, peer, storage, timeouts, opts).await?;
+            Ok(())
+        }
+    }
+}
+
+/// Run one IMAP session over `stream`.
+///
+/// Returns `SessionEnd::StartTls` with the raw stream once STARTTLS has been
+/// accepted (the caller performs the handshake and starts a fresh session).
+/// Client bytes already buffered at that point are discarded with the
+/// `BufReader`, so commands pipelined after STARTTLS never run under TLS.
 async fn serve_imap_with<S>(
     stream: S,
     peer: SocketAddr,
     storage: Arc<Storage>,
     timeouts: Timeouts,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    opts: ImapOpts,
+) -> Result<SessionEnd<S>, Box<dyn std::error::Error + Send + Sync>>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -205,11 +403,48 @@ where
     // future ends (normally below, or by Drop on panic / cancellation).
     let mut session = ImapSession::new(peer.ip().to_string(), Arc::clone(&storage));
     session.timeouts = timeouts;
+    session.tls = opts.tls;
+    session.policy = opts.policy;
 
-    let result = imap_loop(&mut reader, &mut writer, &mut session, &storage).await;
+    let result = imap_loop(&mut reader, &mut writer, &mut session, &storage, opts.greet).await;
 
+    // A no-op after STARTTLS: it is only accepted before login.
     session.finish().await;
-    result
+    match result? {
+        LoopEnd::StartTls => Ok(SessionEnd::StartTls(reader.into_inner().unsplit(writer))),
+        LoopEnd::Closed => {
+            if opts.tls {
+                // Send close_notify (bounded, errors ignored: the session is over).
+                let _ = tokio::time::timeout(timeouts.write, writer.shutdown()).await;
+            }
+            Ok(SessionEnd::Closed)
+        }
+    }
+}
+
+/// How `imap_loop` ended.
+enum LoopEnd {
+    Closed,
+    /// STARTTLS was accepted and its OK sent; the stream must be upgraded.
+    StartTls,
+}
+
+/// The STARTTLS reply (spec section 4.2): `None` to accept, or the BAD
+/// reply. RFC 3501 defines only OK and BAD for STARTTLS.
+fn starttls_refusal(tag: &str, args: &str, session: &ImapSession) -> Option<String> {
+    let reason = if !session.policy.tls_available {
+        // Not advertised: the same reply as any unknown command.
+        "Unknown command"
+    } else if session.tls {
+        "TLS already active"
+    } else if !args.is_empty() {
+        "STARTTLS takes no arguments"
+    } else if session.state != ImapState::NotAuthenticated {
+        "STARTTLS not permitted after login"
+    } else {
+        return None;
+    };
+    Some(format!("{} BAD {}\r\n", tag, reason))
 }
 
 async fn imap_loop<R, W>(
@@ -217,17 +452,33 @@ async fn imap_loop<R, W>(
     writer: &mut W,
     session: &mut ImapSession,
     storage: &Storage,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    greet: bool,
+) -> Result<LoopEnd, Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let wt = session.timeouts.write;
-    write_all_timeout(writer, b"* OK kiss-mail IMAP4rev1 server ready\r\n", wt).await?;
+    if greet {
+        let greeting = format!(
+            "* OK [CAPABILITY {}] kiss-mail IMAP4rev1 server ready\r\n",
+            session.capabilities()
+        );
+        write_all_timeout(writer, greeting.as_bytes(), wt).await?;
+    }
 
+    // Set after a refused credential literal: a client that sends the literal
+    // anyway has it parsed as the next command, which must not reach the log.
+    let mut after_refusal = false;
     loop {
-        let read =
-            tokio::time::timeout(session.read_timeout(), read_command(reader, writer, wt)).await;
+        // Credentials may not be sent: LOGIN/AUTHENTICATE literals are refused
+        // before the `+` continuation (RFC 3501 section 7.5).
+        let refuse_credentials = session.state == ImapState::NotAuthenticated && !session.secure();
+        let read = tokio::time::timeout(
+            session.read_timeout(),
+            read_command(reader, writer, wt, refuse_credentials),
+        )
+        .await;
         let line = match read {
             Err(_) => {
                 write_all_timeout(writer, AUTOLOGOUT, wt).await?;
@@ -236,6 +487,7 @@ where
             Ok(r) => match r? {
                 None => break,
                 Some(Err(msg)) => {
+                    after_refusal = msg.contains(PRIVACY_REQUIRED_REPLY);
                     write_all_timeout(writer, msg.as_bytes(), wt).await?;
                     continue;
                 }
@@ -250,7 +502,10 @@ where
                 continue;
             }
         };
-        if cmd == "AUTHENTICATE" {
+        let redact = std::mem::take(&mut after_refusal);
+        if redact {
+            tracing::debug!("IMAP <- (line withheld after a refused credential literal)");
+        } else if cmd == "AUTHENTICATE" {
             tracing::debug!("IMAP <- {} AUTHENTICATE ...", tag);
         } else if cmd == "LOGIN" {
             tracing::debug!("IMAP <- {} LOGIN ...", tag);
@@ -259,6 +514,15 @@ where
         }
 
         let response: Vec<u8> = match cmd.as_str() {
+            "STARTTLS" => match starttls_refusal(tag, args, session) {
+                Some(bad) => bad.into_bytes(),
+                None => {
+                    let ok = format!("{} {}\r\n", tag, STARTTLS_READY_REPLY);
+                    tracing::debug!("IMAP -> {}", ok.trim_end());
+                    write_all_timeout(writer, ok.as_bytes(), wt).await?;
+                    return Ok(LoopEnd::StartTls);
+                }
+            },
             "AUTHENTICATE" => {
                 match handle_authenticate(tag, args, session, storage, reader, writer).await? {
                     Some(resp) => resp.into_bytes(),
@@ -287,16 +551,21 @@ where
         }
     }
 
-    Ok(())
+    Ok(LoopEnd::Closed)
 }
 
 /// Read one command, following synchronising (`{n}`) and non-synchronising
 /// (`{n+}`) literals. Literal contents are re-encoded as quoted strings so the
 /// rest of the parser only deals with one line.
+///
+/// With `refuse_credentials`, a synchronising literal in a LOGIN or
+/// AUTHENTICATE command gets the tagged PRIVACYREQUIRED refusal instead of
+/// the `+` continuation.
 async fn read_command<R, W>(
     reader: &mut R,
     writer: &mut W,
     write_timeout: Duration,
+    refuse_credentials: bool,
 ) -> std::io::Result<Option<Result<String, String>>>
 where
     R: AsyncBufRead + Unpin,
@@ -315,6 +584,16 @@ where
             command.push_str(line);
             return Ok(Some(Ok(command)));
         };
+        if sync && refuse_credentials {
+            // RFC 3501 section 7.5: reject instead of sending `+`, so the
+            // client never sends the credentials (and the literal is not read).
+            let so_far = format!("{}{}", command, before);
+            if let Some((tag, cmd, _)) = split_command(&so_far)
+                && (cmd == "LOGIN" || cmd == "AUTHENTICATE")
+            {
+                return Ok(Some(Err(format!("{} {}\r\n", tag, PRIVACY_REQUIRED_REPLY))));
+            }
+        }
         let used = command.len().saturating_add(before.len());
         if size > MAX_COMMAND.saturating_sub(used) {
             return Ok(Some(Err("* BAD Literal too large\r\n".to_string())));
@@ -1407,7 +1686,7 @@ async fn do_login(
     failed: &str,
 ) -> Result<(), String> {
     match storage
-        .login(username, password, &session.peer_ip, "IMAP")
+        .login(username, password, &session.peer_ip, "IMAP", session.tls)
         .await
     {
         Ok(outcome) => {
@@ -1498,6 +1777,10 @@ where
     if session.state != ImapState::NotAuthenticated {
         return Ok(Some(format!("{} BAD Already authenticated\r\n", tag)));
     }
+    // Before any `+` continuation, and before an initial response is decoded.
+    if !session.secure() {
+        return Ok(Some(format!("{} {}\r\n", tag, PRIVACY_REQUIRED_REPLY)));
+    }
     let mut words = args.split_whitespace();
     let mechanism = words.next().unwrap_or("").to_ascii_uppercase();
     if mechanism != "PLAIN" {
@@ -1548,7 +1831,8 @@ where
     {
         Ok(()) => format!(
             "{} OK [CAPABILITY {}] AUTHENTICATE completed\r\n",
-            tag, CAPABILITIES
+            tag,
+            session.capabilities()
         ),
         Err(no) => format!("{} NO {}\r\n", tag, no),
     };
@@ -1632,6 +1916,10 @@ async fn process_imap_command(
     if needs_auth && !authenticated {
         return format!("{} NO Not authenticated\r\n", tag).into();
     }
+    // Refuse plaintext credentials before the arguments are even parsed.
+    if cmd == "LOGIN" && !authenticated && !session.secure() {
+        return format!("{} {}\r\n", tag, PRIVACY_REQUIRED_REPLY).into();
+    }
     let max_depth = if authenticated { MAX_TOKEN_DEPTH } else { 1 };
     let Some(toks) = tokenize_with_depth(args, max_depth) else {
         return format!("{} BAD Invalid arguments\r\n", tag).into();
@@ -1677,7 +1965,8 @@ async fn process_text_command(
     match cmd {
         "CAPABILITY" => format!(
             "* CAPABILITY {}\r\n{} OK CAPABILITY completed\r\n",
-            CAPABILITIES, tag
+            session.capabilities(),
+            tag
         ),
         "NOOP" | "CHECK" => {
             let updates = refresh(session, storage).await;
@@ -1700,7 +1989,8 @@ async fn process_text_command(
             match do_login(session, storage, username, password, "LOGIN failed").await {
                 Ok(()) => format!(
                     "{} OK [CAPABILITY {}] LOGIN completed\r\n",
-                    tag, CAPABILITIES
+                    tag,
+                    session.capabilities()
                 ),
                 Err(no) => format!("{} NO {}\r\n", tag, no),
             }
@@ -2618,11 +2908,70 @@ mod tests {
         let input = format!("a LOGIN {{{}}}\r\n", usize::MAX);
         let mut reader = BufReader::new(input.as_bytes());
         let mut out = Vec::new();
-        let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT)
+        let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, false)
             .await
             .unwrap();
         assert_eq!(r, Some(Err("* BAD Literal too large\r\n".to_string())));
         assert!(out.is_empty(), "no continuation for an oversized literal");
+    }
+
+    #[tokio::test]
+    async fn credential_literal_refused_before_continuation_when_not_secure() {
+        // LOGIN / AUTHENTICATE in any case: the tagged refusal, no `+`, and
+        // the literal is not read.
+        for line in [
+            "a LOGIN bob {11}\r\n",
+            "a login {3}\r\n",
+            "a Login \"bob\" {11}\r\n",
+            "a AUTHENTICATE PLAIN {24}\r\n",
+            "a authenticate {5}\r\n",
+        ] {
+            let input = format!("{line}b NOOP\r\n");
+            let mut reader = BufReader::new(input.as_bytes());
+            let mut out = Vec::new();
+            let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                r,
+                Some(Err(format!("a {}\r\n", PRIVACY_REQUIRED_REPLY))),
+                "{line}"
+            );
+            assert!(out.is_empty(), "no continuation for {line}");
+            // The next command is read as a command, not as literal data.
+            let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, true)
+                .await
+                .unwrap();
+            assert_eq!(r, Some(Ok("b NOOP".to_string())), "{line}");
+        }
+
+        // When secure, LOGIN literals work as before.
+        let mut reader = BufReader::new(&b"a LOGIN bob {11}\r\npassword123\r\n"[..]);
+        let mut out = Vec::new();
+        let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, false)
+            .await
+            .unwrap();
+        assert_eq!(r, Some(Ok("a LOGIN bob \"password123\"".to_string())));
+        assert_eq!(out, b"+ Ready for literal data\r\n");
+
+        // Other commands with literals are unaffected while not secure.
+        let mut reader = BufReader::new(&b"a SELECT {5}\r\nINBOX\r\n"[..]);
+        let mut out = Vec::new();
+        let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, true)
+            .await
+            .unwrap();
+        assert_eq!(r, Some(Ok("a SELECT \"INBOX\"".to_string())));
+        assert_eq!(out, b"+ Ready for literal data\r\n");
+
+        // A non-synchronising literal (not advertised) is read as before;
+        // the command itself is refused later by process_imap_command.
+        let mut reader = BufReader::new(&b"a LOGIN bob {3+}\r\npw!\r\n"[..]);
+        let mut out = Vec::new();
+        let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, true)
+            .await
+            .unwrap();
+        assert_eq!(r, Some(Ok("a LOGIN bob \"pw!\"".to_string())));
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -2715,12 +3064,20 @@ mod tests {
 
     use tokio::io::{AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
-    struct Client {
-        r: BufReader<ReadHalf<DuplexStream>>,
-        w: WriteHalf<DuplexStream>,
+    struct Client<S = DuplexStream> {
+        r: BufReader<ReadHalf<S>>,
+        w: WriteHalf<S>,
     }
 
-    impl Client {
+    impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
+        fn new(stream: S) -> Self {
+            let (r, w) = tokio::io::split(stream);
+            Client {
+                r: BufReader::new(r),
+                w,
+            }
+        }
+
         async fn send(&mut self, s: &str) {
             self.w.write_all(s.as_bytes()).await.unwrap();
         }
@@ -2752,19 +3109,10 @@ mod tests {
         let (client, server) = tokio::io::duplex(1 << 16);
         let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = match timeouts {
-                None => serve_imap(server, peer, storage).await,
-                Some(t) => serve_imap_with(server, peer, storage, t).await,
-            };
+            let t = timeouts.unwrap_or_default();
+            let _ = serve_imap_with(server, peer, storage, t, PLAIN_TLS_OFF).await;
         });
-        let (r, w) = tokio::io::split(client);
-        (
-            Client {
-                r: BufReader::new(r),
-                w,
-            },
-            handle,
-        )
+        (Client::new(client), handle)
     }
 
     async fn connect_imap(storage: &Arc<Storage>) -> (Client, tokio::task::JoinHandle<()>) {
@@ -3037,8 +3385,11 @@ mod tests {
         // A tiny pipe the client never reads: CAPABILITY responses fill it.
         let (client, server) = tokio::io::duplex(64);
         let peer: SocketAddr = "127.0.0.1:40003".parse().unwrap();
-        let handle =
-            tokio::spawn(async move { serve_imap_with(server, peer, storage, timeouts).await });
+        let handle = tokio::spawn(async move {
+            serve_imap_with(server, peer, storage, timeouts, PLAIN_TLS_OFF)
+                .await
+                .map(drop)
+        });
         let (_r, mut w) = tokio::io::split(client);
         w.write_all(b"a CAPABILITY\r\n").await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(5), handle)
@@ -3070,7 +3421,11 @@ mod tests {
         let (client, server) = tokio::io::duplex(16);
         let peer: SocketAddr = "127.0.0.1:40004".parse().unwrap();
         let st = Arc::clone(&storage);
-        let handle = tokio::spawn(async move { serve_imap_with(server, peer, st, timeouts).await });
+        let handle = tokio::spawn(async move {
+            serve_imap_with(server, peer, st, timeouts, PLAIN_TLS_OFF)
+                .await
+                .map(drop)
+        });
         let (r, w) = tokio::io::split(client);
         let mut c = Client {
             r: BufReader::new(r),
@@ -3117,5 +3472,579 @@ mod tests {
         // The session's keys were released.
         assert!(!first_message_content(&storage).await.contains("body 1"));
         drop(c);
+    }
+
+    // ------------------------------------------------------------------
+    // TLS: STARTTLS, LOGINDISABLED, PRIVACYREQUIRED, implicit IMAPS
+    // ------------------------------------------------------------------
+
+    use crate::proto::SessionEnd;
+    use crate::tls::Tls;
+    use tokio_rustls::client::TlsStream as ClientTls;
+
+    /// TLS off: today's behaviour (plaintext LOGIN allowed, no STARTTLS).
+    const TLS_OFF: TlsPolicy = TlsPolicy {
+        tls_available: false,
+        allow_plaintext: false,
+    };
+    /// TLS configured, plaintext logins refused (the default).
+    const TLS_REQUIRED: TlsPolicy = TlsPolicy {
+        tls_available: true,
+        allow_plaintext: false,
+    };
+    /// TLS configured, `KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true`.
+    const PLAINTEXT_OK: TlsPolicy = TlsPolicy {
+        tls_available: true,
+        allow_plaintext: true,
+    };
+    /// A plain-listener session with TLS off.
+    const PLAIN_TLS_OFF: ImapOpts = ImapOpts {
+        tls: false,
+        greet: true,
+        policy: TLS_OFF,
+    };
+    const PRIVACY_REQUIRED: &str = "NO [PRIVACYREQUIRED] TLS required; use STARTTLS or port 993";
+
+    type ConnTask = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
+
+    fn test_peer() -> SocketAddr {
+        "127.0.0.1:40000".parse().unwrap()
+    }
+
+    async fn self_signed(dir: &std::path::Path) -> Option<Arc<Tls>> {
+        Some(crate::tls::test_support::self_signed(dir).await)
+    }
+
+    /// A whole plain-listener connection (the spec 3.2 sequence) over an
+    /// in-memory stream.
+    fn start_conn(
+        storage: &Arc<Storage>,
+        tls: Option<Arc<Tls>>,
+        policy: TlsPolicy,
+    ) -> (Client, ConnTask) {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let handle = tokio::spawn(serve_connection(
+            server,
+            test_peer(),
+            Arc::clone(storage),
+            tls,
+            policy,
+            false,
+        ));
+        (Client::new(client), handle)
+    }
+
+    /// Client side of the TLS handshake on `c`'s stream.
+    async fn upgrade(dir: &std::path::Path, c: Client) -> Client<ClientTls<DuplexStream>> {
+        assert!(c.r.buffer().is_empty(), "unread server bytes before TLS");
+        let raw = c.r.into_inner().unsplit(c.w);
+        Client::new(
+            crate::tls::test_support::connect(dir, raw)
+                .await
+                .expect("client handshake"),
+        )
+    }
+
+    /// After LOGOUT on TLS the server sent close_notify: a clean EOF
+    /// (rustls reports `UnexpectedEof` otherwise).
+    async fn assert_clean_tls_eof(c: &mut Client<ClientTls<DuplexStream>>) {
+        let mut rest = String::new();
+        assert_eq!(c.r.read_line(&mut rest).await.unwrap(), 0, "{:?}", rest);
+    }
+
+    fn plain_ir(user: &str, password: &str) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(format!("\0{}\0{}", user, password))
+    }
+
+    #[test]
+    fn capability_lists_per_state() {
+        assert_eq!(
+            capabilities(false, false, TLS_REQUIRED),
+            "IMAP4rev1 STARTTLS LOGINDISABLED SASL-IR IDLE UNSELECT"
+        );
+        assert_eq!(
+            capabilities(false, false, PLAINTEXT_OK),
+            "IMAP4rev1 STARTTLS AUTH=PLAIN SASL-IR IDLE UNSELECT"
+        );
+        assert_eq!(
+            capabilities(false, false, TLS_OFF),
+            "IMAP4rev1 AUTH=PLAIN SASL-IR IDLE UNSELECT"
+        );
+        for policy in [TLS_REQUIRED, PLAINTEXT_OK, TLS_OFF] {
+            assert_eq!(
+                capabilities(true, false, policy),
+                "IMAP4rev1 AUTH=PLAIN SASL-IR IDLE UNSELECT"
+            );
+            for on_tls in [false, true] {
+                let caps = capabilities(on_tls, true, policy);
+                assert!(!caps.contains("STARTTLS"), "{caps}");
+                assert!(!caps.contains("LOGINDISABLED"), "{caps}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn greeting_and_capability_show_starttls_and_logindisabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED);
+        let greeting = c.line().await;
+        assert_eq!(
+            greeting,
+            "* OK [CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED SASL-IR IDLE UNSELECT] \
+             kiss-mail IMAP4rev1 server ready\r\n"
+        );
+        c.send("a CAPABILITY\r\n").await;
+        let resp = c.until_tagged("a").await;
+        assert!(
+            resp.starts_with("* CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED "),
+            "{resp}"
+        );
+        assert!(!resp.contains("AUTH=PLAIN"), "{resp}");
+        c.send("z LOGOUT\r\n").await;
+        c.until_tagged("z").await;
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_before_tls_is_privacyrequired_without_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED);
+        c.line().await;
+        c.send("a LOGIN bob password123\r\n").await;
+        assert_eq!(c.line().await, format!("a {}\r\n", PRIVACY_REQUIRED));
+        // Malformed arguments get the same refusal (nothing is parsed).
+        c.send("b LOGIN ((x\r\n").await;
+        assert_eq!(c.line().await, format!("b {}\r\n", PRIVACY_REQUIRED));
+        c.send("c SELECT INBOX\r\n").await;
+        assert_eq!(c.line().await, "c NO Not authenticated\r\n");
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticate_before_tls_refused_without_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED);
+        c.line().await;
+        c.send("a AUTHENTICATE PLAIN\r\n").await;
+        // The next line is the tagged refusal, never a `+` continuation.
+        assert_eq!(c.line().await, format!("a {}\r\n", PRIVACY_REQUIRED));
+        // SASL-IR: valid and undecodable initial responses are not decoded.
+        c.send(&format!(
+            "b AUTHENTICATE PLAIN {}\r\n",
+            plain_ir("bob", "password123")
+        ))
+        .await;
+        assert_eq!(c.line().await, format!("b {}\r\n", PRIVACY_REQUIRED));
+        c.send("c AUTHENTICATE PLAIN !!not-base64!!\r\n").await;
+        assert_eq!(c.line().await, format!("c {}\r\n", PRIVACY_REQUIRED));
+        // The next line is a command again, not SASL data.
+        c.send("d NOOP\r\n").await;
+        assert_eq!(c.line().await, "d OK NOOP completed\r\n");
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_literal_before_tls_refused_without_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED);
+        c.line().await;
+        c.send("a LOGIN bob {11}\r\n").await;
+        // The tagged refusal, never `+ Ready for literal data`.
+        assert_eq!(c.line().await, format!("a {}\r\n", PRIVACY_REQUIRED));
+        // The client sends no literal; the next line is a command.
+        c.send("b NOOP\r\n").await;
+        assert_eq!(c.line().await, "b OK NOOP completed\r\n");
+        // Case-insensitive command name.
+        c.send("c login {3}\r\n").await;
+        assert_eq!(c.line().await, format!("c {}\r\n", PRIVACY_REQUIRED));
+        c.send("d NOOP\r\n").await;
+        assert_eq!(c.line().await, "d OK NOOP completed\r\n");
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticate_literal_before_tls_refused_without_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED);
+        c.line().await;
+        let ir = plain_ir("bob", "password123");
+        c.send(&format!("a AUTHENTICATE PLAIN {{{}}}\r\n", ir.len()))
+            .await;
+        assert_eq!(c.line().await, format!("a {}\r\n", PRIVACY_REQUIRED));
+        c.send("b NOOP\r\n").await;
+        assert_eq!(c.line().await, "b OK NOOP completed\r\n");
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn starttls_then_login_fetch_decrypts() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::test_storage_encrypted(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED);
+        assert!(c.line().await.starts_with("* OK [CAPABILITY "));
+        c.send("a STARTTLS\r\n").await;
+        assert_eq!(c.line().await, "a OK Begin TLS negotiation now\r\n");
+        let mut c = upgrade(dir.path(), c).await;
+
+        // No greeting after the handshake: the first line is CAPABILITY's.
+        c.send("b CAPABILITY\r\n").await;
+        assert_eq!(
+            c.line().await,
+            "* CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR IDLE UNSELECT\r\n"
+        );
+        assert_eq!(c.line().await, "b OK CAPABILITY completed\r\n");
+        // TLS is already active.
+        c.send("b2 STARTTLS\r\n").await;
+        assert!(c.line().await.starts_with("b2 BAD "));
+
+        c.send("c LOGIN bob password123\r\n").await;
+        let resp = c.until_tagged("c").await;
+        assert_eq!(
+            resp,
+            "c OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR IDLE UNSELECT] LOGIN completed\r\n"
+        );
+        c.send("d SELECT INBOX\r\n").await;
+        c.until_tagged("d").await;
+        c.send("e FETCH 1 BODY[]\r\n").await;
+        let resp = c.until_tagged("e").await;
+        assert!(resp.contains("body 1"), "{resp}");
+        assert!(resp.contains("e OK"), "{resp}");
+
+        let bob = storage.user_manager().get_user("bob").await.unwrap();
+        let rec = bob.login_history.last().unwrap();
+        assert!(rec.success);
+        assert!(rec.tls);
+        assert_eq!(rec.protocol, "IMAP");
+
+        c.send("f LOGOUT\r\n").await;
+        assert!(c.until_tagged("f").await.contains("* BYE"));
+        assert_clean_tls_eof(&mut c).await;
+        h.await.unwrap().unwrap();
+        // The session's keys were released.
+        assert!(!first_message_content(&storage).await.contains("body 1"));
+    }
+
+    #[tokio::test]
+    async fn starttls_after_login_is_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, PLAINTEXT_OK);
+        let greeting = c.line().await;
+        assert!(
+            greeting.starts_with("* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN "),
+            "{greeting}"
+        );
+        c.send("a LOGIN bob password123\r\n").await;
+        let resp = c.until_tagged("a").await;
+        assert!(resp.starts_with("a OK [CAPABILITY "), "{resp}");
+        assert!(!resp.contains("STARTTLS"), "{resp}");
+        assert!(!resp.contains("LOGINDISABLED"), "{resp}");
+        c.send("b CAPABILITY\r\n").await;
+        let resp = c.until_tagged("b").await;
+        assert!(!resp.contains("STARTTLS"), "{resp}");
+        c.send("c STARTTLS\r\n").await;
+        assert!(c.line().await.starts_with("c BAD "));
+        // The session goes on in plaintext.
+        c.send("d NOOP\r\n").await;
+        assert_eq!(c.line().await, "d OK NOOP completed\r\n");
+        // The plaintext login is recorded as such.
+        let bob = storage.user_manager().get_user("bob").await.unwrap();
+        assert!(!bob.login_history.last().unwrap().tls);
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn starttls_with_argument_is_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED);
+        c.line().await;
+        c.send("a STARTTLS now\r\n").await;
+        assert!(c.line().await.starts_with("a BAD "));
+        c.send("b NOOP\r\n").await;
+        assert_eq!(c.line().await, "b OK NOOP completed\r\n");
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn starttls_tls_off_is_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, None, TLS_OFF);
+        assert_eq!(
+            c.line().await,
+            "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR IDLE UNSELECT] \
+             kiss-mail IMAP4rev1 server ready\r\n"
+        );
+        c.send("a STARTTLS\r\n").await;
+        assert!(c.line().await.starts_with("a BAD "));
+        // Plaintext LOGIN works as before.
+        c.send("b LOGIN bob password123\r\n").await;
+        assert!(c.until_tagged("b").await.starts_with("b OK "));
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn implicit_imaps_session_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::test_storage_encrypted(dir.path()).await;
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let permit = Arc::clone(&connections).acquire_owned().await.unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(handle_connection(
+            server,
+            test_peer(),
+            Arc::clone(&storage),
+            self_signed(dir.path()).await,
+            TLS_REQUIRED,
+            true,
+            permit,
+        ));
+        let mut c = Client::new(
+            crate::tls::test_support::connect(dir.path(), client)
+                .await
+                .expect("client handshake"),
+        );
+        assert_eq!(
+            c.line().await,
+            "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR IDLE UNSELECT] \
+             kiss-mail IMAP4rev1 server ready\r\n"
+        );
+        c.send("a LOGIN bob password123\r\nb SELECT INBOX\r\nc FETCH 1 BODY[]\r\n")
+            .await;
+        assert!(c.until_tagged("a").await.starts_with("a OK "));
+        c.until_tagged("b").await;
+        assert!(c.until_tagged("c").await.contains("body 1"));
+        let bob = storage.user_manager().get_user("bob").await.unwrap();
+        let rec = bob.login_history.last().unwrap();
+        assert!(rec.tls);
+        assert_eq!(rec.protocol, "IMAP");
+        c.send("d LOGOUT\r\n").await;
+        c.until_tagged("d").await;
+        assert_clean_tls_eof(&mut c).await;
+        task.await.unwrap();
+        assert_eq!(connections.available_permits(), MAX_CONNECTIONS);
+    }
+
+    #[tokio::test]
+    async fn starttls_pipelined_commands_are_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED);
+        c.line().await;
+        c.send("a STARTTLS\r\nb LOGIN bob password123\r\n").await;
+        assert_eq!(c.line().await, "a OK Begin TLS negotiation now\r\n");
+        let mut c = upgrade(dir.path(), c).await;
+        c.send("c NOOP\r\n").await;
+        // `b` never got a reply: the first line under TLS is c's.
+        assert_eq!(c.line().await, "c OK NOOP completed\r\n");
+        // Still not authenticated, and no login was attempted.
+        c.send("d SELECT INBOX\r\n").await;
+        assert_eq!(c.line().await, "d NO Not authenticated\r\n");
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
+        c.send("e LOGOUT\r\n").await;
+        let resp = c.until_tagged("e").await;
+        assert!(!resp.contains("b "), "{resp}");
+        assert_clean_tls_eof(&mut c).await;
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_password_imap_restricted_works_after_starttls() {
+        let dir = tempfile::tempdir().unwrap();
+        let users = Arc::new(crate::users::UserManager::new(
+            "example.com".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        users.create_user("bob", "password123", None).await.unwrap();
+        let sso = Arc::new(crate::sso::SsoManager::new(
+            crate::sso::SsoConfig::default(),
+            dir.path().to_path_buf(),
+        ));
+        let app_pw = sso
+            .generate_app_password("bob", "phone", None)
+            .await
+            .unwrap();
+        sso.set_allowed_protocols_for_test("bob", &["IMAP"]).await;
+        let storage = Arc::new(Storage::with_encryption(
+            dir.path().to_path_buf(),
+            users,
+            Arc::new(crate::ldap::LdapClient::new(
+                crate::ldap::LdapConfig::default(),
+            )),
+            sso,
+            Arc::new(crate::crypto::CryptoManager::with_enabled(
+                dir.path().to_path_buf(),
+                false,
+            )),
+        ));
+        let tls = self_signed(dir.path()).await;
+
+        // After STARTTLS on the plain listener.
+        let (mut c, h) = start_conn(&storage, tls.clone(), TLS_REQUIRED);
+        c.line().await;
+        c.send("a STARTTLS\r\n").await;
+        assert_eq!(c.line().await, "a OK Begin TLS negotiation now\r\n");
+        let mut c = upgrade(dir.path(), c).await;
+        c.send(&format!("b LOGIN bob {}\r\n", quote(&app_pw))).await;
+        let resp = c.until_tagged("b").await;
+        assert!(resp.starts_with("b OK "), "{resp}");
+        c.send("c LOGOUT\r\n").await;
+        c.until_tagged("c").await;
+        h.await.unwrap().unwrap();
+
+        // Over implicit IMAPS, with AUTHENTICATE.
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let permit = Arc::clone(&connections).acquire_owned().await.unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(handle_connection(
+            server,
+            test_peer(),
+            Arc::clone(&storage),
+            tls,
+            TLS_REQUIRED,
+            true,
+            permit,
+        ));
+        let mut c = Client::new(
+            crate::tls::test_support::connect(dir.path(), client)
+                .await
+                .unwrap(),
+        );
+        c.line().await;
+        c.send(&format!(
+            "a AUTHENTICATE PLAIN {}\r\n",
+            plain_ir("bob", &app_pw)
+        ))
+        .await;
+        let resp = c.until_tagged("a").await;
+        assert!(resp.starts_with("a OK "), "{resp}");
+        c.send("b LOGOUT\r\n").await;
+        c.until_tagged("b").await;
+        task.await.unwrap();
+    }
+
+    /// Plaintext sent to the IMAPS listener fails the handshake at once, gets
+    /// no IMAP reply, and frees the connection slot.
+    #[tokio::test]
+    async fn plaintext_on_implicit_listener_closes_fast_and_frees_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let permit = Arc::clone(&connections).acquire_owned().await.unwrap();
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(b"a CAPABILITY\r\n").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_connection(
+                server,
+                test_peer(),
+                storage,
+                self_signed(dir.path()).await,
+                TLS_REQUIRED,
+                true,
+                permit,
+            ),
+        )
+        .await
+        .expect("handle_connection returns within 1 s");
+        assert_eq!(connections.available_permits(), MAX_CONNECTIONS);
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        assert!(!String::from_utf8_lossy(&got).contains("OK"), "{got:?}");
+    }
+
+    /// STARTTLS accepted, then the client hangs up or sends garbage instead
+    /// of a ClientHello: no panic, the slot is freed.
+    #[tokio::test]
+    async fn starttls_then_hangup_or_garbage_frees_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let tls = self_signed(dir.path()).await;
+        let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        for garbage in [
+            None,
+            Some(&b"\x16\x03\x01garbage\r\n"[..]),
+            Some(b"a NOOP\r\n"),
+        ] {
+            let permit = Arc::clone(&connections).acquire_owned().await.unwrap();
+            let (client, server) = tokio::io::duplex(4096);
+            let task = tokio::spawn(handle_connection(
+                server,
+                test_peer(),
+                Arc::clone(&storage),
+                tls.clone(),
+                TLS_REQUIRED,
+                false,
+                permit,
+            ));
+            let mut c = Client::new(client);
+            c.line().await;
+            c.send("a STARTTLS\r\n").await;
+            assert_eq!(c.line().await, "a OK Begin TLS negotiation now\r\n");
+            if let Some(bytes) = garbage {
+                c.w.write_all(bytes).await.unwrap();
+            }
+            drop(c);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("handle_connection returns promptly")
+                .expect("no panic");
+            assert_eq!(connections.available_permits(), MAX_CONNECTIONS);
+        }
+    }
+
+    #[tokio::test]
+    async fn imaps_listener_without_tls_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let server = ImapServer::new(storage, None, TLS_OFF);
+        let err = server
+            .run("127.0.0.1:0", Some("127.0.0.1:0"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("IMAPS: "), "{err}");
+    }
+
+    #[tokio::test]
+    async fn session_returns_starttls_with_raw_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let opts = ImapOpts {
+            tls: false,
+            greet: false,
+            policy: TLS_REQUIRED,
+        };
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(serve_imap_with(
+            server,
+            test_peer(),
+            storage,
+            Timeouts::default(),
+            opts,
+        ));
+        let mut c = Client::new(client);
+        // greet = false: the first line is STARTTLS's reply.
+        c.send("a STARTTLS\r\n").await;
+        assert_eq!(c.line().await, "a OK Begin TLS negotiation now\r\n");
+        let end = task.await.unwrap().unwrap();
+        assert!(matches!(end, SessionEnd::StartTls(_)));
     }
 }
