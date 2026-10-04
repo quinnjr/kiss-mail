@@ -1407,7 +1407,7 @@ async fn do_login(
     failed: &str,
 ) -> Result<(), String> {
     match storage
-        .login(username, password, &session.peer_ip, "IMAP")
+        .login(username, password, &session.peer_ip, "IMAP", false)
         .await
     {
         Ok(outcome) => {

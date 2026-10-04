@@ -915,7 +915,7 @@ async fn finish_auth(
     storage: &Storage,
 ) -> String {
     match storage
-        .authenticate_full(username, password, &session.peer_ip, "SMTP")
+        .authenticate_full(username, password, &session.peer_ip, "SMTP", false)
         .await
     {
         Ok(account) => {
@@ -1895,7 +1895,10 @@ mod tests {
         let saved = std::fs::read_to_string(dir.path().join("mailboxes.json")).unwrap();
         assert!(!saved.contains("TOP-SECRET-SMTP-BODY"));
 
-        let outcome = storage.login("bob", PW, "127.0.0.1", "IMAP").await.unwrap();
+        let outcome = storage
+            .login("bob", PW, "127.0.0.1", "IMAP", false)
+            .await
+            .unwrap();
         assert!(outcome.key_generation.is_some());
         let content = storage.email_content("bob", &email).await;
         assert!(content.contains("TOP-SECRET-SMTP-BODY"));

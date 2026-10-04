@@ -555,7 +555,7 @@ async fn login(
 
     let user = match state
         .user_manager
-        .authenticate(&req.username, &req.password, &ip, "admin-api")
+        .authenticate(&req.username, &req.password, &ip, "admin-api", false)
         .await
     {
         Ok(user) => user,
@@ -609,7 +609,13 @@ async fn change_own_password(
 ) -> Response {
     match state
         .user_manager
-        .change_password_from(&ip, &req.username, &req.current_password, &req.new_password)
+        .change_password_from(
+            &ip,
+            &req.username,
+            &req.current_password,
+            &req.new_password,
+            false,
+        )
         .await
     {
         Ok(()) => Json(ApiResponse::success(())).into_response(),

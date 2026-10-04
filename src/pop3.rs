@@ -336,7 +336,7 @@ async fn process_pop3_command(line: &str, session: &mut Pop3Session, storage: &S
                 return format!("{} Missing password\r\n", POP3_ERR);
             }
             match storage
-                .login(&username, password, &session.peer_ip, "POP3")
+                .login(&username, password, &session.peer_ip, "POP3", false)
                 .await
             {
                 Ok(outcome) => {
