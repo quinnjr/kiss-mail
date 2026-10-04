@@ -167,6 +167,12 @@ impl SmtpServer {
         tls: Option<Arc<Tls>>,
         policy: TlsPolicy,
     ) -> Self {
+        // The STARTTLS offer and the TLS-required policy must never disagree.
+        debug_assert_eq!(
+            tls.is_some(),
+            policy.tls_available,
+            "TLS presence and TlsPolicy disagree"
+        );
         Self {
             ctx: Arc::new(SmtpContext::new(
                 storage, groups, antispam, antivirus, hostname, tls, policy,

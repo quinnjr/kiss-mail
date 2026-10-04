@@ -1,5 +1,3 @@
-#![allow(dead_code)] // removed in Task 8 once wired
-
 //! Native TLS: certificate source selection, PEM validation, and the
 //! hot-reloading acceptor.
 
@@ -95,11 +93,8 @@ pub(crate) fn select_source(
 /// A validated certificate chain and key, ready to serve.
 pub(crate) struct LoadedCert {
     pub key: Arc<CertifiedKey>,
-    pub not_before: SystemTime,
     pub not_after: SystemTime,
     pub subject: String,
-    /// SHA-256 over the chain DER followed by the private key DER.
-    pub fingerprint: [u8; 32],
     /// DNS subjectAltNames of the leaf certificate, in certificate order.
     pub sans: Vec<String>,
 }
@@ -127,13 +122,6 @@ pub(crate) fn load_pair(cert: &Path, key: &Path, now: SystemTime) -> Result<Load
         }
         e => format!("cannot read private key {}: {e}", key.display()),
     })?;
-
-    let mut hasher = Sha256::new();
-    for c in &chain {
-        hasher.update(c.as_ref());
-    }
-    hasher.update(key_der.secret_der());
-    let fingerprint: [u8; 32] = hasher.finalize().into();
 
     let (not_before, not_after, subject, sans) = {
         let (_, x509) = x509_parser::parse_x509_certificate(chain[0].as_ref())
@@ -201,10 +189,8 @@ pub(crate) fn load_pair(cert: &Path, key: &Path, now: SystemTime) -> Result<Load
 
     Ok(LoadedCert {
         key: Arc::new(certified),
-        not_before,
         not_after,
         subject,
-        fingerprint,
         sans,
     })
 }
@@ -955,15 +941,13 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
             let k = write(d, &format!("{name}.key"), key);
             let loaded = load_pair(&c, &k, now()).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(loaded.subject, subject, "{name}");
-            assert!(loaded.not_before < now(), "{name}");
             assert!(
                 loaded.not_after > now() + Duration::from_secs(86400 * 365),
                 "{name}"
             );
-            assert_eq!(loaded.fingerprint.len(), 32);
             // Deterministic.
             let again = load_pair(&c, &k, now()).unwrap();
-            assert_eq!(loaded.fingerprint, again.fingerprint);
+            assert_eq!(leaf_fingerprint(&loaded.key), leaf_fingerprint(&again.key));
         }
     }
 
@@ -1071,7 +1055,10 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&dir.join("self-signed-cert.pem")), 0o600);
         assert_eq!(mode(&dir.join("self-signed-key.pem")), 0o600);
-        assert_eq!(c.not_after.duration_since(c.not_before).unwrap(), 397 * DAY);
+        let (_, x509) = x509_parser::parse_x509_certificate(c.key.cert[0].as_ref()).unwrap();
+        let v = x509.validity();
+        let validity = (v.not_after.timestamp() - v.not_before.timestamp()) as u64;
+        assert_eq!(Duration::from_secs(validity), 397 * DAY);
     }
 
     #[tokio::test]
@@ -1085,7 +1072,7 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
             .await
             .unwrap();
         assert!(r1 && !r2);
-        assert_eq!(a.fingerprint, b.fingerprint);
+        assert_eq!(leaf_fingerprint(&a.key), leaf_fingerprint(&b.key));
     }
 
     #[tokio::test]

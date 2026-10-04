@@ -142,7 +142,6 @@ pub(crate) fn configured_ports() -> Result<(u16, u16, u16), String> {
 
 /// TLS listener ports (SMTPS, IMAPS, POP3S): 465/993/995 as root, otherwise
 /// 4465/1993/1995.
-#[allow(dead_code)] // reason: used from Task 5 (SMTP STARTTLS)
 pub(crate) fn default_tls_ports() -> (u16, u16, u16) {
     if running_as_root() {
         (465, 993, 995)
@@ -153,7 +152,6 @@ pub(crate) fn default_tls_ports() -> (u16, u16, u16) {
 
 /// TLS ports from an env lookup (`KISS_MAIL_SMTPS_PORT`, `KISS_MAIL_IMAPS_PORT`,
 /// `KISS_MAIL_POP3S_PORT`). A TLS port equal to any plain port is an error.
-#[allow(dead_code)] // reason: used from Task 5 (SMTP STARTTLS)
 pub(crate) fn resolve_tls_ports(
     lookup: impl Fn(&str) -> Option<String>,
     plain: (u16, u16, u16),
@@ -179,7 +177,6 @@ pub(crate) fn resolve_tls_ports(
 }
 
 /// TLS ports from the environment, falling back to `default_tls_ports()`.
-#[allow(dead_code)] // reason: used from Task 5 (SMTP STARTTLS)
 pub(crate) fn configured_tls_ports(plain: (u16, u16, u16)) -> Result<(u16, u16, u16), String> {
     resolve_tls_ports(process_env, plain)
 }

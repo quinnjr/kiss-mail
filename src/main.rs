@@ -36,7 +36,10 @@ use admin_api::{AdminApiConfig, ApiState, RemoteClient};
 use admin_web::{SessionStore, WebAdminConfig, WebServices};
 use antispam::AntiSpam;
 use antivirus::AntiVirus;
-use config::{configured_ports, data_dir, default_ports, env_nonempty, mail_domain};
+use config::{
+    configured_ports, configured_tls_ports, data_dir, default_ports, default_tls_ports,
+    env_nonempty, mail_domain,
+};
 use groups::GroupManager;
 use ldap::LdapClient;
 use sso::SsoManager;
@@ -94,9 +97,6 @@ fn init_cli_logging() {
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     init_server_logging();
-    // Installed whatever the TLS mode and apart from shutdown_signal(), so a
-    // HUP reloads certificates instead of terminating the process.
-    tls::spawn_sighup_handler(None);
 
     // KISS_MAIL_DATA_DIR, then KISS_MAIL_DATA, then ./mail_data
     let data_dir = data_dir();
@@ -106,6 +106,42 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let (smtp_port, imap_port, pop3_port) = configured_ports()?;
     let api_config = AdminApiConfig::from_env()?;
     let web_config = WebAdminConfig::from_env()?;
+
+    // TLS: None when KISS_MAIL_TLS=off; a bad certificate aborts startup.
+    // The data dir is created first so it keeps default permissions (the
+    // self-signed fallback creates `tls/` with mode 0700).
+    tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
+        format!(
+            "Could not create data directory {}: {}",
+            data_dir.display(),
+            e
+        )
+    })?;
+    let tls = tls::Tls::from_env(&data_dir, &domain).await?;
+    // Installed whatever the TLS mode and apart from shutdown_signal(), so a
+    // HUP reloads certificates instead of terminating the process.
+    tls::spawn_sighup_handler(tls.clone());
+    if let Some(tls) = &tls {
+        tls.spawn_reloader();
+    }
+    // The single source of TLS availability for all three servers.
+    let policy = proto::TlsPolicy::from_env(tls.is_some());
+    let tls_ports = if tls.is_some() {
+        Some(configured_tls_ports((smtp_port, imap_port, pop3_port))?)
+    } else {
+        None
+    };
+    if let Some(line) = plaintext_banner_line(policy) {
+        tracing::warn!(
+            "{}: credentials may be sent without TLS ({})",
+            line,
+            if policy.tls_available {
+                "KISS_MAIL_ALLOW_PLAINTEXT_AUTH is set"
+            } else {
+                "TLS is disabled"
+            }
+        );
+    }
 
     // Initialize LDAP (needed for storage auth)
     let ldap_client = Arc::new(LdapClient::from_env());
@@ -206,23 +242,22 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&antispam),
         Arc::clone(&antivirus),
         domain.clone(),
-        None,
-        proto::TlsPolicy::from_env(false),
+        tls.clone(),
+        policy,
     );
-    let imap_server = imap::ImapServer::new(
-        Arc::clone(&storage),
-        None,
-        proto::TlsPolicy::from_env(false),
-    );
-    let pop3_server = pop3::Pop3Server::new(
-        Arc::clone(&storage),
-        None,
-        proto::TlsPolicy::from_env(false),
-    );
+    let imap_server = imap::ImapServer::new(Arc::clone(&storage), tls.clone(), policy);
+    let pop3_server = pop3::Pop3Server::new(Arc::clone(&storage), tls.clone(), policy);
 
-    let smtp_addr = format!("0.0.0.0:{}", smtp_port);
-    let imap_addr = format!("0.0.0.0:{}", imap_port);
-    let pop3_addr = format!("0.0.0.0:{}", pop3_port);
+    // TLS listeners bind on the same host as the plain ones.
+    const MAIL_BIND_HOST: &str = "0.0.0.0";
+    let smtp_addr = format!("{MAIL_BIND_HOST}:{smtp_port}");
+    let imap_addr = format!("{MAIL_BIND_HOST}:{imap_port}");
+    let pop3_addr = format!("{MAIL_BIND_HOST}:{pop3_port}");
+    let addr = |port: u16| Some(format!("{MAIL_BIND_HOST}:{port}"));
+    let (smtps_addr, imaps_addr, pop3s_addr) = match tls_ports {
+        Some((smtps, imaps, pop3s)) => (addr(smtps), addr(imaps), addr(pop3s)),
+        None => (None, None, None),
+    };
 
     // Admin API configuration
     let api_port = api_config.port;
@@ -235,9 +270,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Print startup info
     print_banner(
         &domain,
-        smtp_port,
-        imap_port,
-        pop3_port,
+        (smtp_port, imap_port, pop3_port),
+        tls_ports,
+        tls.as_ref().map(|t| t.status()).as_ref(),
+        policy,
         api_port,
         api_enabled,
         web_port,
@@ -269,21 +305,21 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let mut mail_servers: MailServers = JoinSet::new();
     mail_servers.spawn(async move {
         let r = smtp_server
-            .run(&smtp_addr, None)
+            .run(&smtp_addr, smtps_addr.as_deref())
             .await
             .map_err(|e| e.to_string());
         ("SMTP", r)
     });
     mail_servers.spawn(async move {
         let r = imap_server
-            .run(&imap_addr, None)
+            .run(&imap_addr, imaps_addr.as_deref())
             .await
             .map_err(|e| e.to_string());
         ("IMAP", r)
     });
     mail_servers.spawn(async move {
         let r = pop3_server
-            .run(&pop3_addr, None)
+            .run(&pop3_addr, pop3s_addr.as_deref())
             .await
             .map_err(|e| e.to_string());
         ("POP3", r)
@@ -1625,12 +1661,34 @@ async fn run_sso_cmd(cmd: &str, args: &[String]) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// The banner's TLS line (spec §2.6). `None` means `KISS_MAIL_TLS=off`.
+fn tls_banner_line(status: Option<&tls::TlsStatus>) -> String {
+    let Some(st) = status else {
+        return "TLS ✗ disabled (KISS_MAIL_TLS=off)".to_string();
+    };
+    let expires = chrono::DateTime::<chrono::Utc>::from(st.not_after).format("%Y-%m-%d");
+    if st.self_signed {
+        format!("TLS ⚠ self-signed (expires {expires})")
+    } else {
+        format!("TLS ✓ {} (expires {expires})", st.source)
+    }
+}
+
+/// The banner's plaintext warning, shown whenever credentials may cross a
+/// connection without TLS (the opt-out, or TLS off).
+fn plaintext_banner_line(policy: proto::TlsPolicy) -> Option<String> {
+    policy
+        .secure(false)
+        .then(|| "Plaintext logins ⚠ ALLOWED".to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn print_banner(
     domain: &str,
-    smtp: u16,
-    imap: u16,
-    pop3: u16,
+    (smtp, imap, pop3): (u16, u16, u16),
+    tls_ports: Option<(u16, u16, u16)>,
+    tls_status: Option<&tls::TlsStatus>,
+    policy: proto::TlsPolicy,
     api_port: u16,
     api_enabled: bool,
     web_port: u16,
@@ -1663,9 +1721,27 @@ async fn print_banner(
     println!("  📋 Groups:  {}", group_stats.total_groups);
     println!();
     println!("  Servers:");
-    println!("    SMTP  →  localhost:{}", smtp);
-    println!("    IMAP  →  localhost:{}", imap);
-    println!("    POP3  →  localhost:{}", pop3);
+    match tls_ports {
+        Some((smtps, imaps, pop3s)) => {
+            println!(
+                "    SMTP  →  localhost:{} (STARTTLS), SMTPS localhost:{} (TLS submission)",
+                smtp, smtps
+            );
+            println!(
+                "    IMAP  →  localhost:{} (STARTTLS), IMAPS localhost:{}",
+                imap, imaps
+            );
+            println!(
+                "    POP3  →  localhost:{} (STLS), POP3S localhost:{}",
+                pop3, pop3s
+            );
+        }
+        None => {
+            println!("    SMTP  →  localhost:{}", smtp);
+            println!("    IMAP  →  localhost:{}", imap);
+            println!("    POP3  →  localhost:{}", pop3);
+        }
+    }
     if api_enabled {
         println!("    API   →  localhost:{}", api_port);
     }
@@ -1674,6 +1750,10 @@ async fn print_banner(
     }
     println!();
     println!("  Security:");
+    println!("    {}", tls_banner_line(tls_status));
+    if let Some(line) = plaintext_banner_line(policy) {
+        println!("    {}", line);
+    }
     println!(
         "    Anti-spam   ✓ Rules + AI ({} patterns learned)",
         ai_stats.total_tokens
@@ -1748,6 +1828,8 @@ async fn print_banner(
 
 fn print_help() {
     let (smtp, imap, pop3) = configured_ports().unwrap_or_else(|_| default_ports());
+    let (smtps, imaps, pop3s) =
+        configured_tls_ports((smtp, imap, pop3)).unwrap_or_else(|_| default_tls_ports());
     println!(
         r#"
 KISS Mail - Simple Email Server
@@ -1831,6 +1913,9 @@ ENVIRONMENT:
     KISS_MAIL_SMTP_PORT   SMTP port (deprecated alias SMTP_PORT; default: 2525, or 25 if root)
     KISS_MAIL_IMAP_PORT   IMAP port (deprecated alias IMAP_PORT; default: 1143, or 143 if root)
     KISS_MAIL_POP3_PORT   POP3 port (deprecated alias POP3_PORT; default: 1100, or 110 if root)
+    KISS_MAIL_SMTPS_PORT  SMTPS (implicit TLS submission) port (default: 4465, or 465 if root)
+    KISS_MAIL_IMAPS_PORT  IMAPS port (default: 1993, or 993 if root)
+    KISS_MAIL_POP3S_PORT  POP3S port (default: 1995, or 995 if root)
     KISS_MAIL_ENCRYPTION  Set to 'false'/'0'/'no'/'off' to disable at-rest encryption
     KISS_MAIL_PUBLIC_URL  Public base URL of the web interface (e.g. https://mail.example.com);
                           used in "password change required" replies to mail clients
@@ -1838,6 +1923,20 @@ ENVIRONMENT:
                           kiss_mail=warn on stderr for CLI commands)
 
     Boolean settings accept 1/true/yes/on and 0/false/no/off (any case).
+
+TLS CONFIGURATION:
+    KISS_MAIL_TLS         'auto' (default) or 'off' (boolean aliases accepted). With
+                          auto, STARTTLS/STLS is offered on the plain ports and the
+                          SMTPS/IMAPS/POP3S ports are opened.
+    KISS_MAIL_TLS_CERT    PEM certificate chain file (set together with _KEY)
+    KISS_MAIL_TLS_KEY     PEM private key file (set together with _CERT)
+                          Without them, $KISS_MAIL_DATA_DIR/tls/cert.pem and key.pem
+                          are used if present, else a self-signed certificate is
+                          generated in $KISS_MAIL_DATA_DIR/tls/. Certificate files are
+                          re-checked every 60 s and on SIGHUP.
+    KISS_MAIL_ALLOW_PLAINTEXT_AUTH
+                          Allow logins before TLS on the plain ports (default: false).
+                          When TLS is off, plaintext logins are always allowed.
 
 FIRST RUN:
     If no 'admin' account exists, one is created with a random password that
@@ -1932,16 +2031,20 @@ REMOTE ADMINISTRATION:
 CONNECTING:
     Configure your email client with (ports as currently configured):
       Server:   localhost (or your server's address)
-      SMTP:     Port {smtp}
-      IMAP:     Port {imap}
-      POP3:     Port {pop3}
+      SMTP:     Port {smtps} (SSL/TLS), or port {smtp} with STARTTLS
+      IMAP:     Port {imaps} (SSL/TLS), or port {imap} with STARTTLS
+      POP3:     Port {pop3s} (SSL/TLS), or port {pop3} with STARTTLS (STLS)
       Username: your_username
       Password: your_password
-      Security: None (no TLS - put the server behind a TLS proxy)
+    Logins on the plain ports are refused until STARTTLS, unless
+    KISS_MAIL_ALLOW_PLAINTEXT_AUTH is set or KISS_MAIL_TLS=off.
 "#,
         smtp = smtp,
         imap = imap,
-        pop3 = pop3
+        pop3 = pop3,
+        smtps = smtps,
+        imaps = imaps,
+        pop3s = pop3s
     );
 }
 
@@ -2212,6 +2315,62 @@ mod tests {
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn utc_date(y: i32, m: u32, d: u32) -> std::time::SystemTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .into()
+    }
+
+    #[test]
+    fn banner_tls_line_formats() {
+        let files = tls::TlsStatus {
+            source: "/x/cert.pem".to_string(),
+            subject: "CN=mail.example.com".to_string(),
+            not_after: utc_date(2027, 1, 1),
+            self_signed: false,
+        };
+        assert_eq!(
+            tls_banner_line(Some(&files)),
+            "TLS ✓ /x/cert.pem (expires 2027-01-01)"
+        );
+        let fallback = tls::TlsStatus {
+            source: "self-signed".to_string(),
+            subject: "CN=localhost".to_string(),
+            not_after: utc_date(2027, 11, 5),
+            self_signed: true,
+        };
+        assert_eq!(
+            tls_banner_line(Some(&fallback)),
+            "TLS ⚠ self-signed (expires 2027-11-05)"
+        );
+        assert_eq!(tls_banner_line(None), "TLS ✗ disabled (KISS_MAIL_TLS=off)");
+    }
+
+    #[test]
+    fn plaintext_banner_line_iff_plaintext_allowed() {
+        let policy = |tls_available, allow_plaintext| proto::TlsPolicy {
+            tls_available,
+            allow_plaintext,
+        };
+        // TLS on, plaintext refused: no line.
+        assert_eq!(plaintext_banner_line(policy(true, false)), None);
+        // Opt-out, or TLS off: plaintext logins are allowed.
+        for p in [
+            policy(true, true),
+            policy(false, false),
+            policy(false, true),
+        ] {
+            assert!(p.secure(false));
+            assert_eq!(
+                plaintext_banner_line(p).as_deref(),
+                Some("Plaintext logins ⚠ ALLOWED")
+            );
+        }
     }
 
     #[test]
