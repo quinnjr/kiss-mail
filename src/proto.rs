@@ -8,14 +8,12 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 
 /// How a protocol session ended: the connection is done, or the client
 /// negotiated STARTTLS/STLS and the caller must upgrade the stream `S`.
-#[allow(dead_code)] // reason: used from Task 5 (SMTP STARTTLS)
 pub(crate) enum SessionEnd<S> {
     Closed,
     StartTls(S),
 }
 
 /// Whether plaintext authentication is acceptable on a connection.
-#[allow(dead_code)] // reason: used from Task 5 (SMTP STARTTLS)
 #[derive(Clone, Copy)]
 pub(crate) struct TlsPolicy {
     /// A TLS configuration is loaded, so STARTTLS/implicit TLS can be offered.
@@ -24,7 +22,6 @@ pub(crate) struct TlsPolicy {
     pub allow_plaintext: bool,
 }
 
-#[allow(dead_code)] // reason: used from Task 5 (SMTP STARTTLS)
 impl TlsPolicy {
     pub fn from_env(tls_available: bool) -> Self {
         Self {

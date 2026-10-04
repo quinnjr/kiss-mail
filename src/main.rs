@@ -206,6 +206,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&antispam),
         Arc::clone(&antivirus),
         domain.clone(),
+        None,
+        proto::TlsPolicy::from_env(false),
     );
     let imap_server = imap::ImapServer::new(Arc::clone(&storage));
     let pop3_server = pop3::Pop3Server::new(Arc::clone(&storage));
@@ -258,7 +260,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // SMTP/IMAP/POP3 are required (see `supervise`).
     let mut mail_servers: MailServers = JoinSet::new();
     mail_servers.spawn(async move {
-        let r = smtp_server.run(&smtp_addr).await.map_err(|e| e.to_string());
+        let r = smtp_server
+            .run(&smtp_addr, None)
+            .await
+            .map_err(|e| e.to_string());
         ("SMTP", r)
     });
     mail_servers.spawn(async move {

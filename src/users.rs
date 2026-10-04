@@ -1631,6 +1631,13 @@ impl UserManager {
         Ok(())
     }
 
+    /// Test-only: entry counts of the login throttle's (pair, source, user)
+    /// buckets.
+    #[cfg(test)]
+    pub(crate) fn throttle_sizes(&self) -> (usize, usize, usize) {
+        self.throttle.sizes()
+    }
+
     /// Reserve a login-throttle slot for an authentication path that does
     /// not go through [`UserManager::authenticate`] (LDAP binds, app
     /// passwords). Finish it with `success()` / `failure()`; dropping it

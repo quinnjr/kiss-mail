@@ -696,6 +696,48 @@ pub fn spawn_sighup_handler(tls: Option<Arc<Tls>>) {
     drop(tls);
 }
 
+/// Test helpers shared by the protocol modules: a self-signed [`Tls`] and a
+/// ring-provider rustls client that trusts it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A self-signed `Tls` for `localhost`, stored under `data_dir/tls`.
+    pub(crate) async fn self_signed(data_dir: &Path) -> Arc<Tls> {
+        Tls::from_parts(
+            TlsMode::Auto,
+            |_: &str| None,
+            data_dir,
+            "localhost",
+            SystemTime::now(),
+        )
+        .await
+        .unwrap()
+        .expect("TLS on")
+    }
+
+    /// Handshake as a client over `s`, trusting only the self-signed
+    /// certificate in `data_dir/tls`.
+    pub(crate) async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
+        data_dir: &Path,
+        s: S,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<S>> {
+        let pem = std::fs::read(data_dir.join("tls/self-signed-cert.pem"))?;
+        let cert = CertificateDer::from_pem_slice(&pem).map_err(std::io::Error::other)?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).map_err(std::io::Error::other)?;
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(std::io::Error::other)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect(name, s)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
