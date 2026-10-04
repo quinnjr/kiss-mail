@@ -468,8 +468,14 @@ where
     }
 
     loop {
-        let read =
-            tokio::time::timeout(session.read_timeout(), read_command(reader, writer, wt)).await;
+        // Credentials may not be sent: LOGIN/AUTHENTICATE literals are refused
+        // before the `+` continuation (RFC 3501 section 7.5).
+        let refuse_credentials = session.state == ImapState::NotAuthenticated && !session.secure();
+        let read = tokio::time::timeout(
+            session.read_timeout(),
+            read_command(reader, writer, wt, refuse_credentials),
+        )
+        .await;
         let line = match read {
             Err(_) => {
                 write_all_timeout(writer, AUTOLOGOUT, wt).await?;
@@ -544,10 +550,15 @@ where
 /// Read one command, following synchronising (`{n}`) and non-synchronising
 /// (`{n+}`) literals. Literal contents are re-encoded as quoted strings so the
 /// rest of the parser only deals with one line.
+///
+/// With `refuse_credentials`, a synchronising literal in a LOGIN or
+/// AUTHENTICATE command gets the tagged PRIVACYREQUIRED refusal instead of
+/// the `+` continuation.
 async fn read_command<R, W>(
     reader: &mut R,
     writer: &mut W,
     write_timeout: Duration,
+    refuse_credentials: bool,
 ) -> std::io::Result<Option<Result<String, String>>>
 where
     R: AsyncBufRead + Unpin,
@@ -566,6 +577,16 @@ where
             command.push_str(line);
             return Ok(Some(Ok(command)));
         };
+        if sync && refuse_credentials {
+            // RFC 3501 section 7.5: reject instead of sending `+`, so the
+            // client never sends the credentials (and the literal is not read).
+            let so_far = format!("{}{}", command, before);
+            if let Some((tag, cmd, _)) = split_command(&so_far)
+                && (cmd == "LOGIN" || cmd == "AUTHENTICATE")
+            {
+                return Ok(Some(Err(format!("{} {}\r\n", tag, PRIVACY_REQUIRED_REPLY))));
+            }
+        }
         let used = command.len().saturating_add(before.len());
         if size > MAX_COMMAND.saturating_sub(used) {
             return Ok(Some(Err("* BAD Literal too large\r\n".to_string())));
@@ -2880,11 +2901,70 @@ mod tests {
         let input = format!("a LOGIN {{{}}}\r\n", usize::MAX);
         let mut reader = BufReader::new(input.as_bytes());
         let mut out = Vec::new();
-        let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT)
+        let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, false)
             .await
             .unwrap();
         assert_eq!(r, Some(Err("* BAD Literal too large\r\n".to_string())));
         assert!(out.is_empty(), "no continuation for an oversized literal");
+    }
+
+    #[tokio::test]
+    async fn credential_literal_refused_before_continuation_when_not_secure() {
+        // LOGIN / AUTHENTICATE in any case: the tagged refusal, no `+`, and
+        // the literal is not read.
+        for line in [
+            "a LOGIN bob {11}\r\n",
+            "a login {3}\r\n",
+            "a Login \"bob\" {11}\r\n",
+            "a AUTHENTICATE PLAIN {24}\r\n",
+            "a authenticate {5}\r\n",
+        ] {
+            let input = format!("{line}b NOOP\r\n");
+            let mut reader = BufReader::new(input.as_bytes());
+            let mut out = Vec::new();
+            let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                r,
+                Some(Err(format!("a {}\r\n", PRIVACY_REQUIRED_REPLY))),
+                "{line}"
+            );
+            assert!(out.is_empty(), "no continuation for {line}");
+            // The next command is read as a command, not as literal data.
+            let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, true)
+                .await
+                .unwrap();
+            assert_eq!(r, Some(Ok("b NOOP".to_string())), "{line}");
+        }
+
+        // When secure, LOGIN literals work as before.
+        let mut reader = BufReader::new(&b"a LOGIN bob {11}\r\npassword123\r\n"[..]);
+        let mut out = Vec::new();
+        let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, false)
+            .await
+            .unwrap();
+        assert_eq!(r, Some(Ok("a LOGIN bob \"password123\"".to_string())));
+        assert_eq!(out, b"+ Ready for literal data\r\n");
+
+        // Other commands with literals are unaffected while not secure.
+        let mut reader = BufReader::new(&b"a SELECT {5}\r\nINBOX\r\n"[..]);
+        let mut out = Vec::new();
+        let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, true)
+            .await
+            .unwrap();
+        assert_eq!(r, Some(Ok("a SELECT \"INBOX\"".to_string())));
+        assert_eq!(out, b"+ Ready for literal data\r\n");
+
+        // A non-synchronising literal (not advertised) is read as before;
+        // the command itself is refused later by process_imap_command.
+        let mut reader = BufReader::new(&b"a LOGIN bob {3+}\r\npw!\r\n"[..]);
+        let mut out = Vec::new();
+        let r = read_command(&mut reader, &mut out, WRITE_TIMEOUT, true)
+            .await
+            .unwrap();
+        assert_eq!(r, Some(Ok("a LOGIN bob \"pw!\"".to_string())));
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -3568,6 +3648,45 @@ mod tests {
         // The next line is a command again, not SASL data.
         c.send("d NOOP\r\n").await;
         assert_eq!(c.line().await, "d OK NOOP completed\r\n");
+        assert_no_login_attempt(&storage).await;
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_literal_before_tls_refused_without_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED);
+        c.line().await;
+        c.send("a LOGIN bob {11}\r\n").await;
+        // The tagged refusal, never `+ Ready for literal data`.
+        assert_eq!(c.line().await, format!("a {}\r\n", PRIVACY_REQUIRED));
+        // The client sends no literal; the next line is a command.
+        c.send("b NOOP\r\n").await;
+        assert_eq!(c.line().await, "b OK NOOP completed\r\n");
+        // Case-insensitive command name.
+        c.send("c login {3}\r\n").await;
+        assert_eq!(c.line().await, format!("c {}\r\n", PRIVACY_REQUIRED));
+        c.send("d NOOP\r\n").await;
+        assert_eq!(c.line().await, "d OK NOOP completed\r\n");
+        assert_no_login_attempt(&storage).await;
+        drop(c);
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticate_literal_before_tls_refused_without_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path()).await;
+        let (mut c, h) = start_conn(&storage, self_signed(dir.path()).await, TLS_REQUIRED);
+        c.line().await;
+        let ir = plain_ir("bob", "password123");
+        c.send(&format!("a AUTHENTICATE PLAIN {{{}}}\r\n", ir.len()))
+            .await;
+        assert_eq!(c.line().await, format!("a {}\r\n", PRIVACY_REQUIRED));
+        c.send("b NOOP\r\n").await;
+        assert_eq!(c.line().await, "b OK NOOP completed\r\n");
         assert_no_login_attempt(&storage).await;
         drop(c);
         h.await.unwrap().unwrap();
