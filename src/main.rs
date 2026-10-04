@@ -94,6 +94,9 @@ fn init_cli_logging() {
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     init_server_logging();
+    // Installed whatever the TLS mode and apart from shutdown_signal(), so a
+    // HUP reloads certificates instead of terminating the process.
+    tls::spawn_sighup_handler(None);
 
     // KISS_MAIL_DATA_DIR, then KISS_MAIL_DATA, then ./mail_data
     let data_dir = data_dir();

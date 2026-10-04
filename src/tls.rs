@@ -1,15 +1,20 @@
 #![allow(dead_code)] // removed in Task 8 once wired
 
-//! Native TLS: certificate source selection and PEM validation.
+//! Native TLS: certificate source selection, PEM validation, and the
+//! hot-reloading acceptor.
 
+use rustls::ServerConfig;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::TlsAcceptor;
 
 /// `KISS_MAIL_TLS`: whether native TLS is offered at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +295,405 @@ fn create_tls_dir(dir: &Path) -> Result<(), String> {
     }
     b.create(dir)
         .map_err(|e| format!("cannot create TLS directory {}: {e}", dir.display()))
+}
+
+/// Upper bound on a TLS handshake (implicit TLS or after STARTTLS).
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often the reloader re-reads the active certificate files.
+const RELOAD_INTERVAL: Duration = Duration::from_secs(60);
+/// Warn this long before the serving certificate expires...
+const EXPIRY_WARN_WINDOW: Duration = Duration::from_secs(14 * 86_400);
+/// ...at most this often.
+const EXPIRY_WARN_EVERY: Duration = Duration::from_secs(86_400);
+
+const SELF_SIGNED_WARNING: &str = "Using a self-signed certificate; mail clients will warn, \
+     and Outlook/Gmail refuse it. Run certbot (see DEPLOY.md) or set \
+     KISS_MAIL_TLS_CERT/KISS_MAIL_TLS_KEY.";
+
+/// What the banner shows about the serving certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsStatus {
+    /// The certificate path, or `self-signed`.
+    pub source: String,
+    pub subject: String,
+    pub not_after: SystemTime,
+    pub self_signed: bool,
+}
+
+/// Result of one reload check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReloadOutcome {
+    /// The active files hash the same as the last successful load.
+    Unchanged,
+    /// A new certificate was validated and swapped in.
+    Reloaded,
+    /// The files changed but failed validation; the current cert stays.
+    Failed(String),
+    /// Self-signed with no fixed-location pair to upgrade to.
+    NothingToReload,
+}
+
+/// Serves whichever certificate was loaded last; swapped on reload. Live
+/// sessions keep the key they negotiated with.
+#[derive(Debug)]
+struct ReloadingResolver(RwLock<Arc<CertifiedKey>>);
+
+impl ReloadingResolver {
+    fn current(&self) -> Arc<CertifiedKey> {
+        Arc::clone(&self.0.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn set(&self, key: Arc<CertifiedKey>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = key;
+    }
+}
+
+impl ResolvesServerCert for ReloadingResolver {
+    fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.current())
+    }
+}
+
+/// The active source plus what the last successful load recorded.
+struct Active {
+    source: CertSource,
+    /// SHA-256 of the raw cert file bytes then key file bytes at the last
+    /// successful load; `None` for self-signed (those files are not watched).
+    file_fp: Option<[u8; 32]>,
+    subject: String,
+    not_after: SystemTime,
+}
+
+/// The TLS acceptor and its hot-reloading certificate.
+pub struct Tls {
+    resolver: Arc<ReloadingResolver>,
+    acceptor: TlsAcceptor,
+    data_dir: PathBuf,
+    active: Mutex<Active>,
+    /// Serializes reloads (timer and SIGHUP).
+    reload_lock: tokio::sync::Mutex<()>,
+    last_expiry_warn: Mutex<Option<SystemTime>>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// SHA-256 of the cert file bytes followed by the key file bytes, unparsed.
+async fn file_fingerprint(cert: &Path, key: &Path) -> Result<[u8; 32], String> {
+    let c = tokio::fs::read(cert)
+        .await
+        .map_err(|e| format!("cannot read certificate {}: {e}", cert.display()))?;
+    let k = tokio::fs::read(key)
+        .await
+        .map_err(|e| format!("cannot read private key {}: {e}", key.display()))?;
+    let mut h = Sha256::new();
+    h.update(&c);
+    h.update(&k);
+    Ok(h.finalize().into())
+}
+
+/// SHA-256 of the leaf certificate, as `openssl x509 -fingerprint -sha256`
+/// prints it, so operators can compare with what clients show.
+fn leaf_fingerprint(key: &CertifiedKey) -> String {
+    let digest = Sha256::digest(key.cert[0].as_ref());
+    digest
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn rfc3339(t: SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+}
+
+impl Tls {
+    /// Build from `KISS_MAIL_TLS`, `KISS_MAIL_TLS_CERT` and `KISS_MAIL_TLS_KEY`.
+    /// `None` when TLS is off; `Err` aborts startup.
+    pub async fn from_env(data_dir: &Path, domain: &str) -> Result<Option<Arc<Tls>>, String> {
+        let mode = parse_tls_mode(std::env::var("KISS_MAIL_TLS").ok().as_deref())?;
+        Self::from_parts(
+            mode,
+            |k| std::env::var(k).ok(),
+            data_dir,
+            domain,
+            SystemTime::now(),
+        )
+        .await
+    }
+
+    /// [`Tls::from_env`] with the mode, variable lookup and clock passed in.
+    pub(crate) async fn from_parts(
+        mode: TlsMode,
+        lookup: impl Fn(&str) -> Option<String>,
+        data_dir: &Path,
+        domain: &str,
+        now: SystemTime,
+    ) -> Result<Option<Arc<Tls>>, String> {
+        if mode == TlsMode::Off {
+            return Ok(None);
+        }
+        let source = select_source(lookup, data_dir)?;
+        let (loaded, file_fp) = match &source {
+            CertSource::Env { cert, key } | CertSource::FixedLocation { cert, key } => {
+                // Hash before loading: a change in between just reloads later.
+                let fp = file_fingerprint(cert, key).await?;
+                let loaded = load_pair(cert, key, now)?;
+                tracing::info!(
+                    "TLS certificate {}: subject {}, expires {}",
+                    cert.display(),
+                    loaded.subject,
+                    rfc3339(loaded.not_after)
+                );
+                (loaded, Some(fp))
+            }
+            CertSource::SelfSigned => {
+                let (loaded, regenerated) =
+                    ensure_self_signed(&data_dir.join("tls"), domain, now).await?;
+                if regenerated {
+                    tracing::warn!(
+                        "Generated a new self-signed TLS certificate; its fingerprint changed. \
+                         SHA-256 fingerprint: {}",
+                        leaf_fingerprint(&loaded.key)
+                    );
+                }
+                tracing::warn!("{SELF_SIGNED_WARNING}");
+                (loaded, None)
+            }
+        };
+
+        let resolver = Arc::new(ReloadingResolver(RwLock::new(Arc::clone(&loaded.key))));
+        let config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .map_err(|e| format!("TLS configuration: {e}"))?
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
+
+        let tls = Arc::new(Tls {
+            resolver,
+            acceptor: TlsAcceptor::from(Arc::new(config)),
+            data_dir: data_dir.to_path_buf(),
+            active: Mutex::new(Active {
+                source,
+                file_fp,
+                subject: loaded.subject,
+                not_after: loaded.not_after,
+            }),
+            reload_lock: tokio::sync::Mutex::new(()),
+            last_expiry_warn: Mutex::new(None),
+        });
+        tls.maybe_warn_expiry(now);
+        Ok(Some(tls))
+    }
+
+    /// Server-side handshake, bounded by [`HANDSHAKE_TIMEOUT`].
+    pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        s: S,
+    ) -> std::io::Result<tokio_rustls::server::TlsStream<S>> {
+        self.accept_with(s, HANDSHAKE_TIMEOUT).await
+    }
+
+    /// [`Tls::accept`] with an explicit timeout; a timeout is `TimedOut`.
+    pub(crate) async fn accept_with<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        s: S,
+        timeout: Duration,
+    ) -> std::io::Result<tokio_rustls::server::TlsStream<S>> {
+        match tokio::time::timeout(timeout, self.acceptor.accept(s)).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TLS handshake timed out",
+            )),
+        }
+    }
+
+    pub fn status(&self) -> TlsStatus {
+        let a = lock(&self.active);
+        let (source, self_signed) = match &a.source {
+            CertSource::Env { cert, .. } | CertSource::FixedLocation { cert, .. } => {
+                (cert.display().to_string(), false)
+            }
+            CertSource::SelfSigned => ("self-signed".to_string(), true),
+        };
+        TlsStatus {
+            source,
+            subject: a.subject.clone(),
+            not_after: a.not_after,
+            self_signed,
+        }
+    }
+
+    /// Re-read the active source's files and swap the cert in if they changed
+    /// and validate (§2.3).
+    pub(crate) async fn reload_now(&self) -> ReloadOutcome {
+        self.reload_at(SystemTime::now()).await
+    }
+
+    async fn reload_at(&self, now: SystemTime) -> ReloadOutcome {
+        let _serial = self.reload_lock.lock().await;
+        let (source, last_fp) = {
+            let a = lock(&self.active);
+            (a.source.clone(), a.file_fp)
+        };
+        let (cert, key, upgrade) = match source {
+            CertSource::Env { cert, key } | CertSource::FixedLocation { cert, key } => {
+                (cert, key, false)
+            }
+            // Self-signed upgrades as soon as a real pair is installed.
+            CertSource::SelfSigned => match select_source(|_| None, &self.data_dir) {
+                Ok(CertSource::FixedLocation { cert, key }) => (cert, key, true),
+                Ok(_) => return ReloadOutcome::NothingToReload,
+                Err(e) => return ReloadOutcome::Failed(e),
+            },
+        };
+        let fp = match file_fingerprint(&cert, &key).await {
+            Ok(fp) => fp,
+            Err(e) => return ReloadOutcome::Failed(e),
+        };
+        if Some(fp) == last_fp {
+            return ReloadOutcome::Unchanged;
+        }
+        let loaded = match load_pair(&cert, &key, now) {
+            Ok(l) => l,
+            Err(e) => return ReloadOutcome::Failed(e),
+        };
+        self.resolver.set(Arc::clone(&loaded.key));
+        {
+            let mut a = lock(&self.active);
+            if upgrade {
+                a.source = CertSource::FixedLocation { cert, key };
+            }
+            a.file_fp = Some(fp);
+            a.subject = loaded.subject;
+            a.not_after = loaded.not_after;
+        }
+        // A new certificate gets its own expiry warning schedule.
+        *lock(&self.last_expiry_warn) = None;
+        ReloadOutcome::Reloaded
+    }
+
+    /// Log a WARN when the serving cert expires within 14 days, at most once
+    /// per 24 h. Returns whether it warned.
+    fn maybe_warn_expiry(&self, now: SystemTime) -> bool {
+        let st = self.status();
+        let warn_from = st
+            .not_after
+            .checked_sub(EXPIRY_WARN_WINDOW)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if now < warn_from {
+            return false;
+        }
+        let mut last = lock(&self.last_expiry_warn);
+        if let Some(prev) = *last {
+            // A clock that went backwards counts as "warned recently".
+            let elapsed = now.duration_since(prev).unwrap_or(Duration::ZERO);
+            if elapsed < EXPIRY_WARN_EVERY {
+                return false;
+            }
+        }
+        *last = Some(now);
+        drop(last);
+        if now >= st.not_after {
+            tracing::warn!(
+                "TLS certificate {} ({}) expired on {}; renew it (e.g. certbot renew)",
+                st.source,
+                st.subject,
+                rfc3339(st.not_after)
+            );
+        } else {
+            let days = st
+                .not_after
+                .duration_since(now)
+                .unwrap_or_default()
+                .as_secs()
+                / 86_400;
+            tracing::warn!(
+                "TLS certificate {} ({}) expires in {days} day(s), on {}; renew it (e.g. certbot renew)",
+                st.source,
+                st.subject,
+                rfc3339(st.not_after)
+            );
+        }
+        true
+    }
+
+    /// Check for new certificate files every 60 s and log expiry warnings.
+    /// The task ends once the last other reference to `self` is dropped.
+    pub fn spawn_reloader(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(RELOAD_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // the first tick is immediate; startup just loaded
+            loop {
+                tick.tick().await;
+                let Some(tls) = weak.upgrade() else { break };
+                let outcome = tls.reload_now().await;
+                tls.log_outcome("periodic check", &outcome);
+                tls.maybe_warn_expiry(SystemTime::now());
+            }
+        });
+    }
+
+    fn log_outcome(&self, trigger: &str, outcome: &ReloadOutcome) {
+        match outcome {
+            ReloadOutcome::Reloaded => {
+                let st = self.status();
+                tracing::info!(
+                    "TLS certificate reloaded ({trigger}) from {}: subject {}, expires {}",
+                    st.source,
+                    st.subject,
+                    rfc3339(st.not_after)
+                );
+            }
+            ReloadOutcome::Failed(e) => tracing::error!(
+                "TLS certificate reload failed ({trigger}); keeping the current certificate: {e}"
+            ),
+            ReloadOutcome::Unchanged => {
+                tracing::debug!("TLS certificate unchanged ({trigger})")
+            }
+            ReloadOutcome::NothingToReload => {
+                tracing::debug!("TLS: self-signed, no certificate files to load ({trigger})")
+            }
+        }
+    }
+}
+
+/// Install the SIGHUP listener (Unix). Each HUP triggers an immediate reload
+/// of `tls`, or logs "SIGHUP: nothing to reload" without one. This is separate
+/// from the shutdown signals, so a HUP never stops the server.
+pub fn spawn_sighup_handler(tls: Option<Arc<Tls>>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("cannot install the SIGHUP handler: {e}");
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            while hup.recv().await.is_some() {
+                match &tls {
+                    Some(tls) => {
+                        let outcome = tls.reload_now().await;
+                        if outcome == ReloadOutcome::NothingToReload {
+                            tracing::info!("SIGHUP: nothing to reload");
+                        } else {
+                            tls.log_outcome("SIGHUP", &outcome);
+                        }
+                    }
+                    None => tracing::info!("SIGHUP: nothing to reload"),
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    drop(tls);
 }
 
 #[cfg(test)]
@@ -666,5 +1070,371 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
             .await
             .unwrap();
         assert!(r);
+    }
+
+    // ---- Task 3: Tls handle ----
+
+    use rustls::pki_types::ServerName;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn valid_pair() -> (String, String) {
+        make_cert("localhost", (2020, 1, 1), (2200, 1, 1))
+    }
+
+    fn cert_der(pem: &str) -> CertificateDer<'static> {
+        CertificateDer::from_pem_slice(pem.as_bytes()).unwrap()
+    }
+
+    fn sha(der: &[u8]) -> [u8; 32] {
+        Sha256::digest(der).into()
+    }
+
+    /// Write `$DATA_DIR/tls/{cert,key}.pem`.
+    fn write_fixed(data_dir: &Path, cert: &str, key: &str) {
+        let tls = data_dir.join("tls");
+        fs::create_dir_all(&tls).unwrap();
+        fs::write(tls.join("cert.pem"), cert).unwrap();
+        fs::write(tls.join("key.pem"), key).unwrap();
+    }
+
+    async fn tls_with_fixed(data_dir: &Path, cert: &str, key: &str) -> Arc<Tls> {
+        write_fixed(data_dir, cert, key);
+        Tls::from_parts(TlsMode::Auto, no_env, data_dir, "localhost", now())
+            .await
+            .unwrap()
+            .expect("TLS on")
+    }
+
+    type ClientStream = tokio_rustls::client::TlsStream<DuplexStream>;
+    type ServerStream = tokio_rustls::server::TlsStream<DuplexStream>;
+
+    /// Handshake a ring-provider client that trusts only `trust` against `tls`.
+    async fn handshake(
+        tls: &Tls,
+        trust: &CertificateDer<'static>,
+    ) -> Result<(ClientStream, ServerStream), String> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trust.clone()).unwrap();
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+        let (c, s) = tokio::io::duplex(64 * 1024);
+        let name = ServerName::try_from("localhost").unwrap();
+        let (cr, sr) = tokio::join!(connector.connect(name, c), tls.accept(s));
+        Ok((
+            cr.map_err(|e| format!("client: {e}"))?,
+            sr.map_err(|e| format!("server: {e}"))?,
+        ))
+    }
+
+    fn peer_cert(c: &ClientStream) -> CertificateDer<'static> {
+        c.get_ref().1.peer_certificates().unwrap()[0]
+            .clone()
+            .into_owned()
+    }
+
+    #[tokio::test]
+    async fn off_mode_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = Tls::from_parts(TlsMode::Off, no_env, dir.path(), "localhost", now())
+            .await
+            .unwrap();
+        assert!(tls.is_none());
+        assert!(!dir.path().join("tls").exists(), "Off must not touch disk");
+    }
+
+    #[tokio::test]
+    async fn self_signed_handshake_presents_localhost() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = Tls::from_parts(TlsMode::Auto, no_env, dir.path(), "localhost", now())
+            .await
+            .unwrap()
+            .unwrap();
+        let st = tls.status();
+        assert!(st.self_signed);
+        assert_eq!(st.source, "self-signed");
+        assert_eq!(st.subject, "localhost");
+        let pem = fs::read_to_string(dir.path().join("tls/self-signed-cert.pem")).unwrap();
+        let trust = cert_der(&pem);
+        let (client, _server) = handshake(&tls, &trust).await.unwrap();
+        let peer = peer_cert(&client);
+        assert_eq!(peer, trust);
+        let (_, x509) = x509_parser::parse_x509_certificate(peer.as_ref()).unwrap();
+        let san = x509.subject_alternative_name().unwrap().unwrap();
+        assert!(
+            san.value.general_names.iter().any(|n| matches!(
+                n,
+                x509_parser::extensions::GeneralName::DNSName("localhost")
+            )),
+            "SANs: {:?}",
+            san.value.general_names
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_location_status_and_unchanged_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, k) = valid_pair();
+        let tls = tls_with_fixed(dir.path(), &c, &k).await;
+        let st = tls.status();
+        assert!(!st.self_signed);
+        assert_eq!(
+            st.source,
+            dir.path().join("tls/cert.pem").display().to_string()
+        );
+        assert_eq!(tls.reload_now().await, ReloadOutcome::Unchanged);
+    }
+
+    #[tokio::test]
+    async fn reload_swaps_cert_for_new_handshakes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c1, k1) = valid_pair();
+        let tls = tls_with_fixed(dir.path(), &c1, &k1).await;
+        let (client, _) = handshake(&tls, &cert_der(&c1)).await.unwrap();
+        assert_eq!(
+            sha(peer_cert(&client).as_ref()),
+            sha(cert_der(&c1).as_ref())
+        );
+
+        let (c2, k2) = valid_pair();
+        write_fixed(dir.path(), &c2, &k2);
+        assert_eq!(tls.reload_now().await, ReloadOutcome::Reloaded);
+        let (client, _) = handshake(&tls, &cert_der(&c2)).await.unwrap();
+        assert_eq!(
+            sha(peer_cert(&client).as_ref()),
+            sha(cert_der(&c2).as_ref())
+        );
+        assert_eq!(tls.reload_now().await, ReloadOutcome::Unchanged);
+    }
+
+    #[tokio::test]
+    async fn reload_mismatched_intermediate_state_heals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c1, k1) = valid_pair();
+        let tls = tls_with_fixed(dir.path(), &c1, &k1).await;
+        let (c2, k2) = valid_pair();
+        // New cert lands before its key.
+        fs::write(dir.path().join("tls/cert.pem"), &c2).unwrap();
+        match tls.reload_now().await {
+            ReloadOutcome::Failed(e) => assert!(e.contains("does not match"), "{e}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Failure is not recorded: the same files fail again (retry).
+        assert!(matches!(tls.reload_now().await, ReloadOutcome::Failed(_)));
+        // Old cert still served.
+        let (client, _) = handshake(&tls, &cert_der(&c1)).await.unwrap();
+        assert_eq!(peer_cert(&client), cert_der(&c1));
+        fs::write(dir.path().join("tls/key.pem"), &k2).unwrap();
+        assert_eq!(tls.reload_now().await, ReloadOutcome::Reloaded);
+        let (client, _) = handshake(&tls, &cert_der(&c2)).await.unwrap();
+        assert_eq!(peer_cert(&client), cert_der(&c2));
+    }
+
+    #[tokio::test]
+    async fn reload_expired_replacement_fails_and_keeps_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c1, k1) = valid_pair();
+        let tls = tls_with_fixed(dir.path(), &c1, &k1).await;
+        let (c2, k2) = make_cert("localhost", (2020, 1, 1), (2021, 1, 1));
+        write_fixed(dir.path(), &c2, &k2);
+        match tls.reload_now().await {
+            ReloadOutcome::Failed(e) => assert!(e.contains("expired"), "{e}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let (client, _) = handshake(&tls, &cert_der(&c1)).await.unwrap();
+        assert_eq!(peer_cert(&client), cert_der(&c1));
+        assert_eq!(tls.status().not_after, load_status_not_after(&c1, &k1));
+    }
+
+    fn load_status_not_after(cert: &str, key: &str) -> SystemTime {
+        let d = tempfile::tempdir().unwrap();
+        let c = write(d.path(), "c.pem", cert);
+        let k = write(d.path(), "k.pem", key);
+        load_pair(&c, &k, now()).unwrap().not_after
+    }
+
+    #[tokio::test]
+    async fn reload_missing_files_fails_and_keeps_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c1, k1) = valid_pair();
+        let tls = tls_with_fixed(dir.path(), &c1, &k1).await;
+        fs::remove_file(dir.path().join("tls/key.pem")).unwrap();
+        match tls.reload_now().await {
+            ReloadOutcome::Failed(e) => assert!(e.contains("key.pem"), "{e}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let (client, _) = handshake(&tls, &cert_der(&c1)).await.unwrap();
+        assert_eq!(peer_cert(&client), cert_der(&c1));
+    }
+
+    #[tokio::test]
+    async fn self_signed_upgrades_to_fixed_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = Tls::from_parts(TlsMode::Auto, no_env, dir.path(), "localhost", now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tls.reload_now().await, ReloadOutcome::NothingToReload);
+        let (c, k) = valid_pair();
+        write_fixed(dir.path(), &c, &k);
+        assert_eq!(tls.reload_now().await, ReloadOutcome::Reloaded);
+        let st = tls.status();
+        assert!(!st.self_signed);
+        assert_eq!(
+            st.source,
+            dir.path().join("tls/cert.pem").display().to_string()
+        );
+        let (client, _) = handshake(&tls, &cert_der(&c)).await.unwrap();
+        assert_eq!(peer_cert(&client), cert_der(&c));
+        assert_eq!(tls.reload_now().await, ReloadOutcome::Unchanged);
+    }
+
+    #[tokio::test]
+    async fn self_signed_upgrade_with_bad_pair_stays_self_signed() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = Tls::from_parts(TlsMode::Auto, no_env, dir.path(), "localhost", now())
+            .await
+            .unwrap()
+            .unwrap();
+        let (c, _) = valid_pair();
+        let (_, k) = valid_pair();
+        write_fixed(dir.path(), &c, &k);
+        assert!(matches!(tls.reload_now().await, ReloadOutcome::Failed(_)));
+        assert!(tls.status().self_signed);
+    }
+
+    #[tokio::test]
+    async fn env_source_is_watched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c1, k1) = valid_pair();
+        let cp = write(dir.path(), "env-cert.pem", &c1);
+        let kp = write(dir.path(), "env-key.pem", &k1);
+        let (cs, ks) = (cp.display().to_string(), kp.display().to_string());
+        let lookup = move |k: &str| match k {
+            "KISS_MAIL_TLS_CERT" => Some(cs.clone()),
+            "KISS_MAIL_TLS_KEY" => Some(ks.clone()),
+            _ => None,
+        };
+        let tls = Tls::from_parts(TlsMode::Auto, lookup, dir.path(), "localhost", now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tls.status().source, cp.display().to_string());
+        let (c2, k2) = valid_pair();
+        write(dir.path(), "env-cert.pem", &c2);
+        write(dir.path(), "env-key.pem", &k2);
+        assert_eq!(tls.reload_now().await, ReloadOutcome::Reloaded);
+    }
+
+    #[tokio::test]
+    async fn startup_errors_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, k) = make_cert("localhost", (2020, 1, 1), (2021, 1, 1));
+        write_fixed(dir.path(), &c, &k);
+        let err = Tls::from_parts(TlsMode::Auto, no_env, dir.path(), "localhost", now())
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("expired"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_returns_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, k) = valid_pair();
+        let tls = tls_with_fixed(dir.path(), &c, &k).await;
+        let (_client, server) = tokio::io::duplex(1024);
+        let err = tls
+            .accept_with(server, Duration::from_millis(100))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn live_session_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c1, k1) = valid_pair();
+        let tls = tls_with_fixed(dir.path(), &c1, &k1).await;
+        let (mut client, mut server) = handshake(&tls, &cert_der(&c1)).await.unwrap();
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let n = server.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                server.write_all(&buf[..n]).await.unwrap();
+                server.flush().await.unwrap();
+            }
+        });
+        let mut buf = [0u8; 5];
+        client.write_all(b"one\r\n").await.unwrap();
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"one\r\n");
+
+        let (c2, k2) = valid_pair();
+        write_fixed(dir.path(), &c2, &k2);
+        assert_eq!(tls.reload_now().await, ReloadOutcome::Reloaded);
+
+        client.write_all(b"two\r\n").await.unwrap();
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"two\r\n");
+        // The live session still uses the old cert; new handshakes get the new one.
+        assert_eq!(peer_cert(&client), cert_der(&c1));
+        let (fresh, _) = handshake(&tls, &cert_der(&c2)).await.unwrap();
+        assert_eq!(peer_cert(&fresh), cert_der(&c2));
+        client.shutdown().await.unwrap();
+        drop(client);
+        echo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expiry_warning_within_14_days_at_most_daily() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, k) = valid_pair();
+        let tls = tls_with_fixed(dir.path(), &c, &k).await;
+        let not_after = tls.status().not_after;
+        // Far from expiry: no warning (the startup check did not fire either).
+        assert!(!tls.maybe_warn_expiry(not_after - 15 * DAY));
+        let t = not_after - 14 * DAY;
+        assert!(tls.maybe_warn_expiry(t));
+        assert!(!tls.maybe_warn_expiry(t + Duration::from_secs(23 * 3600)));
+        assert!(tls.maybe_warn_expiry(t + DAY));
+        // Already expired still warns, once per day.
+        assert!(tls.maybe_warn_expiry(not_after + DAY));
+        assert!(!tls.maybe_warn_expiry(not_after + DAY + Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn sighup_triggers_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c1, k1) = valid_pair();
+        let tls = tls_with_fixed(dir.path(), &c1, &k1).await;
+        spawn_sighup_handler(Some(Arc::clone(&tls)));
+        let before = tls.status().not_after;
+        let (c2, k2) = make_cert("localhost", (2020, 1, 1), (2199, 1, 1));
+        write_fixed(dir.path(), &c2, &k2);
+        // SAFETY: raise() is async-signal-safe; the handler is installed above.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tls.status().not_after == before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "SIGHUP did not reload"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (client, _) = handshake(&tls, &cert_der(&c2)).await.unwrap();
+        assert_eq!(peer_cert(&client), cert_der(&c2));
     }
 }
