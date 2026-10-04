@@ -47,6 +47,12 @@ actix-web = { version = "4.15", default-features = false, features = ["macros", 
 handlebars = "6.4.0"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
 chacha20poly1305 = { version = "0.10.1", features = ["std"] }
+# Native TLS / STARTTLS: ring provider only (no aws-lc: it needs cmake/nasm and
+# breaks the musl and cross builds). CI checks `cargo tree -i aws-lc-sys`.
+rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rcgen        = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+x509-parser  = "0.18"   # notAfter/notBefore and SAN inspection
 
 [dev-dependencies]
 tempfile = "3.24.0"
