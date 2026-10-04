@@ -14,7 +14,7 @@ pub(crate) enum SessionEnd<S> {
 }
 
 /// Whether plaintext authentication is acceptable on a connection.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct TlsPolicy {
     /// A TLS configuration is loaded, so STARTTLS/implicit TLS can be offered.
     pub tls_available: bool,

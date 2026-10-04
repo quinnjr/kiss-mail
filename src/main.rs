@@ -209,7 +209,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         None,
         proto::TlsPolicy::from_env(false),
     );
-    let imap_server = imap::ImapServer::new(Arc::clone(&storage));
+    let imap_server = imap::ImapServer::new(
+        Arc::clone(&storage),
+        None,
+        proto::TlsPolicy::from_env(false),
+    );
     let pop3_server = pop3::Pop3Server::new(Arc::clone(&storage));
 
     let smtp_addr = format!("0.0.0.0:{}", smtp_port);
@@ -267,7 +271,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         ("SMTP", r)
     });
     mail_servers.spawn(async move {
-        let r = imap_server.run(&imap_addr).await.map_err(|e| e.to_string());
+        let r = imap_server
+            .run(&imap_addr, None)
+            .await
+            .map_err(|e| e.to_string());
         ("IMAP", r)
     });
     mail_servers.spawn(async move {
