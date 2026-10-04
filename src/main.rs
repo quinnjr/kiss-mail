@@ -2034,7 +2034,7 @@ async fn write_secret_file(path: &Path, secret: &str) -> std::io::Result<()> {
 
 /// A random 24-character base62 password.
 fn generate_initial_password() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     rand::rng()
         .sample_iter(&rand::distr::Alphanumeric)
         .take(INITIAL_ADMIN_PASSWORD_LEN)
