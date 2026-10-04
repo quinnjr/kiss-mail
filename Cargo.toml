@@ -46,7 +46,7 @@ axum = { version = "0.8.8", features = ["json"] }
 # localhost); dropping them removes h2 0.3 (RUSTSEC-2026-0258).
 actix-web = { version = "4.15", default-features = false, features = ["macros", "cookies"] }
 handlebars = "6.4.0"
-x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 chacha20poly1305 = { version = "0.10.1", features = ["std"] }
 
 [dev-dependencies]
