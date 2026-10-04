@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Native TLS and STARTTLS for the mail protocols (no proxy needed):
+  - Implicit TLS listeners: SMTPS 465 (submission only, AUTH required), IMAPS
+    993 and POP3S 995 (4465/1993/1995 inside the container; override with
+    `KISS_MAIL_SMTPS_PORT`, `KISS_MAIL_IMAPS_PORT`, `KISS_MAIL_POP3S_PORT`).
+  - `STARTTLS` on SMTP (25/587) and IMAP (143), `STLS` on POP3 (110).
+  - Settings: `KISS_MAIL_TLS` (`auto`/`off`, plus boolean aliases),
+    `KISS_MAIL_TLS_CERT`, `KISS_MAIL_TLS_KEY`, `KISS_MAIL_ALLOW_PLAINTEXT_AUTH`.
+  - Certificate source: the env vars, then `$DATA_DIR/tls/cert.pem` + `key.pem`,
+    then a self-signed certificate (397 days, regenerated within 30 days of
+    expiry, stable fingerprint across restarts). Reloaded within 60 s and on
+    `SIGHUP`. An expired, unparseable or mismatched configured certificate
+    aborts startup. TLS 1.2 and 1.3 only.
+  - VM bootstrap installs a Certbot deploy hook
+    (`/etc/letsencrypt/renewal-hooks/deploy/kiss-mail.sh`); Helm gets
+    `tls.mode`, `tls.existingSecret` (cert-manager) and `tls.allowPlaintextAuth`;
+    firewall rules and compose/Kubernetes manifests cover the new ports.
 - Zero-knowledge email encryption (ProtonMail-style)
   - X25519 key exchange
   - ChaCha20-Poly1305 authenticated encryption
@@ -66,6 +82,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--public-url`.
 
 ### Changed
+- **Breaking: plaintext logins are disabled by default.** SMTP answers
+  `538 5.7.11`, IMAP `NO [PRIVACYREQUIRED]` (with `LOGINDISABLED`) and POP3
+  `-ERR [AUTH]` on connections without TLS. Checklist:
+  - [ ] Point mail clients at implicit TLS (993/465/995) or use STARTTLS/STLS.
+  - [ ] `upgrade.sh` keeps existing installs working: it adds
+        `KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true` when the old container has no
+        TLS settings and prints how to remove it
+        (`--no-pull --env KISS_MAIL_ALLOW_PLAINTEXT_AUTH=false`).
+  - [ ] Docker Compose and Helm users: set `KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true`
+        (Helm `tls.allowPlaintextAuth`) until clients switch, or switch to TLS.
+  - [ ] `KISS_MAIL_TLS=off` disables TLS and keeps plaintext logins allowed,
+        with a startup warning and a banner line.
+  - [ ] Install a real certificate: Outlook and Gmail refuse the self-signed
+        one.
 - Docker images are built only from the standard Alpine `Dockerfile` (`rust:1.94-alpine` builder, `alpine:3.23` runtime). The Docker Hardened Images (`dhi.io`) variant and `Dockerfile.alpine` were removed: dhi.io is enterprise-only, and the CI workflow no longer needs Docker Hub credentials.
 - Improved startup banner with security status
 - **REST API status codes** now follow the error kind: 400 invalid input
@@ -209,6 +239,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   final digest with cosign. All GitHub Actions are pinned to commit SHAs.
 
 ### Upgrade notes
+- **TLS.** Servers set up with Certbot before this release lack the deploy
+  hook, so renewed certificates are not copied to the mail ports. Install
+  `/etc/letsencrypt/renewal-hooks/deploy/kiss-mail.sh` (script in DEPLOY.md,
+  from `install_tls_hook` in `deploy/common/bootstrap.sh.tftpl`), then run
+  `certbot reconfigure --cert-name <domain> --deploy-hook <hook>` or reissue
+  with `certbot --nginx --redirect -d <domain> --deploy-hook <hook>`. Run
+  `terraform apply` for the new firewall rules and `upgrade.sh` for the
+  465/993/995 bindings (busy host ports are skipped with a warning).
 - **Back up the data directory before upgrading** (`upgrade.sh` now writes
   `<data-dir>.pre-upgrade-<timestamp>.tgz` automatically).
 - **No rollback to earlier versions once encrypted mail has arrived**: older
@@ -286,6 +324,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   user, labels) and refuses Compose-managed containers.
 
 ### Security
+- Plaintext-login refusal happens before credentials are read (for IMAP,
+  before literal continuations are accepted), so a refused client never sends
+  its password.
 - Admin password generated on the VM and stored only in the root-only
   `credentials.txt`; never in Terraform state or instance metadata, and
   passed to the server on stdin. Setup copies are deleted after provisioning.

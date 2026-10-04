@@ -4,10 +4,11 @@ This guide covers all deployment options for KISS Mail.
 
 > **Recommended**: All deployments use **Docker containers** from `ghcr.io/quinnjr/kiss-mail:latest`
 
-> **No TLS in the mail protocols:** SMTP, IMAP and POP3 are plaintext (no
-> STARTTLS). The scripts below put Nginx (with optional Certbot) in front of the
-> web admin only. Put a TLS-terminating proxy in front of the mail ports before
-> users send real passwords over the internet.
+> **TLS in the mail protocols:** SMTP, IMAP and POP3 support implicit TLS
+> (465/993/995) and STARTTLS natively, with a self-signed certificate until you
+> install a real one (see [SSL/TLS](#ssltls)). Plaintext logins are refused by
+> default. The scripts below put Nginx (with optional Certbot) in front of the
+> web admin; the mail ports are served by kiss-mail itself.
 
 ### Admin account
 
@@ -66,6 +67,17 @@ Read these before upgrading an existing installation (see also
   aliases (they log a warning) and **will be removed in 0.3.0**; use
   `KISS_MAIL_DATA_DIR` and
   `KISS_MAIL_SMTP_PORT`/`KISS_MAIL_IMAP_PORT`/`KISS_MAIL_POP3_PORT`.
+- **Plaintext logins are refused by default (breaking).** SMTP answers
+  `538 5.7.11`, IMAP `NO [PRIVACYREQUIRED]` and POP3 `-ERR [AUTH]` until the
+  client uses TLS. `upgrade.sh` adds `KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true`
+  (and prints how to remove it) when the old container has no
+  `KISS_MAIL_TLS*` or `KISS_MAIL_ALLOW_PLAINTEXT_AUTH` setting, and publishes
+  465/993/995 when those host ports are free (busy ones are skipped with a
+  warning). Compose and Helm users must set
+  `KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true` (Helm `tls.allowPlaintextAuth`) or
+  move their clients to TLS. Existing VMs also need `terraform apply` for the
+  new firewall rules. Existing Certbot installs need the deploy hook, see
+  [Existing installs](#existing-installs-before-the-tls-release).
 - **Session cookie default.** The cookie is `Secure` unless the web admin
   binds a loopback address, and the container image binds `0.0.0.0`, so
   logins over plain HTTP stop working. Set `KISS_MAIL_WEB_SECURE_COOKIE=false`
@@ -217,13 +229,18 @@ reaches it through the bridge. Nginx overwrites `X-Real-IP` and
 ```bash
 docker run -d \
   --name kiss-mail \
-  -p 25:2525 -p 143:1143 -p 110:1100 -p 127.0.0.1:8080:8080 \
+  -p 25:2525 -p 143:1143 -p 110:1100 \
+  -p 465:4465 -p 993:1993 -p 995:1995 \
+  -p 127.0.0.1:8080:8080 \
   -v kiss-mail-data:/data \
   -e KISS_MAIL_DOMAIN=mail.example.com \
   ghcr.io/quinnjr/kiss-mail:latest
 ```
 
 The image's entrypoint is `kiss-mail`; with no arguments it runs the server.
+It starts with a self-signed certificate and refuses plaintext logins; see
+[SSL/TLS](#ssltls) to install a real certificate, or add
+`-e KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true` for clients that cannot use TLS yet.
 
 ### Build from Source
 
@@ -245,6 +262,12 @@ when running the binary directly.
 | `KISS_MAIL_SMTP_PORT` (deprecated alias `SMTP_PORT`, removed in 0.3.0) | 2525 | 2525 (25 as root) | SMTP port |
 | `KISS_MAIL_IMAP_PORT` (deprecated alias `IMAP_PORT`, removed in 0.3.0) | 1143 | 1143 (143 as root) | IMAP port |
 | `KISS_MAIL_POP3_PORT` (deprecated alias `POP3_PORT`, removed in 0.3.0) | 1100 | 1100 (110 as root) | POP3 port |
+| `KISS_MAIL_SMTPS_PORT` | 4465 | 4465 (465 as root) | Implicit TLS SMTP (submission, AUTH required) |
+| `KISS_MAIL_IMAPS_PORT` | 1993 | 1993 (993 as root) | Implicit TLS IMAP |
+| `KISS_MAIL_POP3S_PORT` | 1995 | 1995 (995 as root) | Implicit TLS POP3 |
+| `KISS_MAIL_TLS` | - | auto | `auto` or `off` (also true/on/yes/1 and false/off/no/0). `off` disables TLS and allows plaintext logins |
+| `KISS_MAIL_TLS_CERT` / `KISS_MAIL_TLS_KEY` | - | - | PEM certificate chain and key (both or neither) |
+| `KISS_MAIL_ALLOW_PLAINTEXT_AUTH` | - | false | Allow logins on connections without TLS |
 | `KISS_MAIL_WEB_ENABLED` | - | true | Web admin on/off |
 | `KISS_MAIL_WEB_PORT` | 8080 | 8080 | Web admin port |
 | `KISS_MAIL_WEB_BIND` | 0.0.0.0 | 127.0.0.1 | Web bind address |
@@ -824,19 +847,184 @@ Generate DKIM keys and add:
 
 ## SSL/TLS
 
-### With Certbot (Let's Encrypt)
+kiss-mail terminates TLS itself for the mail protocols: implicit TLS on
+465/993/995 (4465/1993/1995 inside the container) and `STARTTLS`/`STLS` on
+25/587, 143 and 110. Nginx and Certbot only cover the web admin's HTTPS.
+
+### Client settings
+
+| | Implicit TLS (recommended) | STARTTLS |
+|---|---|---|
+| IMAP | 993, SSL/TLS | 143 |
+| SMTP (submission) | 465, SSL/TLS | 587 |
+| POP3 | 995, SSL/TLS | 110 (`STLS`) |
+
+Port 465 is submission only (`MAIL` requires `AUTH`). STARTTLS can be stripped
+by an attacker on the network path, so prefer implicit TLS or require TLS in
+the client. Stripping on port 25 (server to server) is accepted: MTA-STS and
+DANE are out of scope.
+
+### Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KISS_MAIL_TLS` | auto | `auto` or `off` (aliases: true/on/yes/1 = auto, false/off/no/0 = off) |
+| `KISS_MAIL_TLS_CERT` / `KISS_MAIL_TLS_KEY` | - | Certificate chain and key in PEM |
+| `KISS_MAIL_SMTPS_PORT` / `KISS_MAIL_IMAPS_PORT` / `KISS_MAIL_POP3S_PORT` | 4465 / 1993 / 1995 (465 / 993 / 995 as root) | Implicit TLS ports |
+| `KISS_MAIL_ALLOW_PLAINTEXT_AUTH` | false | Allow logins without TLS |
+
+Plaintext logins are refused by default: SMTP `538 5.7.11`, IMAP
+`NO [PRIVACYREQUIRED]` (with `LOGINDISABLED` advertised), POP3 `-ERR [AUTH]`.
+`KISS_MAIL_TLS=off` turns TLS off and **also allows plaintext logins**; the
+server logs a startup warning and adds a banner line.
+
+Certificate source, first match wins:
+
+1. `KISS_MAIL_TLS_CERT` + `KISS_MAIL_TLS_KEY`
+2. `$DATA_DIR/tls/cert.pem` + `key.pem`
+3. a self-signed certificate: 397 days, regenerated within 30 days of expiry,
+   names = `KISS_MAIL_DOMAIN` and `localhost`, same fingerprint across
+   restarts while the data directory persists
+
+Reload: the files are checked every 60 seconds (by content hash) and on
+`SIGHUP` immediately (`docker kill --signal=HUP kiss-mail`). Existing sessions
+keep their old certificate; new connections get the new one. The server
+switches from self-signed to `$DATA_DIR/tls/` as soon as the files appear.
+
+An **expired, unparseable or mismatched configured certificate aborts
+startup**, naming the file and suggesting `certbot renew`. Renew or fix the
+file, then start the container again. A certificate expiring within 14 days is
+logged as a warning (at most once a day).
+
+Limits:
+
+- Self-signed: clients warn, and Outlook and Gmail refuse self-signed
+  certificates. Install a real one for those clients.
+- TLS 1.2 and 1.3 only: very old clients that only offer CBC or RSA key
+  exchange cannot connect.
+
+### With Certbot (Let's Encrypt) on a VM
+
+The VM bootstrap (Terraform, cloud-init) installs the deploy hook
+`/etc/letsencrypt/renewal-hooks/deploy/kiss-mail.sh`. After a successful
+issuance or renewal it copies the new key and chain into `$DATA_DIR/tls/`
+(mode 0600, owned by uid 1000) and sends `SIGHUP` to the container. It only
+acts for certificates whose names include `$DOMAIN`. Once DNS points at the
+server, run:
 
 ```bash
-sudo certbot --nginx -d mail.example.com
-# then mark the session cookie Secure and switch the public URL to https:
+sudo certbot --nginx --redirect -d mail.example.com \
+  --deploy-hook /etc/letsencrypt/renewal-hooks/deploy/kiss-mail.sh
+```
+
+The explicit `--deploy-hook` is needed because certbot only runs the hooks in
+the `renewal-hooks` directory on renewal, not on first issuance (the flag also
+saves the hook for later renewals). The same certificate then serves the web
+admin and the mail ports. Then mark the session cookie `Secure` and switch the
+public URL to https:
+
+```bash
 curl -fsSL .../upgrade.sh | sudo bash -s -- --no-pull \
   --env KISS_MAIL_WEB_SECURE_COOKIE=true --env KISS_MAIL_PUBLIC_URL=https://mail.example.com
 ```
 
+#### Existing installs (before the TLS release)
+
+Servers set up earlier do not have the hook. Install it (it is generated by
+`install_tls_hook` in `deploy/common/bootstrap.sh.tftpl`; set `DOMAIN` and
+`DATA_DIR` to your values, for example `/opt/kiss-mail/data`):
+
+```bash
+sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/kiss-mail.sh >/dev/null <<'EOF'
+#!/bin/bash
+DOMAIN=mail.example.com
+DATA_DIR=/opt/kiss-mail/data
+set -eo pipefail
+TLS_DIR="$DATA_DIR/tls"
+if [[ -z "$RENEWED_LINEAGE" ]]; then
+    echo "kiss-mail deploy hook: RENEWED_LINEAGE is not set (this hook is run by certbot)" >&2
+    exit 1
+fi
+case " $RENEWED_DOMAINS " in
+    *" $DOMAIN "*) ;;
+    *) exit 0 ;;
+esac
+install -d -m 0700 -o 1000 -g 1000 "$TLS_DIR"
+install -m 0600 -o 1000 -g 1000 "$RENEWED_LINEAGE/privkey.pem" "$TLS_DIR/key.pem.new"
+mv -f "$TLS_DIR/key.pem.new" "$TLS_DIR/key.pem"
+install -m 0600 -o 1000 -g 1000 "$RENEWED_LINEAGE/fullchain.pem" "$TLS_DIR/cert.pem.new"
+mv -f "$TLS_DIR/cert.pem.new" "$TLS_DIR/cert.pem"
+docker kill --signal=HUP kiss-mail >/dev/null || true
+echo "kiss-mail deploy hook: installed the certificate for $DOMAIN in $TLS_DIR"
+EOF
+sudo chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/kiss-mail.sh
+```
+
+Then attach it to the existing certificate and run it once:
+
+```bash
+sudo certbot reconfigure --cert-name mail.example.com \
+  --deploy-hook /etc/letsencrypt/renewal-hooks/deploy/kiss-mail.sh
+sudo RENEWED_LINEAGE=/etc/letsencrypt/live/mail.example.com \
+  RENEWED_DOMAINS=mail.example.com \
+  /etc/letsencrypt/renewal-hooks/deploy/kiss-mail.sh
+```
+
+(Alternatively reissue with the `certbot --nginx ... --deploy-hook` command
+above.) Also run `upgrade.sh` (it publishes 465/993/995 when they are free and
+keeps plaintext logins working with `KISS_MAIL_ALLOW_PLAINTEXT_AUTH=true`
+until you remove it) and `terraform apply` for the new firewall rules.
+
+### Docker Compose or `docker run`
+
+Mount the files and point the server at them, or drop `cert.pem` and
+`key.pem` into `$DATA_DIR/tls/` (readable by uid 1000):
+
+```yaml
+    volumes:
+      - ./certs:/certs:ro
+    environment:
+      KISS_MAIL_TLS_CERT: /certs/fullchain.pem
+      KISS_MAIL_TLS_KEY: /certs/privkey.pem
+```
+
+After renewing, run `docker kill --signal=HUP kiss-mail` (or wait up to 60
+seconds).
+
+### Kubernetes and Helm (cert-manager)
+
+Create a `kubernetes.io/tls` Secret, for example with a cert-manager
+`Certificate` for the mail host, and point the chart at it:
+
+```yaml
+tls:
+  mode: auto
+  existingSecret: mail-example-com-tls   # kubernetes.io/tls Secret
+  allowPlaintextAuth: false
+```
+
+The Secret is mounted at `/etc/kiss-mail/tls` as a whole directory (no
+`subPath`, so renewals reach the pod) and `KISS_MAIL_TLS_CERT`/`_KEY` point at
+`tls.crt`/`tls.key`. Secret updates propagate to the pod within a couple of
+minutes and the server reloads the files. Without `existingSecret` the server
+uses `/data/tls/*` if present, else a self-signed certificate. With
+`persistence.enabled: false` the self-signed fingerprint changes on every pod
+restart. The plain manifests in `deploy/kubernetes/` use the same variables in
+the ConfigMap.
+
+### Firewalls
+
+Ports published by Docker bypass ufw and firewalld; the cloud firewall
+(Terraform security groups) controls what is reachable. Open 465, 993 and 995
+(and 587, 143, 110, 25 for STARTTLS/plain). Existing VMs need
+`terraform apply` for the new rules plus `upgrade.sh` for the port bindings.
+
 ### With Custom Certificate
 
-1. Place certificates in `/etc/ssl/kiss-mail/`
-2. Update Nginx configuration
+Use `KISS_MAIL_TLS_CERT`/`KISS_MAIL_TLS_KEY` or `$DATA_DIR/tls/cert.pem` +
+`key.pem` for the mail ports. For the web admin, place the certificate for
+Nginx in `/etc/ssl/kiss-mail/` and update the Nginx configuration.
 
 ---
 
@@ -927,8 +1115,12 @@ docker inspect kiss-mail --format '{{.State.Health.Status}}'
 ### SSL certificate issues
 
 ```bash
-# Renew certificate
+# Renew certificate (the deploy hook reloads kiss-mail)
 certbot renew
+
+# Mail ports
+openssl s_client -connect mail.example.com:993
+openssl s_client -starttls smtp -connect mail.example.com:587
 
 # Check certificate
 openssl s_client -connect mail.example.com:443
