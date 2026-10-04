@@ -921,12 +921,20 @@ mod tests {
         AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf,
     };
 
-    struct Client {
-        r: BufReader<ReadHalf<DuplexStream>>,
-        w: WriteHalf<DuplexStream>,
+    struct Client<S = DuplexStream> {
+        r: BufReader<ReadHalf<S>>,
+        w: WriteHalf<S>,
     }
 
-    impl Client {
+    impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
+        fn new(stream: S) -> Self {
+            let (r, w) = tokio::io::split(stream);
+            Client {
+                r: BufReader::new(r),
+                w,
+            }
+        }
+
         async fn send(&mut self, s: &str) {
             self.w.write_all(s.as_bytes()).await.unwrap();
         }
@@ -1114,48 +1122,11 @@ mod tests {
     type ConnTask = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
     type ClientTls<S> = tokio_rustls::client::TlsStream<S>;
 
-    struct TlsClient {
-        r: BufReader<ReadHalf<ClientTls<DuplexStream>>>,
-        w: WriteHalf<ClientTls<DuplexStream>>,
-    }
-
-    impl TlsClient {
-        fn new(s: ClientTls<DuplexStream>) -> Self {
-            let (r, w) = tokio::io::split(s);
-            Self {
-                r: BufReader::new(r),
-                w,
-            }
-        }
-
-        async fn send(&mut self, s: &str) {
-            self.w.write_all(s.as_bytes()).await.unwrap();
-        }
-
-        async fn line(&mut self) -> String {
-            let mut l = String::new();
-            self.r.read_line(&mut l).await.unwrap();
-            l
-        }
-
-        async fn multiline(&mut self) -> String {
-            let mut out = String::new();
-            loop {
-                let l = self.line().await;
-                assert!(!l.is_empty(), "EOF in multi-line response: {}", out);
-                out.push_str(&l);
-                if l == ".\r\n" {
-                    return out;
-                }
-            }
-        }
-
-        /// After QUIT on TLS the server sent close_notify: a clean EOF
-        /// (rustls reports `UnexpectedEof` otherwise).
-        async fn assert_clean_eof(&mut self) {
-            let mut rest = String::new();
-            assert_eq!(self.r.read_line(&mut rest).await.unwrap(), 0, "{:?}", rest);
-        }
+    /// After QUIT on TLS the server sent close_notify: a clean EOF
+    /// (rustls reports `UnexpectedEof` otherwise).
+    async fn assert_clean_tls_eof(c: &mut Client<ClientTls<DuplexStream>>) {
+        let mut rest = String::new();
+        assert_eq!(c.r.read_line(&mut rest).await.unwrap(), 0, "{:?}", rest);
     }
 
     fn test_peer() -> SocketAddr {
@@ -1192,23 +1163,14 @@ mod tests {
     }
 
     /// Client side of the TLS handshake on `c`'s stream.
-    async fn upgrade(dir: &std::path::Path, c: Client) -> TlsClient {
+    async fn upgrade(dir: &std::path::Path, c: Client) -> Client<ClientTls<DuplexStream>> {
         assert!(c.r.buffer().is_empty(), "unread server bytes before TLS");
         let raw = c.r.into_inner().unsplit(c.w);
-        TlsClient::new(
+        Client::new(
             crate::tls::test_support::connect(dir, raw)
                 .await
                 .expect("client handshake"),
         )
-    }
-
-    /// No login was attempted: no history, no failure count, no throttle slot.
-    async fn assert_no_login_attempt(storage: &Storage) {
-        let users = storage.user_manager();
-        let bob = users.get_user("bob").await.unwrap();
-        assert!(bob.login_history.is_empty(), "{:?}", bob.login_history);
-        assert_eq!(bob.failed_login_attempts, 0);
-        assert_eq!(users.throttle_sizes(), (0, 0, 0));
     }
 
     #[tokio::test]
@@ -1255,7 +1217,7 @@ mod tests {
         assert!(capa.contains("\r\nUSER\r\n"), "{}", capa);
         c.send("QUIT\r\n").await;
         c.line().await;
-        c.assert_clean_eof().await;
+        assert_clean_tls_eof(&mut c).await;
         h.await.unwrap().unwrap();
     }
 
@@ -1277,7 +1239,7 @@ mod tests {
         assert_eq!(c.line().await, AUTH_REFUSED);
         c.send("STAT\r\n").await;
         assert_eq!(c.line().await, "-ERR Not authenticated\r\n");
-        assert_no_login_attempt(&storage).await;
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
         drop(c);
         h.await.unwrap().unwrap();
     }
@@ -1323,7 +1285,7 @@ mod tests {
 
         c.send("QUIT\r\n").await;
         assert!(c.line().await.starts_with("+OK"));
-        c.assert_clean_eof().await;
+        assert_clean_tls_eof(&mut c).await;
         h.await.unwrap().unwrap();
         assert!(!first_message_content(&storage).await.contains("body 1"));
     }
@@ -1390,7 +1352,7 @@ mod tests {
         assert!(bob.login_history.is_empty(), "{:?}", bob.login_history);
         c.send("QUIT\r\n").await;
         c.line().await;
-        c.assert_clean_eof().await;
+        assert_clean_tls_eof(&mut c).await;
         h.await.unwrap().unwrap();
     }
 
@@ -1410,7 +1372,7 @@ mod tests {
             true,
             permit,
         ));
-        let mut c = TlsClient::new(
+        let mut c = Client::new(
             crate::tls::test_support::connect(dir.path(), client)
                 .await
                 .expect("client handshake"),
@@ -1426,7 +1388,7 @@ mod tests {
         assert_eq!(rec.protocol, "POP3");
         c.send("QUIT\r\n").await;
         assert!(c.line().await.starts_with("+OK"));
-        c.assert_clean_eof().await;
+        assert_clean_tls_eof(&mut c).await;
         task.await.unwrap();
         assert_eq!(connections.available_permits(), MAX_CONNECTIONS);
     }
@@ -1445,10 +1407,10 @@ mod tests {
         assert_eq!(c.line().await, "+OK\r\n");
         c.send("STAT\r\n").await;
         assert_eq!(c.line().await, "-ERR Not authenticated\r\n");
-        assert_no_login_attempt(&storage).await;
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
         c.send("QUIT\r\n").await;
         c.line().await;
-        c.assert_clean_eof().await;
+        assert_clean_tls_eof(&mut c).await;
         h.await.unwrap().unwrap();
     }
 

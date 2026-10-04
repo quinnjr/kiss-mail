@@ -3550,15 +3550,6 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(format!("\0{}\0{}", user, password))
     }
 
-    /// No login was attempted: no history, no failure count, no throttle slot.
-    async fn assert_no_login_attempt(storage: &Storage) {
-        let users = storage.user_manager();
-        let bob = users.get_user("bob").await.unwrap();
-        assert!(bob.login_history.is_empty(), "{:?}", bob.login_history);
-        assert_eq!(bob.failed_login_attempts, 0);
-        assert_eq!(users.throttle_sizes(), (0, 0, 0));
-    }
-
     #[test]
     fn capability_lists_per_state() {
         assert_eq!(
@@ -3622,7 +3613,7 @@ mod tests {
         assert_eq!(c.line().await, format!("b {}\r\n", PRIVACY_REQUIRED));
         c.send("c SELECT INBOX\r\n").await;
         assert_eq!(c.line().await, "c NO Not authenticated\r\n");
-        assert_no_login_attempt(&storage).await;
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
         drop(c);
         h.await.unwrap().unwrap();
     }
@@ -3648,7 +3639,7 @@ mod tests {
         // The next line is a command again, not SASL data.
         c.send("d NOOP\r\n").await;
         assert_eq!(c.line().await, "d OK NOOP completed\r\n");
-        assert_no_login_attempt(&storage).await;
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
         drop(c);
         h.await.unwrap().unwrap();
     }
@@ -3670,7 +3661,7 @@ mod tests {
         assert_eq!(c.line().await, format!("c {}\r\n", PRIVACY_REQUIRED));
         c.send("d NOOP\r\n").await;
         assert_eq!(c.line().await, "d OK NOOP completed\r\n");
-        assert_no_login_attempt(&storage).await;
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
         drop(c);
         h.await.unwrap().unwrap();
     }
@@ -3687,7 +3678,7 @@ mod tests {
         assert_eq!(c.line().await, format!("a {}\r\n", PRIVACY_REQUIRED));
         c.send("b NOOP\r\n").await;
         assert_eq!(c.line().await, "b OK NOOP completed\r\n");
-        assert_no_login_attempt(&storage).await;
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
         drop(c);
         h.await.unwrap().unwrap();
     }
@@ -3860,7 +3851,7 @@ mod tests {
         // Still not authenticated, and no login was attempted.
         c.send("d SELECT INBOX\r\n").await;
         assert_eq!(c.line().await, "d NO Not authenticated\r\n");
-        assert_no_login_attempt(&storage).await;
+        crate::tls::test_support::assert_no_login_attempt(&storage, "bob").await;
         c.send("e LOGOUT\r\n").await;
         let resp = c.until_tagged("e").await;
         assert!(!resp.contains("b "), "{resp}");

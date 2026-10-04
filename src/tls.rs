@@ -716,6 +716,20 @@ pub(crate) mod test_support {
         .expect("TLS on")
     }
 
+    /// No login was attempted for `user`: no history, no failure count, no
+    /// throttle slot. For asserting that a refusal never reached `login`.
+    pub(crate) async fn assert_no_login_attempt(storage: &crate::storage::Storage, user: &str) {
+        let users = storage.user_manager();
+        let account = users.get_user(user).await.unwrap();
+        assert!(
+            account.login_history.is_empty(),
+            "{:?}",
+            account.login_history
+        );
+        assert_eq!(account.failed_login_attempts, 0);
+        assert_eq!(users.throttle_sizes(), (0, 0, 0));
+    }
+
     /// Handshake as a client over `s`, trusting only the self-signed
     /// certificate in `data_dir/tls`.
     pub(crate) async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
