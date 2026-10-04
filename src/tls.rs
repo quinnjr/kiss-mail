@@ -999,6 +999,7 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
         assert_eq!(self_signed_sans("localhost"), vec!["localhost"]);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn self_signed_first_call_generates_with_modes() {
         use std::os::unix::fs::PermissionsExt;
@@ -1415,6 +1416,7 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
         assert!(!tls.maybe_warn_expiry(not_after + DAY + Duration::from_secs(60)));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn sighup_triggers_reload() {
         let dir = tempfile::tempdir().unwrap();
