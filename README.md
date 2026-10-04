@@ -108,7 +108,9 @@ Prefer implicit TLS (SSL/TLS) where your client offers it.
 | Password | your_password                     | your_password               |
 
 In the Docker image the TLS ports are 4465/1993/1995 inside the container;
-the published host ports are 465/993/995. Port 465 is submission only: `MAIL`
+the published host ports are 465/993/995 in the VM installers, while
+`docker-compose.yml` publishes 4465/1993/1995 (map them to 465/993/995 in
+production). Port 465 is submission only: `MAIL`
 requires `AUTH`.
 
 - Plaintext logins are **refused by default**: SMTP answers `538 5.7.11`, IMAP

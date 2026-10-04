@@ -73,7 +73,12 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Check no aws-lc (ring only)
-        run: "! cargo tree -i aws-lc-sys 2>/dev/null | grep -q aws-lc-sys"
+        run: |
+          out=$(cargo tree --prefix none -e normal,build)
+          if grep -q aws-lc <<<"$out"; then
+            echo "aws-lc is in the dependency tree" >&2
+            exit 1
+          fi
 
   # ==========================================================================
   # Build & Test
