@@ -145,6 +145,67 @@ else
     fail "docker kill --signal=HUP kiss-mail called"
 fi
 
+# --- mixed-case DOMAIN: hook lowercases DOMAIN and RENEWED_DOMAINS -----------
+MIXED="$WORK/mixed"
+mkdir -p "$MIXED/data" "$MIXED/letsencrypt/renewal-hooks/deploy"
+MIXED_HOOK="$MIXED/letsencrypt/renewal-hooks/deploy/kiss-mail.sh"
+# log/warn/error are called from the sourced block.
+# shellcheck disable=SC2329
+if (
+    log() { :; }
+    warn() { :; }
+    error() { echo "error: $1" >&2; exit 1; }
+    # shellcheck source=/dev/null
+    . "$WORK/common.sh"
+    DOMAIN="Mail.Example.COM"
+    DATA_DIR="$MIXED/data"
+    # shellcheck disable=SC2034  # read by install_tls_hook
+    KM_TLS_HOOK="$MIXED_HOOK"
+    install_tls_hook
+) && grep -qx 'DOMAIN=mail.example.com' "$MIXED_HOOK"; then
+    pass "hook written with a lowercased DOMAIN"
+else
+    fail "hook written with a lowercased DOMAIN"
+fi
+if env PATH="$WORK/bin:$PATH" RENEWED_LINEAGE="$LINEAGE" RENEWED_DOMAINS="MAIL.example.com" bash "$MIXED_HOOK" \
+    && [[ "$(cat "$MIXED/data/tls/cert.pem" 2>/dev/null)" == "CHAIN" ]]; then
+    pass "mixed-case domain matches"
+else
+    fail "mixed-case domain matches"
+fi
+
+# --- a skip is reported on stderr --------------------------------------------
+skip_err="$(run_hook "$OTHER" "other.example.org" 2>&1 >/dev/null || true)"
+if [[ "$skip_err" == *"other.example.org does not include mail.example.com; skipping"* ]]; then
+    pass "skip prints a message on stderr"
+else
+    fail "skip prints a message on stderr (got: $skip_err)"
+fi
+
+# --- partial failure: a failing chain install leaves key.pem/cert.pem alone --
+echo "OLDKEY" > "$DATA_DIR/tls/key.pem"
+echo "OLDCHAIN" > "$DATA_DIR/tls/cert.pem"
+mv "$WORK/bin/install" "$WORK/bin/install.real"
+cat > "$WORK/bin/install" << 'FAKE'
+#!/bin/bash
+for a in "$@"; do
+    [[ "$a" == */cert.pem.new ]] && exit 1
+done
+exec "$(dirname "$0")/install.real" "$@"
+FAKE
+chmod +x "$WORK/bin/install"
+if run_hook "$LINEAGE" "$DOMAIN"; then
+    fail "hook fails when installing the chain fails"
+else
+    pass "hook fails when installing the chain fails"
+fi
+if [[ "$(cat "$DATA_DIR/tls/key.pem")" == "OLDKEY" && "$(cat "$DATA_DIR/tls/cert.pem")" == "OLDCHAIN" ]]; then
+    pass "key.pem and cert.pem unchanged after a partial failure"
+else
+    fail "key.pem and cert.pem unchanged after a partial failure"
+fi
+mv -f "$WORK/bin/install.real" "$WORK/bin/install"
+
 # --- a failing docker (container stopped or renamed) does not fail the hook --
 printf '#!/bin/bash\nexit 1\n' > "$WORK/bin/docker"
 if run_hook "$LINEAGE" "$DOMAIN"; then

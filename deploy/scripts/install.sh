@@ -377,7 +377,7 @@ install_tls_hook() {
     {
         echo '#!/bin/bash'
         echo '# KISS Mail certbot deploy hook, written by the KISS Mail installer.'
-        printf 'DOMAIN=%q\n' "$DOMAIN"
+        printf 'DOMAIN=%q\n' "$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]')"
         printf 'DATA_DIR=%q\n' "$DATA_DIR"
         cat << 'HOOK'
 # No "set -u": certbot sets RENEWED_LINEAGE and RENEWED_DOMAINS.
@@ -388,16 +388,22 @@ if [[ -z "$RENEWED_LINEAGE" ]]; then
     exit 1
 fi
 # Certbot runs this for every certificate on the machine; only act on ours.
+# Certbot lowercases RENEWED_DOMAINS; DOMAIN was lowercased when written.
+RENEWED_DOMAINS="$(printf '%s' "$RENEWED_DOMAINS" | tr '[:upper:]' '[:lower:]')"
 case " $RENEWED_DOMAINS " in
     *" $DOMAIN "*) ;;
-    *) exit 0 ;;
+    *)
+        echo "kiss-mail deploy hook: $RENEWED_DOMAINS does not include $DOMAIN; skipping" >&2
+        exit 0
+        ;;
 esac
 install -d -m 0700 -o 1000 -g 1000 "$TLS_DIR"
-# Key first, then the chain. Each is written under a temp name and renamed,
-# so the server never reads a half-written file.
+# Stage both files under temp names first, then rename key and cert. If a
+# staging step fails (set -e), neither live file has changed, so the server
+# never sees a mismatched pair or a half-written file.
 install -m 0600 -o 1000 -g 1000 "$RENEWED_LINEAGE/privkey.pem" "$TLS_DIR/key.pem.new"
-mv -f "$TLS_DIR/key.pem.new" "$TLS_DIR/key.pem"
 install -m 0600 -o 1000 -g 1000 "$RENEWED_LINEAGE/fullchain.pem" "$TLS_DIR/cert.pem.new"
+mv -f "$TLS_DIR/key.pem.new" "$TLS_DIR/key.pem"
 mv -f "$TLS_DIR/cert.pem.new" "$TLS_DIR/cert.pem"
 # During upgrade.sh the container may be stopped or named kiss-mail-old; the
 # new container loads the copied files when it starts.
