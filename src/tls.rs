@@ -95,6 +95,8 @@ pub(crate) struct LoadedCert {
     pub subject: String,
     /// SHA-256 over the chain DER followed by the private key DER.
     pub fingerprint: [u8; 32],
+    /// DNS subjectAltNames of the leaf certificate, in certificate order.
+    pub sans: Vec<String>,
 }
 
 fn to_system_time(ts: i64) -> SystemTime {
@@ -128,7 +130,7 @@ pub(crate) fn load_pair(cert: &Path, key: &Path, now: SystemTime) -> Result<Load
     hasher.update(key_der.secret_der());
     let fingerprint: [u8; 32] = hasher.finalize().into();
 
-    let (not_before, not_after, subject) = {
+    let (not_before, not_after, subject, sans) = {
         let (_, x509) = x509_parser::parse_x509_certificate(chain[0].as_ref())
             .map_err(|e| format!("cannot parse certificate {}: {e}", cert.display()))?;
         let validity = x509.validity();
@@ -146,10 +148,26 @@ pub(crate) fn load_pair(cert: &Path, key: &Path, now: SystemTime) -> Result<Load
                 })
             })
             .unwrap_or_default();
+        let sans: Vec<String> = x509
+            .subject_alternative_name()
+            .ok()
+            .flatten()
+            .map(|san| {
+                san.value
+                    .general_names
+                    .iter()
+                    .filter_map(|n| match n {
+                        x509_parser::extensions::GeneralName::DNSName(d) => Some(d.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         (
             to_system_time(validity.not_before.timestamp()),
             to_system_time(validity.not_after.timestamp()),
             subject,
+            sans,
         )
     };
 
@@ -182,7 +200,96 @@ pub(crate) fn load_pair(cert: &Path, key: &Path, now: SystemTime) -> Result<Load
         not_after,
         subject,
         fingerprint,
+        sans,
     })
+}
+
+const SELF_SIGNED_CERT: &str = "self-signed-cert.pem";
+const SELF_SIGNED_KEY: &str = "self-signed-key.pem";
+/// Self-signed validity, and the renewal margin before it runs out.
+const SELF_SIGNED_VALIDITY_DAYS: u64 = 397;
+const SELF_SIGNED_RENEW_DAYS: u64 = 30;
+
+/// SANs for the self-signed cert: the domain plus `localhost`. Names that are
+/// not valid DNS names are dropped.
+pub(crate) fn self_signed_sans(domain: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in [domain, "localhost"] {
+        let name = name.trim();
+        if rcgen::string::Ia5String::try_from(name).is_ok()
+            && rustls::pki_types::DnsName::try_from(name).is_ok()
+            && !out.iter().any(|n| n == name)
+        {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+fn generate_self_signed(domain: &str, now: SystemTime) -> Result<(String, String), String> {
+    use chrono::{Datelike, Utc};
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, date_time_ymd};
+
+    let sans = self_signed_sans(domain);
+    let cn = sans.first().cloned().unwrap_or_else(|| "localhost".into());
+    let key = KeyPair::generate().map_err(|e| format!("self-signed key generation failed: {e}"))?;
+    let mut params = CertificateParams::new(sans)
+        .map_err(|e| format!("self-signed certificate parameters: {e}"))?;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, cn);
+    params.distinguished_name = dn;
+    // rcgen takes calendar dates, so the window is aligned to midnight UTC.
+    let from = chrono::DateTime::<Utc>::from(now);
+    let to = from + chrono::Duration::days(SELF_SIGNED_VALIDITY_DAYS as i64);
+    params.not_before = date_time_ymd(from.year(), from.month() as u8, from.day() as u8);
+    params.not_after = date_time_ymd(to.year(), to.month() as u8, to.day() as u8);
+    let cert = params
+        .self_signed(&key)
+        .map_err(|e| format!("self-signed certificate generation failed: {e}"))?;
+    Ok((cert.pem(), key.serialize_pem()))
+}
+
+/// Load the persisted self-signed pair from `tls_dir`, generating a new one
+/// when it is missing, unparseable, within 30 days of expiry, or issued for
+/// different names. Returns the cert and whether it was (re)generated.
+pub(crate) async fn ensure_self_signed(
+    tls_dir: &Path,
+    domain: &str,
+    now: SystemTime,
+) -> Result<(LoadedCert, bool), String> {
+    let cert_path = tls_dir.join(SELF_SIGNED_CERT);
+    let key_path = tls_dir.join(SELF_SIGNED_KEY);
+
+    if let Ok(loaded) = load_pair(&cert_path, &key_path, now) {
+        let margin = Duration::from_secs(SELF_SIGNED_RENEW_DAYS * 86_400);
+        let fresh = loaded.not_after > now + margin;
+        if fresh && loaded.sans == self_signed_sans(domain) {
+            return Ok((loaded, false));
+        }
+    }
+
+    create_tls_dir(tls_dir)?;
+    let (cert_pem, key_pem) = generate_self_signed(domain, now)?;
+    crate::storage::write_atomic(&key_path, key_pem.into_bytes())
+        .await
+        .map_err(|e| format!("cannot write {}: {e}", key_path.display()))?;
+    crate::storage::write_atomic(&cert_path, cert_pem.into_bytes())
+        .await
+        .map_err(|e| format!("cannot write {}: {e}", cert_path.display()))?;
+    let loaded = load_pair(&cert_path, &key_path, now)?;
+    Ok((loaded, true))
+}
+
+fn create_tls_dir(dir: &Path) -> Result<(), String> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
+        .map_err(|e| format!("cannot create TLS directory {}: {e}", dir.display()))
 }
 
 #[cfg(test)]
@@ -474,5 +581,90 @@ KTvsIyrzcUiViWo4cgLuYXwH8lD5+sFyZg==\n\
         let c = write(dir.path(), "c.pem", cert.pem());
         let k = write(dir.path(), "k.pem", key.serialize_pem());
         assert_eq!(load_pair(&c, &k, now()).unwrap().subject, "san.test");
+    }
+
+    const DAY: Duration = Duration::from_secs(86_400);
+
+    #[test]
+    fn self_signed_sans_drops_invalid_names() {
+        assert_eq!(self_signed_sans("bad_host!"), vec!["localhost"]);
+        assert_eq!(
+            self_signed_sans("mail.example.com"),
+            vec!["mail.example.com", "localhost"]
+        );
+        assert_eq!(self_signed_sans("localhost"), vec!["localhost"]);
+    }
+
+    #[tokio::test]
+    async fn self_signed_first_call_generates_with_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("tls");
+        let t = now();
+        let (c, regen) = ensure_self_signed(&dir, "mail.example.com", t)
+            .await
+            .unwrap();
+        assert!(regen);
+        assert_eq!(c.sans, vec!["mail.example.com", "localhost"]);
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("self-signed-cert.pem")), 0o600);
+        assert_eq!(mode(&dir.join("self-signed-key.pem")), 0o600);
+        assert_eq!(c.not_after.duration_since(c.not_before).unwrap(), 397 * DAY);
+    }
+
+    #[tokio::test]
+    async fn self_signed_reused_when_unchanged() {
+        let base = tempfile::tempdir().unwrap();
+        let t = now();
+        let (a, r1) = ensure_self_signed(base.path(), "mail.example.com", t)
+            .await
+            .unwrap();
+        let (b, r2) = ensure_self_signed(base.path(), "mail.example.com", t)
+            .await
+            .unwrap();
+        assert!(r1 && !r2);
+        assert_eq!(a.fingerprint, b.fingerprint);
+    }
+
+    #[tokio::test]
+    async fn self_signed_regenerates_near_expiry() {
+        let base = tempfile::tempdir().unwrap();
+        let t = now();
+        ensure_self_signed(base.path(), "mail.example.com", t)
+            .await
+            .unwrap();
+        let (_, r) = ensure_self_signed(base.path(), "mail.example.com", t + 368 * DAY)
+            .await
+            .unwrap();
+        assert!(r);
+    }
+
+    #[tokio::test]
+    async fn self_signed_regenerates_on_domain_change() {
+        let base = tempfile::tempdir().unwrap();
+        let t = now();
+        ensure_self_signed(base.path(), "mail.example.com", t)
+            .await
+            .unwrap();
+        let (c, r) = ensure_self_signed(base.path(), "other.example.org", t)
+            .await
+            .unwrap();
+        assert!(r);
+        assert_eq!(c.sans, vec!["other.example.org", "localhost"]);
+    }
+
+    #[tokio::test]
+    async fn self_signed_regenerates_on_corrupt_cert() {
+        let base = tempfile::tempdir().unwrap();
+        let t = now();
+        ensure_self_signed(base.path(), "mail.example.com", t)
+            .await
+            .unwrap();
+        fs::write(base.path().join("self-signed-cert.pem"), b"garbage").unwrap();
+        let (_, r) = ensure_self_signed(base.path(), "mail.example.com", t)
+            .await
+            .unwrap();
+        assert!(r);
     }
 }
