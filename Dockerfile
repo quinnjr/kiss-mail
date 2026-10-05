@@ -45,7 +45,7 @@ RUN strip /app/target/release/kiss-mail
 # -----------------------------------------------------------------------------
 # Stage 2: Runtime
 # -----------------------------------------------------------------------------
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 
 ARG VERSION=dev
 ARG COMMIT=unknown
